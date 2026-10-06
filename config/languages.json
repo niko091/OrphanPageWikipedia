@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "languages": ["vec", "lmo", "fur", "roa-tara", "nap", "pms", "scn", "sc", "lij", "eml", "co", "lld"],
+  "topic_languages": ["vec", "lmo", "fur", "roa-tara", "nap"],
+  "size_selection": {
+    "reference_language": "vec",
+    "multiplier": 1.5,
+    "always_include": ["vec"]
+  },
+  "databases": {}
+}

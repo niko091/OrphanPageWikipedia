@@ -1,0 +1,13 @@
+{
+  "name": "orphanwiki-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-web.mjs",
+    "check": "tsc --noEmit",
+    "test": "npm run build && node tests/web/dashboard.cjs"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "strict": true,
+    "noEmitOnError": true,
+    "removeComments": false,
+    "rootDir": "web/src",
+    "outDir": "web/assets",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "files": [
+    "web/src/app.ts"
+  ]
+}

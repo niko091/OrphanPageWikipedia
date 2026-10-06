@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="it">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title data-i18n="De-orfanizzare le pagine">De-orfanizzare le pagine</title><link rel="stylesheet" href="assets/style.css?v=2eff4b0a43be"></head>
+<body data-page="deorphanize">
+<header><div class="header-row"><h1 data-i18n="De-orfanizzare le pagine">De-orfanizzare le pagine</h1><div class="preferences"><button type="button" id="ui-language-toggle" class="preference-button" aria-label="Interfaccia italiana: passa all’inglese">IT</button><button type="button" id="theme-toggle" class="preference-button theme-button" aria-label="Modalità chiara: passa alla modalità scura"><span id="theme-light-icon"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></span><span id="theme-dark-icon" hidden><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg></span></button></div></div><p data-i18n="Pagine orfane e possibili collegamenti dal confronto tra lingue.">Pagine orfane e possibili collegamenti dal confronto tra lingue.</p></header>
+<nav class="page-nav" aria-label="Pagine di analisi" data-i18n-aria-label="Pagine di analisi"><a id="articles-link" href="index.html" data-i18n="Analisi delle voci">Analisi delle voci</a><a id="creators-link" href="creators.html">Who creates the Orphan pages</a><a id="deorphanize-link" aria-current="page" href="deorphanize.html" data-i18n="De-orfanizzare le pagine">De-orfanizzare le pagine</a></nav>
+<main><div class="toolbar"><label><span data-i18n="Lingua e raccolta">Lingua e raccolta</span><select id="dataset"></select></label><label><span data-i18n="Modello LLM">Modello LLM</span><select id="llm-provider"></select></label><a id="download" download data-i18n="Scarica tutti i dati CSV">Scarica tutti i dati CSV</a></div>
+<p id="status" role="status" data-i18n="Caricamento dei dataset…">Caricamento dei dataset…</p><p id="source" class="muted"></p>
+<section class="panel" id="candidate-section" aria-labelledby="candidate-heading">
+<h2 id="candidate-heading" data-i18n="Da quali pagine possiamo collegare le orfane?">Da quali pagine possiamo collegare le orfane?</h2>
+<p data-i18n="Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.">Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.</p>
+<div class="list-controls">
+  <label>
+    <span data-i18n="Cerca una voce orfana">Cerca una voce orfana</span>
+    <input id="candidate-search" type="search" placeholder="Titolo della voce" data-i18n-placeholder="Titolo della voce">
+  </label>
+  <label>
+    <span data-i18n="Categoria">Categoria</span>
+    <input id="candidate-category" type="search" list="candidate-categories" placeholder="Cerca una categoria…" data-i18n-placeholder="Cerca una categoria…">
+    <datalist id="candidate-categories"></datalist>
+  </label>
+  <label>
+    <span data-i18n="Ordina per">Ordina per</span>
+    <select id="candidate-sort">
+      <option value="candidates-desc" data-i18n="Collegamenti possibili: più numerosi">Collegamenti possibili: più numerosi</option>
+      <option value="candidates-asc" data-i18n="Collegamenti possibili: meno numerosi">Collegamenti possibili: meno numerosi</option>
+      <option value="length-desc" data-i18n="Dimensione: più grandi">Dimensione: più grandi</option>
+      <option value="length-asc" data-i18n="Dimensione: più piccole">Dimensione: più piccole</option>
+      <option value="date-desc" data-i18n="Creazione: più recenti">Creazione: più recenti</option>
+      <option value="date-asc" data-i18n="Creazione: più vecchie">Creazione: più vecchie</option>
+    </select>
+  </label>
+</div>
+<p id="candidate-info" role="status"></p>
+<div id="candidate-cards" class="candidate-grid"></div><button id="candidate-more" hidden data-i18n="Mostra altre 25 schede">Mostra altre 25 schede</button>
+</section>
+</main><footer>OrphanWiki · <span data-i18n="Analisi descrittiva">Analisi descrittiva</span> · <a href="https://ojs.aaai.org/index.php/ICWSM/article/view/31300" data-i18n="Studio di riferimento">Studio di riferimento</a></footer>
+<dialog id="llm-prompt" aria-labelledby="llm-prompt-title"><h2 id="llm-prompt-title">Prompt</h2><p id="llm-prompt-status" role="status"></p><textarea id="llm-prompt-text" readonly spellcheck="false" aria-label="Prompt"></textarea><div class="prompt-actions"><button type="button" id="llm-prompt-copy" data-i18n="Copia prompt">Copia prompt</button><a id="llm-prompt-open" class="connect-button" target="_blank" rel="noopener noreferrer">Apri chat</a><button type="button" id="llm-prompt-close" data-i18n="Chiudi">Chiudi</button></div></dialog>
+<script src="assets/app.js?v=137270036860"></script></body></html>

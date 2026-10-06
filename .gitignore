@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.cache/
+data/
+web/data/
+target/
+*.so
+*.pyc
+node_modules/
+web/assets/
+.env
+.env.*
+replica.my.cnf
+.my.cnf
+.DS_Store
+*.md

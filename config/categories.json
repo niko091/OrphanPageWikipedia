@@ -1,0 +1,7 @@
+{
+  "min_support": 5,
+  "exclude_patterns": ["^(Wikipedia|Wikipèdia|Wikipédia|MediaWiki|Template):", "^Pagine (con|senza|da) ", "^Pages (with|without|needing) "],
+  "exclude_categories": [],
+  "category_priority": {},
+  "page_overrides": {}
+}

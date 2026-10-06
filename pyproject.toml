@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.12,<2"]
+build-backend = "maturin"
+
+[project]
+name = "orphanwiki"
+version = "0.1.0"
+description = "Wikipedia orphan analysis in Rust, PAWS collection in Python and a TypeScript dashboard"
+requires-python = ">=3.11"
+dependencies = ["PyMySQL>=1.1,<2"]
+
+[project.optional-dependencies]
+topics = ["fasttext==0.9.3", "numpy>=1.26,<3"]
+
+[tool.maturin]
+python-source = "."
+module-name = "orphanwiki._native"
