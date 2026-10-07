@@ -230,7 +230,7 @@ async function checkPaperProfiles() {
   const row=(id,name)=>rows(id).find(node=>node.children[0].textContent===name);
   const value=node=>node.children[2].textContent;
   const width=node=>node.children[1].children[0].style.width;
-  for(const [id,count] of [['topics-full',64],['topics-paper',4],['features-paper',10]])assert.equal(rows(id).length,count);
+  for(const [id,count] of [['topics-full',64],['topics-paper',4],['features-paper',6]])assert.equal(rows(id).length,count);
   for(const id of ['topics-full','topics-paper']) {
     assert(rows(id).every(node=>value(node)==='— (0/0)'));
     assert(rows(id).every(node=>node.title.includes('dato non disponibile')));
@@ -241,11 +241,11 @@ async function checkPaperProfiles() {
   assert.equal(value(row('features-paper','Lunghezza minore (< mediana)')),'100% (2/2)');
   assert(!row('features-paper','Creatore attualmente bot'));
   assert(!row('features-paper','Creatore attualmente non bot'));
-  assert.equal(value(row('features-paper','Creata da bot')),'— (0/0)');
-  assert.equal(value(row('features-paper','Creata da non bot')),'— (0/0)');
+  assert(!row('features-paper','Creata da bot'));
+  assert(!row('features-paper','Creata da non bot'));
   assert.match(row('features-paper','Voci nuove (< mediana)').title,/copertura 6\/7/);
   assert.equal(value(row('features-paper','Qualità alta (Johnson 2021)')),'— (0/0)');
-  assert.equal(value(row('features-paper','Biografie di donne')),'— (0/0)');
+  assert(!row('features-paper','Biografie di donne'));
   assert.match(nodes['features-thresholds'].textContent,/VEC: mediana età 2 giorni/);
   assert.match(nodes['features-thresholds'].textContent,/EN: mediana età 200 giorni/);
   assert.equal(JSON.stringify(raw),before);
@@ -264,7 +264,7 @@ async function checkPaperProfiles() {
   assert.equal(value(row('topics-paper','History and Society')),'— (0/0)');
   assert.match(row('topics-paper','History and Society').title,/Nessuna voce soddisfa/);
   assert.match(row('topics-paper','Culture').title,/copertura 3\/7/); // Empty predicted labels are known false.
-  assert.equal(value(row('features-paper','Biografie di donne')),'— (0/0)');
+  assert(!row('features-paper','Biografie di donne'));
   assert.equal(rows('topics-full')[0].children[0].textContent,'Culture · Biography.Women');
   const bars=()=>rows('features-paper').map(node=>[value(node),width(node)]);
   const values=bars();
@@ -287,11 +287,11 @@ async function checkPaperProfiles() {
   assert.equal(JSON.stringify(raw),withTopics);
   raw.pages.forEach(page=>page.page_created_at=null);vm.runInContext('paperProfiles()',context);
   assert.equal(value(row('features-paper','New articles (< median)')),'— (0/0)');
-  // Today's group membership never fills historical bot-at-creation rows.
+  // Bot membership does not add article characteristic rows.
   raw.pages=[{orphan:true,creator_key:'actor:1',creator_is_bot_now:true},{orphan:true,creator_key:'actor:2',creator_is_bot_now:false}];
   vm.runInContext('paperProfiles()',context);
-  assert.equal(value(row('features-paper','Created by a bot')),'— (0/0)');
-  assert.equal(value(row('features-paper','Created by a non-bot')),'— (0/0)');
+  assert(!row('features-paper','Created by a bot'));
+  assert(!row('features-paper','Created by a non-bot'));
   raw.pages=[];vm.runInContext('paperProfiles()',context);
   assert(rows('features-paper').every(node=>value(node)==='— (0/0)'));
   assert(rows('features-paper').every(node=>!width(node).includes('NaN')));
@@ -454,6 +454,20 @@ async function checkConnections() {
   assert.match(invalid.nodes.status.textContent,/Raccolta richiesta non disponibile/);
   console.log('Connections page: proposed/existing links, dead-end priority, pagination, safety and invalid routes passed.');
 }
+function assertAnchorInstructions(prompt) {
+  assert.match(prompt,/Anchor-first: fix Y as destination/);
+  assert.match(prompt,/Check disambiguation/);
+  assert.match(prompt,/title \(with\/without disambiguation parentheses\)/);
+  assert.match(prompt,/aliases attested in supplied pages; hints, not identity proof/);
+  assert.match(prompt,/existing unlinked mention with the reference anchor's sense/);
+  assert.match(prompt,/Choose by context, not just position\/spelling; link once/);
+  assert.match(prompt,/No invented probabilities\/keyphraseness\/confidence/);
+  assert.match(prompt,/Use ADD LINK for a verified unlinked mention; keep wording/);
+  assert.match(prompt,/minimal reference-supported content only if locally relevant; else skip/);
+  assert.match(prompt,/No See also solely to remove orphan status/);
+  assert.match(prompt,/existing mention\/new content\/already linked\/no relevant anchor or context\/unreadable/);
+  assert.match(prompt,/citation markup\/full named-reference definitions/);
+}
 async function checkFixPrompts() {
   const raw=fixture();raw.metadata.demo=false;
   const page={page_id:1,title:'Y à & # <img>',orphan:true,category:'Tema',creator_key:'private-actor'};
@@ -475,10 +489,10 @@ async function checkFixPrompts() {
   assert.equal(fix().target,'_blank');assert.equal(fix().rel,'noopener noreferrer');
   assert(fix().href.length<=7500);
   let text=prompt();
-  assert.match(text,/X → Y/);assert.match(text,/First read Y and each local X, then both reference pages X_B and Y_B/);
+  assert.match(text,/X → Y/);assert.match(text,/Read Y, each local X and all X_B\/Y_B once/);
   assert.match(text,/Reply in Italian/);assert.match(text,/propose up to 5 distinct relevant edits/);
   assert.match(text,/always preferring suitable Dead-end pages/);
-  assert.match(text,/unique, exact existing text string in local X source/);assert.match(text,/copyable Wikipedia wikitext/);
+  assert.match(text,/unique verbatim source Ctrl\+F anchor/);assert.match(text,/copyable Wikipedia wikitext/);
   assert.match(text,/exactly ADD LINK/);assert.match(text,/Markdown table with exactly these four columns/);
   assert.match(text,/Link pagina lingua da cambiare \| Link pagina lingua di provenienza \| Stringa da cercare con Ctrl\+F \| Stringa da inserire \/ ADD LINK/);
   assert.match(text,/neutrality, verifiability, no original research/);
@@ -486,29 +500,30 @@ async function checkFixPrompts() {
   // explicit census flags, relevant relationships and copyable edit instructions.
   assert.match(text,/Use ONLY the supplied Wikipedia pages/);
   assert.match(text,/Do not search the web, open external citation links/);
-  assert.match(text,/Transfer only facts explicitly present in the reference Wikipedia pages/);
+  assert.match(text,/Use only facts stated in supplied references/);
   assert.match(text,/never invent sources/);assert(!text.includes("checking the reference article's original citations"));
-  assert.match(text,/Read local source wikitext for exact anchors and syntax/);
-  assert.match(text,/if raw access fails, try Wikipedia's source view\/API on the same wiki/);
+  assert.match(text,/Use exact local source wikitext\/anchors\/syntax/);
+  assert.match(text,/on raw failure try one same-wiki source view\/API fallback/);
   assert.match(text,/never guess text from rendered output/);
   assert.match(text,/Truncated\/error\/login pages are unreadable/);
-  assert.match(text,/Orphan tags\/name absence do not prove absent links/);
+  assert.match(text,/Orphan tags\/name absence\/bold\/navbox labels prove nothing/);
   assert.match(text,/including piped\/redirect links/);
-  assert.match(text,/Verify actual href\/redirect targets/);
-  assert.match(text,/bold text or navbox labels are not proof of links/);
-  assert.match(text,/If unverified, existing-link status is unknown/);
+  assert.match(text,/Verify href\/resolved targets/);
+  assert.match(text,/unverified stays unknown/);
+  assert.match(text,/Skip existing X → Y links/);
   assert.match(text,/Use ONLY supplied local census dead_end flags/);
   assert.match(text,/unknown stays unknown/);assert.match(text,/Never infer them from rendered text/);
   assert.match(text,/shared navbox\/category, profession or team alone does not justify new prose/);
   assert.match(text,/inclusion criteria, date, place and ordering/);
   assert.match(text,/birthplace, residence and place of death are not interchangeable/);
-  assert.match(text,/BEFORE, AFTER or REPLACE outside the copyable code/);
+  assert.match(text,/BEFORE\/AFTER\/REPLACE outside code/);
   assert.match(text,/complete replacement text/);
   assert.match(text,/numbered fenced wikitext block below the table with real newlines/);
   assert.match(text,/exact unlinked words referring to Y/);
-  assert.match(text,/explicit Markdown link to local X/);
+  assert.match(text,/local X Markdown link/);
   assert.match(text,/row-numbered evidence notes/);assert.match(text,/No deliberation/);
-  assert.match(text,/Fewer than five rows, including none, is acceptable/);
+  assert.match(text,/Zero rows are valid/);
+  assertAnchorInstructions(text);
   assert(text.includes('Target source view: https://vec.wikipedia.org/w/index.php?curid=1&action=raw'));
   const referenceViews=text.split('Reference source views:\n')[1].split('\n');
   assert.equal(referenceViews.length,6); // shared Y_B raw URL appears once, not once per candidate
@@ -634,9 +649,10 @@ async function checkSingleConnectionPrompts() {
     assert.match(prompt,/Evaluate only this single proposed link X → Y/);
     assert.match(prompt,/Do not evaluate, suggest or edit other local source pages/);
     assert.match(prompt,/at most one edit \(one table row\)/);
+    assertAnchorInstructions(prompt);
     assert.match(prompt,/include every supplied reference source URL in that same row/);
     assert.match(prompt,/local census dead_end=false/);
-    assert(!prompt.includes('up to 5'));assert(!prompt.includes('Other '));assert(!prompt.includes('Unrelated'));
+    assert(!prompt.includes('up to 5'));assert(!prompt.includes('/wiki/Other_'));assert(!prompt.includes('/wiki/Unrelated_'));
     assert.equal((prompt.match(/^\d+\. Local X/gm)||[]).length,1);
     assert.equal((prompt.match(/Observed reference edge/g)||[]).length,3);
     assert(prompt.includes('https://roa-tara.wikipedia.org/wiki/Chosen_%C3%A0_%26_%23'));
@@ -664,7 +680,7 @@ async function checkSingleConnectionPrompts() {
   }
   assert.equal((prompt.match(/Observed reference edge/g)||[]).length,7);
   assert.equal(prompt.split('Reference source views:\n')[1].split('\n').length,14);
-  assert(!prompt.includes('Other '));assert(!prompt.includes('up to 5'));
+  assert(!prompt.includes('/wiki/Other_'));assert(!prompt.includes('up to 5'));
   assert.equal(JSON.stringify(raw),fullData);assert.equal(getFetchCount(),fetches);
   // Invalid/missing evidence must disable only its own card, without borrowing another candidate.
   for(const evidence of [[],[{language:'lmo.evil',source_title:'Bad',target_title:'Bad'}]]) {

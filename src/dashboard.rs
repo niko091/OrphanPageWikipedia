@@ -158,18 +158,7 @@ fn profiles(pages: Vec<ProfileObservation>) -> Result<Profiles, String> {
             )
         }),
     );
-    let labels = [
-        "new",
-        "old",
-        "quality_high",
-        "quality_low",
-        "created_bot",
-        "created_non_bot",
-        "women",
-        "other_biographies",
-        "short",
-        "long",
-    ];
+    let labels = ["new", "old", "quality_high", "quality_low", "short", "long"];
     let features = summary(
         labels.map(str::to_owned).to_vec(),
         totals,
@@ -183,18 +172,7 @@ fn profiles(pages: Vec<ProfileObservation>) -> Result<Profiles, String> {
             let length = split(*length, 1);
             (
                 usize::from(!orphan),
-                vec![
-                    age,
-                    age.map(|v| !v),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    length,
-                    length.map(|v| !v),
-                ],
+                vec![age, age.map(|v| !v), None, None, length, length.map(|v| !v)],
             )
         }),
     );
@@ -545,9 +523,9 @@ mod tests {
         assert_eq!(report.features.rows[0].orphans, 1);
         assert_eq!(report.features.rows[1].orphans, 1);
         assert_eq!(report.features.rows[2].known, 0);
-        assert_eq!(report.features.rows.len(), 10);
-        assert_eq!(report.features.rows[4].known, 0);
-        assert_eq!(report.features.rows[5].percent, None);
+        assert_eq!(report.features.rows.len(), 6);
+        assert_eq!(report.features.rows[4].known, 2);
+        assert_eq!(report.features.rows[5].percent, Some(0.0));
     }
     #[test]
     fn aggregate_creators_remain_scoped_and_empty_bot_groups_undefined() {
