@@ -23,28 +23,6 @@ def demo():
             'pages': pages, 'redirects': {}, 'category_parents': {'Scritori': ['Cultura'], 'Musica': ['Cultura'], 'Montagne': ['Mondo'], 'Fiumi': ['Mondo'], 'Comuni': ['Mondo'], 'Storia': ['Mondo']}}
 
 
-def demo_creators(raw):
-    language = raw['metadata']['language']
-    records = []
-    for i, page in enumerate(raw['pages']):
-        group = [p for j, p in enumerate(raw['pages']) if j % 15 == i % 15]
-        prior = sum(p['created_at'] < page['created_at'] for p in group)
-        records.append({
-            'page_id': page['page_id'], 'article_created_at': page['created_at'],
-            'creator_key': f'demo:{language}:creator:{i % 15}', 'creator_attribution': 'synthetic',
-            'creator_account_type': ['registered', 'bot', 'temporary'][i % 3],
-            'creator_is_bot_now': i % 3 == 1,
-            'creator_tenure_days': prior * 100, 'creator_prior_edits_main': prior * 12,
-            'creator_prior_edits_other': prior * 3, 'creator_prior_articles': prior,
-            'creator_articles_created_total': len(group),
-            'creator_languages_created': [language], 'creator_languages_before': [language] if prior else [],
-            'origin': 'translation_tagged' if i % 4 == 0 else 'new_page_unclassified',
-        })
-    return {'metadata': {'language': language, 'source': 'synthetic', 'demo': True, 'complete': True,
-                         'started_at': raw['metadata']['started_at'], 'finished_at': raw['metadata']['finished_at'],
-                         'languages_scanned': [language]}, 'pages': records}
-
-
 def graph_reference(raw):
     titles = [p['title'] for p in raw['pages']]
     index = {title: i for i, title in enumerate(titles)}
@@ -69,6 +47,38 @@ def graph_reference(raw):
     return incoming, outgoing, unresolved, sources
 
 
+def add_synthetic_creators(result):
+    """Give DOM tests varied creator values without a research supplement."""
+    pages = result['pages']
+    language = result['metadata']['language']
+    for index, page in enumerate(pages):
+        group = [other for position, other in enumerate(pages) if position % 15 == index % 15]
+        prior = sum(other['created_at'] < page['created_at'] for other in group)
+        orphans = sum(other['orphan'] for other in group)
+        page.update(creator_key=f'demo:{language}:creator:{index % 15}',
+                    creator_attribution='synthetic',
+                    creator_account_type=['registered', 'bot', 'temporary'][index % 3],
+                    creator_is_bot_now=index % 3 == 1,
+                    creator_tenure_days=prior * 100,
+                    creator_prior_edits_main=prior * 12,
+                    creator_prior_edits_other=prior * 3,
+                    creator_prior_articles=prior,
+                    creator_articles_created_total=len(group),
+                    creator_articles_in_census=len(group),
+                    creator_orphans_current=orphans,
+                    creator_orphans_current_share=orphans / len(group),
+                    creator_languages_created=[language],
+                    creator_languages_before=[language] if prior else [],
+                    creator_data_status='matched',
+                    origin='translation_tagged' if index % 4 == 0 else 'new_page_unclassified')
+    result['metadata']['creators'] = {
+        'status': 'collected', 'language': language, 'languages_scanned': [language],
+        'matched_pages': len(pages), 'unmatched_pages': 0,
+        'started_at': result['metadata']['started_at'],
+        'finished_at': result['metadata']['finished_at'],
+    }
+
+
 if __name__ == '__main__':
     import argparse
     from pathlib import Path
@@ -82,7 +92,8 @@ if __name__ == '__main__':
     reference['metadata']['language'] = 'lmo'
     for i, page in enumerate(reference['pages']):
         page['links'] = [reference['pages'][(i + 1) % len(reference['pages'])]['title']] if i % 2 == 0 else []
-    supplements = {r['metadata']['language']: demo_creators(r) for r in [raw, reference]}
-    results = compare_languages([raw, reference], creators=supplements)
+    results = compare_languages([raw, reference])
+    for result in results.values():
+        add_synthetic_creators(result)
     export_result(results['vec'], args.output)
     export_result(results['lmo'], Path(args.output).parent / 'lmo-demo.json')

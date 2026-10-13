@@ -10,15 +10,67 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
 
-def replica_database(language, database=None):
-    """Resolve a Wikipedia replica name, permitting explicit historical names."""
+
+def prepared_summaries_match(summary_path, creators_path, metadata, sources, page_count=None):
+    """Validate cached chart and creator transports against their source files."""
+    try:
+        summary = json.loads(Path(summary_path).read_text(encoding='utf-8'))
+        creators = json.loads(Path(creators_path).read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(summary, dict) or not isinstance(creators, dict):
+        return False
+    summary_metadata = summary.get('metadata')
+    if metadata.get('kind') == 'aggregate' and isinstance(summary_metadata, dict):
+        metadata_matches = {key: value for key, value in summary_metadata.items()
+                            if key not in ('creators', 'history')} == metadata
+    else:
+        metadata_matches = summary_metadata == metadata
+    count = summary.get('census_page_count')
+    return (summary.get('format') == 'dashboard_summary_v1'
+            and summary.get('histogram_rule') == HISTOGRAM_RULE
+            and creators.get('format') == 'creator_index_v1'
+            and metadata_matches and creators.get('metadata') == summary_metadata
+            and summary.get('sources') == sources == creators.get('sources')
+            and type(count) is int and count >= 0 and count == creators.get('census_page_count')
+            and (page_count is None or count == page_count))
+
+
+def wiki_database(language, database=None):
+    """Resolve the configured database name for a Wikipedia edition."""
     if not isinstance(language, str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,19}', language) or language == 'all':
         raise ValueError('Codice lingua non valido')
     database = language.replace('-', '_') + 'wiki' if database is None else database
     if not isinstance(database, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,40}wiki', database):
         raise ValueError('Nome database Wikipedia non valido (senza suffisso _p)')
     return database
+
+
+def configured_languages(path='config/languages.json'):
+    """Return every configured edition; this is the sole collection selection."""
+    config = json.loads(Path(path).read_text(encoding='utf-8'))
+    if not isinstance(config, dict) or set(config) - {'version', 'languages', 'databases'}:
+        raise ValueError('Configurazione lingue non valida')
+    languages = config.get('languages')
+    databases = config.get('databases', {})
+    if (config.get('version') != 1 or not isinstance(languages, list) or not languages
+            or any(not isinstance(code, str) for code in languages)
+            or len(languages) != len(set(languages)) or not isinstance(databases, dict)
+            or set(databases) - set(languages)):
+        raise ValueError('Configurazione lingue non valida')
+    return [(code, wiki_database(code, databases.get(code))) for code in languages]
+
+
+def _approved_graph_source(metadata, database):
+    if metadata.get('demo'):
+        return True
+    return (metadata.get('source') == 'Wikimedia SQL dumps / ' + database
+            and isinstance(metadata.get('sql_release'), str)
+            and re.fullmatch(r'20[0-9]{6}', metadata['sql_release']) is not None
+            and isinstance(metadata.get('dump_manifest_sha256'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', metadata['dump_manifest_sha256']) is not None)
 
 
 def load_topic_model(path, configuration='config/topics.json'):
@@ -50,7 +102,7 @@ def load_topic_model(path, configuration='config/topics.json'):
 
 
 def predict_topics(raw, model, spec, batch_size=256, deadline=None):
-    """One native graph call, then bounded fastText batches over PAWS QIDs.
+    """One native graph call, then bounded fastText batches over dump QIDs.
 
     O(V+E+R) graph work and O(V+E) extra adjacency/sets. The model is loaded
     once outside this function. No text, API enrichment or downloaded article
@@ -59,10 +111,10 @@ def predict_topics(raw, model, spec, batch_size=256, deadline=None):
     """
     if (raw['metadata'].get('complete') is not True or
             raw['metadata'].get('item_mapping') != {'source': 'page_props.wikibase_item', 'complete': True}):
-        raise ValueError('I temi richiedono grafo e identificativi PAWS completi')
-    database = replica_database(raw['metadata']['language'], raw['metadata'].get('database'))
-    if not raw['metadata'].get('demo') and raw['metadata'].get('source') != 'Wiki Replicas / ' + database:
-        raise ValueError('Usare esclusivamente censimenti PAWS per il modello')
+        raise ValueError('I temi richiedono un grafo completo con identificativi di pagina')
+    database = wiki_database(raw['metadata']['language'], raw['metadata'].get('database'))
+    if not _approved_graph_source(raw['metadata'], database):
+        raise ValueError('Usare esclusivamente dump SQL verificati')
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= 10000:
         raise ValueError('Dimensione del blocco non valida')
     def check_deadline():
@@ -108,7 +160,9 @@ def predict_topics(raw, model, spec, batch_size=256, deadline=None):
             print(f"Temi {raw['metadata']['language']}: {done}/{len(eligible)} voci; stima inferenza totale {elapsed / done * len(eligible):.1f}s", flush=True)
     check_deadline()
     prediction_seconds = time.monotonic() - prediction_started
-    return {'metadata': {'language': raw['metadata']['language'], 'source': 'local_model_on_PAWS_replica_outlinks',
+    topic_source = ('local_model_on_synthetic_outlinks' if raw['metadata'].get('demo')
+                    else 'local_model_on_verified_SQL_dump_outlinks')
+    return {'metadata': {'language': raw['metadata']['language'], 'source': topic_source,
                          'demo': raw['metadata'].get('demo', False), 'complete': True,
                          'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
                          'input_sha256': json_sha256(raw), 'graph_finished_at': raw['metadata']['finished_at'],
@@ -123,10 +177,11 @@ def attach_topics(rows, raw, supplement):
     """Join a complete local inference run to its exact graph; never infer gender."""
     meta = supplement.get('metadata', {})
     if (meta.get('language') != raw['metadata']['language'] or meta.get('complete') is not True or
-            meta.get('source') != 'local_model_on_PAWS_replica_outlinks' or
+            meta.get('source') != ('local_model_on_synthetic_outlinks' if raw['metadata'].get('demo')
+                                   else 'local_model_on_verified_SQL_dump_outlinks') or
             bool(meta.get('demo')) != bool(raw['metadata'].get('demo')) or
             meta.get('input_sha256') != json_sha256(raw)):
-        raise ValueError('Supplemento dei temi non corrispondente al grafo PAWS')
+        raise ValueError('Supplemento dei temi non corrispondente al grafo')
     model_labels = meta.get('model', {}).get('labels', [])
     if (not isinstance(model_labels, list) or len(model_labels) != 64 or
             any(not isinstance(label, str) or '.' not in label for label in model_labels)):
@@ -166,7 +221,7 @@ def aggregate_index(results, files):
     members = []
     for language, result in sorted(results.items()):
         meta = result['metadata']
-        replica_database(language, meta.get('database'))
+        wiki_database(language, meta.get('database'))
         if meta['language'] != language or meta.get('complete') is not True:
             raise ValueError('L’aggregato richiede censimenti completi, uno per lingua')
         if not re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', files[language]):
@@ -176,17 +231,21 @@ def aggregate_index(results, files):
     if len({bool(m['metadata'].get('demo')) for m in members}) != 1:
         raise ValueError('Non mescolare dati sintetici e dati reali')
     age_rules = {m['metadata'].get('age_rule') for m in members}
+    historical_age_rules = {m['metadata'].get('historical_age_rule') for m in members}
     from ._native import collection_interval
     start, finish = collection_interval([(m['metadata']['started_at'], m['metadata']['finished_at']) for m in members])
     return {'metadata': {
         'kind': 'aggregate', 'language': 'all', 'languages': sorted(results),
         'complete': True, 'demo': bool(members[0]['metadata'].get('demo')),
-        'source': 'Wiki Replicas / PAWS (aggregate of local censuses)',
+        'source': ('Synthetic complete graphs' if members[0]['metadata'].get('demo')
+                   else 'Wikimedia SQL dumps (aggregate of source-specific releases)'),
         'started_at': start,
         'finished_at': finish,
-        'temporal_consistency': 'independent_live_collection_intervals',
+        'temporal_consistency': 'independent_source_specific_intervals',
         'observation_unit': 'language_page',
         'age_rule': next(iter(age_rules)) if len(age_rules) == 1 else 'mixed_per_language',
+        'historical_age_rule': (next(iter(historical_age_rules)) if len(historical_age_rules) == 1
+                                else 'mixed_per_language'),
         'length_unit': 'UTF-8 wikitext bytes',
     }, 'members': members}
 
@@ -201,21 +260,20 @@ def _comparison_schema(connection):
             PRIMARY KEY(language,item), UNIQUE(language,id)) WITHOUT ROWID;
         CREATE INDEX items_by_item ON items(item,language,id);
         CREATE TABLE ambiguous(language TEXT, item TEXT, PRIMARY KEY(language,item)) WITHOUT ROWID;
-        CREATE TABLE edges(language TEXT, target INTEGER, source INTEGER,
-            PRIMARY KEY(language,target,source)) WITHOUT ROWID;
+        CREATE TABLE edges(language TEXT, target INTEGER, source INTEGER);
         CREATE TABLE candidates(language TEXT, id INTEGER, data TEXT,
             PRIMARY KEY(language,id)) WITHOUT ROWID;''')
 
 
-def _comparison_analysis(raw, rules, creators, topics):
+def _comparison_analysis(raw, rules, topics, history=None):
     meta = raw['metadata']
     language = meta['language']
-    database = replica_database(language, meta.get('database'))
-    if not meta.get('demo') and meta.get('source') != 'Wiki Replicas / ' + database:
-        raise ValueError('Usare esclusivamente raccolte Wiki Replicas tramite PAWS')
+    database = wiki_database(language, meta.get('database'))
+    if not _approved_graph_source(meta, database):
+        raise ValueError('Usare esclusivamente dump SQL verificati')
     if meta.get('item_mapping') != {'source': 'page_props.wikibase_item', 'complete': True}:
-        raise ValueError(f'{language}: identificativi interlingua non raccolti; ripetere collect con il codice aggiornato')
-    result = analyze(raw, rules, creators, include_sources=True, topics=topics)
+        raise ValueError(f'{language}: identificativi interlingua non raccolti; importare un dump completo')
+    result = analyze(raw, rules, include_sources=True, topics=topics, history=history)
     result['metadata']['input_sha256'] = json_sha256(raw)
     return result
 
@@ -269,9 +327,7 @@ def _comparison_candidates(connection, language, page_id, item):
             else:
                 counterparts.append({'language': other, 'status': 'orphan' if incoming == 0 else 'non_orphan',
                                      'page_id': pid, 'title': title, 'in_degree': incoming})
-        # CROSS JOIN fixes the lookup order: find the target's incoming edges
-        # before their source items. Otherwise SQLite may scan every item of a
-        # reference wiki for each orphan, despite the available edge index.
+        # Keep the target-edge lookup ahead of source-item joins for each orphan.
         edges = connection.execute('''
             SELECT lp.id,lp.title,lp.outgoing,bt.language,bp.id,bp.title,bt.id,bt.title
             FROM items ti CROSS JOIN edges e ON e.language=ti.language AND e.target=ti.id
@@ -330,6 +386,11 @@ class _StagedCandidates(Mapping):
 
 def _finish_comparison(connection):
     """Same indexed matching for file and in-memory callers; one orphan at a time."""
+    # The edge stream is appended while each wiki is analyzed. Build its
+    # lookup index once, after all inserts, to avoid random B-tree writes for
+    # hundreds of millions of links in a large SQL collection.
+    connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS edges_by_target '
+                       'ON edges(language,target,source)')
     wikis = [(language, json.loads(meta), count) for language, meta, count in
              connection.execute('SELECT language,metadata,page_count FROM wikis ORDER BY language')]
     if len(wikis) < 2:
@@ -353,9 +414,9 @@ def _finish_comparison(connection):
                     print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)
         meta['comparison'] = {'rule': 'cross_language_incoming_v1', 'status': 'compared',
             'reference_languages': [other for other, _, _ in wikis if other != language],
-            'collections': provenance, 'matching_source': 'local page_props.wikibase_item via PAWS',
+            'collections': provenance, 'matching_source': 'local page_props.wikibase_item from SQL dumps',
             'ambiguous_items_excluded': ambiguous, 'mapped_articles': mapped,
-            'temporal_consistency': 'independent_live_collection_intervals',
+            'temporal_consistency': 'independent_source_specific_intervals',
             'interpretation': 'candidates for manual review, not validated recommendations'}
         results[language] = {'metadata': meta, 'pages': _StagedPages(connection, language, count),
                              'link_candidates': _StagedCandidates(connection, language)}
@@ -363,47 +424,72 @@ def _finish_comparison(connection):
     return results
 
 
-def compare_languages(raws, rules=None, creators=None, topics=None):
-    """Compatibility API for already-loaded graphs; file CLI uses bounded staging.
+def compare_languages(raws, rules=None, topics=None, histories=None):
+    """Materialized comparison for small synthetic parity tests.
 
     Both paths share one matching algorithm. This API deliberately materializes
     its return value; use compare_files for large on-disk collections.
     """
-    creators, topics = creators or {}, topics or {}
+    topics, histories = topics or {}, histories or {}
     languages = [r['metadata']['language'] for r in raws]
-    if set(creators) - set(languages) or set(topics) - set(languages):
+    if set(topics) - set(languages) or set(histories) - set(languages):
         raise ValueError('Supplemento senza la corrispondente raccolta')
     with closing(sqlite3.connect(':memory:')) as connection:
         _comparison_schema(connection)
         for raw in raws:
             language = raw['metadata']['language']
-            _stage_comparison(connection, _comparison_analysis(raw, rules, creators.get(language), topics.get(language)))
+            _stage_comparison(connection, _comparison_analysis(raw, rules, topics.get(language),
+                                                                histories.get(language)))
         return {lang: {**result, 'pages': list(result['pages']), 'link_candidates': dict(result['link_candidates'].items())}
                 for lang, result in _finish_comparison(connection).items()}
 
 
-def _comparison_file_worker(path, staging, rules, creators, topics, sender):
+def _comparison_file_worker(path, staging, rules, topics, histories, sender):
     """A sequential spawned worker releases all graph/JSON/native allocations."""
     try:
-        raw = json.loads(Path(path).read_text())
-        language = raw['metadata']['language']
-        print(f'Analisi integrale {language}: {len(raw["pages"])} voci', flush=True)
-        creator = creators.get(language)
-        checkpoint = Path(path).with_name(Path(path).stem.removesuffix('-raw') + '-creators.json')
-        if creator is None and not raw.get('creator_data') and checkpoint.exists():
-            creator = checkpoint
+        from .dumps import _read_first_metadata
+        graph_metadata = _read_first_metadata(path)
+        language = graph_metadata['language']
         topic = topics.get(language)
         checkpoint = Path(path).with_name(Path(path).stem.removesuffix('-raw') + '-topics.json')
         if topic is None and checkpoint.exists():
             topic = checkpoint
-        extra = json.loads(Path(creator).read_text()) if creator is not None else None
-        predictions = json.loads(Path(topic).read_text()) if topic is not None else None
-        result = _comparison_analysis(raw, rules, extra, predictions)
-        del raw, extra, predictions
-        print(f'Grafo {language} risolto; salvataggio degli indici su disco', flush=True)
+        history = histories.get(language)
+        checkpoint = Path(path).with_name(Path(path).stem.removesuffix('-raw') + '-history.json')
+        if history is None and checkpoint.exists():
+            history = checkpoint
+        bounded = (Path(path).stat().st_size >= 128 * 1024**2 and
+                   graph_metadata.get('source', '').startswith('Wikimedia SQL dumps / '))
         with closing(sqlite3.connect(staging)) as connection:
-            connection.executescript('PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;')
-            _stage_comparison(connection, result)
+            # Random target-key inserts dominate the large SQL comparison.
+            # Keep its B-tree pages in a bounded cache instead of rereading
+            # them from disk for each source-page batch.
+            cache_kib = 262144 if bounded else 8192
+            connection.execute(f'PRAGMA cache_size=-{cache_kib}')
+            connection.execute('PRAGMA temp_store=FILE')
+            if bounded:
+                # This database is unpublished staging and is discarded on a
+                # failed comparison; per-batch disk sync is unnecessary.
+                connection.execute('PRAGMA synchronous=OFF')
+            if bounded:
+                from .dumps import analyze_imported_dump
+                candidate_stage = Path(staging).parent.parent
+                database = wiki_database(language, graph_metadata.get('database'))
+                release = graph_metadata['sql_release']
+                import_work_dir = (candidate_stage if (candidate_stage / f'{database}-{release}.sqlite').is_file()
+                                   else None)
+                print(f'Analisi SQL a blocchi {language}', flush=True)
+                analyze_imported_dump(path, history, Path(staging).parent / 'comparison-analysis.json',
+                                      rules, import_work_dir, topic, comparison_connection=connection)
+            else:
+                raw = json.loads(Path(path).read_text())
+                print(f'Analisi integrale {language}: {len(raw["pages"])} voci', flush=True)
+                predictions = json.loads(Path(topic).read_text()) if topic is not None else None
+                historical = json.loads(Path(history).read_text()) if history is not None else None
+                result = _comparison_analysis(raw, rules, predictions, historical)
+                del raw, predictions
+                print(f'Grafo {language} risolto; salvataggio degli indici su disco', flush=True)
+                _stage_comparison(connection, result)
         try:
             import resource
             import sys
@@ -419,11 +505,12 @@ def _comparison_file_worker(path, staging, rules, creators, topics, sender):
 
 
 @contextmanager
-def compare_files(paths, rules=None, creators=None, topics=None, work_dir=None):
-    """O(largest graph + largest orphan candidate list) RAM, SQLite disk staging.
+def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None):
+    """Sequential comparisons with verified SQL staging for large imported wikis.
 
-    Every census is analyzed once in an isolated sequential worker. Resolved
-    matchable edges, article observations and candidates are streamed to disk.
+    Each worker streams matchable edges, article observations and candidates to
+    SQLite. Large imported editions retain titles and redirect mappings in RAM,
+    but never materialize all raw pages, revisions or source adjacency together.
     Results must be exported within this context, before closing the database.
     """
     if len(paths) < 2:
@@ -431,13 +518,13 @@ def compare_files(paths, rules=None, creators=None, topics=None, work_dir=None):
     def supplements(files):
         result = {}
         for path in files or []:
-            data = json.loads(Path(path).read_text())
-            language = data['metadata']['language']
+            from .dumps import _read_first_metadata
+            language = _read_first_metadata(path)['language']
             if language in result:
                 raise ValueError('Un solo supplemento per lingua')
             result[language] = str(path)
         return result
-    creators, topics = supplements(creators), supplements(topics)
+    topics, histories = supplements(topics), supplements(histories)
     context = multiprocessing.get_context('spawn')
     with tempfile.TemporaryDirectory(prefix='orphanwiki-compare-', dir=work_dir) as folder:
         staging = str(Path(folder) / 'comparison.sqlite')
@@ -447,7 +534,7 @@ def compare_files(paths, rules=None, creators=None, topics=None, work_dir=None):
             for position, path in enumerate(paths, 1):
                 receiver, sender = context.Pipe(duplex=False)
                 worker = context.Process(target=_comparison_file_worker,
-                    args=(str(path), staging, rules, creators, topics, sender))
+                    args=(str(path), staging, rules, topics, histories, sender))
                 try:
                     worker.start()
                     sender.close()
@@ -473,19 +560,17 @@ def compare_files(paths, rules=None, creators=None, topics=None, work_dir=None):
                     receiver.close()
                     sender.close()
                     worker.close()
-            if set(creators) - languages or set(topics) - languages:
+            if set(topics) - languages or set(histories) - languages:
                 raise ValueError('Supplemento senza la corrispondente raccolta')
             yield _finish_comparison(connection)
 
 
-def analyze(raw, rules=None, creators=None, include_sources=False, topics=None):
+def analyze(raw, rules=None, include_sources=False, topics=None, history=None):
     from .categories import classify
-    if creators is None:
-        creators = raw.get('creator_data')
     language = raw['metadata']['language']
-    replica_database(language, raw['metadata'].get('database'))
+    wiki_database(language, raw['metadata'].get('database'))
     if 'biographies' in raw['metadata'] or any('biography' in p for p in raw['pages']):
-        raise ValueError('Dataset arricchito da una fonte esterna: usare la raccolta originale della lingua ottenuta su PAWS.')
+        raise ValueError('Dataset arricchito da una fonte esterna: usare i dump ufficiali non modificati')
     if raw['metadata'].get('complete') is not True:
         raise ValueError('Il grafo deve comprendere tutta la wiki: un campione genera false orfane.')
     redirects = raw.get('redirects', {})
@@ -500,33 +585,30 @@ def analyze(raw, rules=None, creators=None, include_sources=False, topics=None):
     else:
         ins, outs, unresolved = graph_counts(titles, links, redirects)
     choices = classify(raw['pages'], raw.get('category_parents', {}), rules or {})
-    creation_events = raw['metadata'].get('creation_date_rule') == 'creation_event_v1' or (creators or {}).get('metadata', {}).get('creation_date_rule') == 'creation_event_v1'
+    creation_events = raw['metadata'].get('creation_date_rule') == 'creation_event_v1'
     rows = []
     for p, incoming, outgoing in zip(raw['pages'], ins, outs):
-        created = p.get('page_created_at') if creation_events else p.get('created_at')
-        rows.append({
-            'page_id': p['page_id'], 'title': p['title'], 'revision_id': p.get('revision_id'),
-            'wikibase_item': p.get('wikibase_item'),
-            **choices[p['page_id']], 'categories': p.get('categories', []),
-            'created_at': created, 'length_bytes': p.get('length_bytes'),
-            'first_public_revision_at': p.get('first_public_revision_at', p.get('created_at')),
-            'page_created_at': p.get('page_created_at'),
-            'creation_date_source': p.get('creation_date_source'),
-            'creation_date_status': p.get('creation_date_status', 'not_collected'),
-            'in_degree': incoming, 'out_degree': outgoing,
-            'orphan': incoming == 0,
-        })
-    creator_metadata = attach_creators(rows, raw['metadata'], creators)
+        rows.append(observation_row(p, choices[p['page_id']], incoming, outgoing, creation_events))
+    creator_metadata = initialize_creator_rows(rows)
+    history_metadata = attach_history(rows, raw['metadata'], history)
     ages = article_ages(raw['metadata']['finished_at'],
                         [r['page_created_at'] if creation_events else r['created_at'] for r in rows])
-    for row, (age, after_collection) in zip(rows, ages):
+    history_ages = article_ages(raw['metadata']['finished_at'],
+                                [r['history_first_revision_at'] for r in rows])
+    for row, (age, after_collection), (history_age, _) in zip(rows, ages, history_ages):
         row['created_at'] = row['page_created_at'] if creation_events else row['created_at']
         row['age_days'] = age
+        row['history_first_revision_age_days'] = history_age
         if after_collection:
             row['creation_date_status'] = 'after_graph_collection'
-    result = {'metadata': {**raw['metadata'], 'creators': creator_metadata, 'unresolved_target_occurrences': unresolved,
+    result = {'metadata': {**raw['metadata'], 'creators': creator_metadata, 'history': history_metadata,
+                         'unresolved_target_occurrences': unresolved,
                          'category_rule': 'structural_specificity_v1', 'category_rules': rules or {}, 'engine': 'rust',
-                         'age_rule': 'page_creation_event' if creation_events else 'first_public_revision_legacy',
+                         'age_rule': ('page_creation_event' if creation_events else
+                                      'unavailable_no_approved_creation_event' if raw['metadata'].get('source', '').startswith('Wikimedia SQL dumps / ')
+                                      else 'first_public_revision_legacy'),
+                         'historical_age_rule': ('mediawiki_history_first_observed_revision_v1'
+                                                 if history_metadata['status'] == 'collected' else 'not_collected'),
                          'length_unit': 'UTF-8 wikitext bytes'}, 'pages': rows}
     if topics is not None:
         result['metadata']['topics'] = attach_topics(rows, raw, topics)
@@ -534,6 +616,22 @@ def analyze(raw, rules=None, creators=None, include_sources=False, topics=None):
     if include_sources:
         result['_incoming_sources'] = sources
     return result
+
+
+def observation_row(page, choice, incoming, outgoing, creation_events=False):
+    """Build one article observation from native graph and category results."""
+    created = page.get('page_created_at') if creation_events else page.get('created_at')
+    return {
+        'page_id': page['page_id'], 'title': page['title'], 'revision_id': page.get('revision_id'),
+        'wikibase_item': page.get('wikibase_item'), **choice,
+        'categories': page.get('categories', []), 'created_at': created,
+        'length_bytes': page.get('length_bytes'),
+        'first_public_revision_at': page.get('first_public_revision_at', page.get('created_at')),
+        'page_created_at': page.get('page_created_at'),
+        'creation_date_source': page.get('creation_date_source'),
+        'creation_date_status': page.get('creation_date_status', 'not_collected'),
+        'in_degree': incoming, 'out_degree': outgoing, 'orphan': incoming == 0,
+    }
 
 
 def _json_chunks(value, ensure_ascii=False, sort_keys=False):
@@ -565,7 +663,7 @@ def json_sha256(value):
 # Complete observations and link evidence remain in the canonical JSON/CSV.
 OBSERVATION_COLUMNS = (
     'page_id', 'title', 'category', 'category_status', 'orphan', 'in_degree',
-    'out_degree', 'created_at', 'age_days', 'length_bytes', 'origin',
+    'out_degree', 'created_at', 'age_days', 'history_first_revision_age_days', 'length_bytes', 'origin',
     'creator_key', 'creator_data_status', 'creator_account_type',
     'creator_tenure_days', 'creator_prior_edits_main', 'creator_prior_edits_other',
     'creator_prior_articles', 'creator_articles_created_total',
@@ -573,11 +671,15 @@ OBSERVATION_COLUMNS = (
     'creator_orphans_current_share', 'creator_orphans_at_30_days',
     'creator_attribution', 'creator_registered_at', 'creator_tenure_status',
     'creator_experience_status', 'topic_labels', 'topic_status', 'topic_input_count',
-    'wikibase_item', 'page_created_at', 'first_public_revision_at',
+    'wikibase_item', 'page_created_at', 'first_public_revision_at', 'history_first_revision_at',
     'creation_date_source', 'creation_date_status',
     'creator_account_type_at_creation', 'creator_is_bot_now',
     'creator_languages_created', 'creator_languages_before', 'creation_tags',
     'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status',
+    'history_creator_key', 'history_creator_status', 'history_data_status',
+    'creator_groups_at_creation_history', 'creator_continuity_months_before_creation',
+    'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history',
+    'creator_prior_edits_other_history',
 )
 
 
@@ -620,7 +722,7 @@ def write_dashboard_exports(source, folder, expected=None):
         section, _, metadata = next(events)
         if section != 'metadata' or metadata.get('complete') is not True:
             raise ValueError('Raccolta completa richiesta')
-        replica_database(metadata.get('language'))
+        wiki_database(metadata.get('language'))
         if expected and (metadata['language'] != expected['language'] or
                          bool(metadata.get('demo')) != bool(expected.get('demo')) or
                          metadata.get('finished_at') != expected['date']):
@@ -628,9 +730,16 @@ def write_dashboard_exports(source, folder, expected=None):
         generation = json_sha256([metadata, initial.st_size, initial.st_mtime_ns])[:12]
         directory = source.stem + '-connections-' + generation
         filenames = {'observations_file': source.stem + '-observations.json',
+                     'summary_file': source.stem + '-summary.json',
+                     'creator_index_file': source.stem + '-creators.json',
                      'cards_file': source.stem + '-cards.json', 'connections_dir': directory}
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
             raise ValueError('I trasporti devono essere distinti dal dataset originale')
+        from ._native import DashboardSummaryAccumulator
+        summary = DashboardSummaryAccumulator(metadata['language'], False,
+            metadata.get('creators', {}).get('status') not in ('collected', 'partially_collected')
+            and metadata.get('history', {}).get('status') in ('collected', 'partially_collected'))
+        summary_batch = []
         orphans, summaries, shortlists, seen = {}, {}, {}, set()
 
         def detail(identifier, record):
@@ -646,14 +755,19 @@ def write_dashboard_exports(source, folder, expected=None):
                     if type(pid) is not int or pid <= 0 or pid in seen or type(record.get('orphan')) is not bool:
                         raise ValueError('Osservazione o identificativo duplicato non valido')
                     seen.add(pid)
+                    summary_batch.append(record)
+                    if len(summary_batch) == 512:
+                        summary.add_batch(json.dumps(summary_batch, ensure_ascii=False))
+                        summary_batch.clear()
                     if record['orphan']:
                         orphans[str(pid)] = record
                     yield record
                 elif section == 'link_candidates':
                     if identifier not in orphans or identifier in summaries:
                         raise ValueError('Candidate non corrispondenti a una voce orfana')
-                    summary = {'status': record.get('status'), 'candidate_count': record.get('candidate_count')}
-                    summaries[identifier] = summary
+                    candidate_summary = {'status': record.get('status'),
+                                         'candidate_count': record.get('candidate_count')}
+                    summaries[identifier] = candidate_summary
                     selected, group_sizes, selected_ids = [], [0, 0], set()
                     for candidate in record.get('candidates', []):
                         pid, title = candidate.get('page_id'), candidate.get('title')
@@ -671,13 +785,23 @@ def write_dashboard_exports(source, folder, expected=None):
                             selected.append({**candidate, 'evidence': [reference]})
                             group_sizes[group] += 1
                             selected_ids.add(pid)
-                    shortlists[identifier] = {**summary, 'candidates': selected}
+                    shortlists[identifier] = {**candidate_summary, 'candidates': selected}
                     detail(identifier, record)
             if (source.stat().st_size, source.stat().st_mtime_ns) != (initial.st_size, initial.st_mtime_ns):
                 raise ValueError('Esportazione modificata durante la conversione')
 
         write_observations(folder / filenames['observations_file'],
                            {'metadata': metadata, 'pages': pages(), 'link_candidates': summaries})
+        if summary_batch:
+            summary.add_batch(json.dumps(summary_batch, ensure_ascii=False))
+        summary_count, summary_json = summary.finish()
+        if summary_count != len(seen):
+            raise ValueError('Riepilogo del censimento incompleto')
+        write_summary_files(folder / filenames['summary_file'],
+                            folder / filenames['creator_index_file'], metadata,
+                            summary_count, summary_json,
+                            [{'language': metadata['language'], 'file': source.name,
+                              'size': initial.st_size, 'mtime_ns': initial.st_mtime_ns}])
         for identifier in orphans.keys() - summaries.keys():
             detail(identifier, {})
         write_json(folder / filenames['cards_file'],
@@ -687,6 +811,88 @@ def write_dashboard_exports(source, folder, expected=None):
         return filenames
     finally:
         events.close()
+
+
+def write_summary_files(summary_path, creators_path, metadata, count, report_json, sources):
+    reports = json.loads(report_json)
+    creators = reports.pop('creators')
+    # The category chart renders its first 20 ranked bars. The full category
+    # census remains in the canonical/observation exports for the explorer.
+    reports['categories'] = reports['categories'][:20]
+    shared = {'metadata': metadata, 'sources': sources, 'census_page_count': count}
+    write_json(summary_path, {'format': 'dashboard_summary_v1', 'histogram_rule': HISTOGRAM_RULE,
+                              **shared, 'reports': reports})
+    write_json(creators_path, {'format': 'creator_index_v1', **shared, 'creators': creators})
+
+
+def write_aggregate_summary(members, output, metadata, aggregate=True):
+    """Prepare exact Rust chart reports from canonical page streams once.
+
+    The largest graph remains on disk; only chart fields enter the native
+    accumulator. Candidate evidence is not parsed or duplicated.
+    """
+    from ._native import DashboardSummaryAccumulator
+    metadata = dict(metadata)
+    if aggregate:
+        collected_creators = [member['metadata']['creators'] for member in members
+                              if member['metadata'].get('creators', {}).get('status') in
+                              ('collected', 'partially_collected')]
+        metadata['creators'] = {
+            'status': ('collected' if len(collected_creators) == len(members) else
+                       'partially_collected' if collected_creators else 'not_collected'),
+            'languages_scanned': [member['language'] for member in members
+                                  if member['metadata'].get('creators', {}).get('status') in
+                                  ('collected', 'partially_collected')],
+            'collected_languages': len(collected_creators),
+        }
+        collected_history = [member['metadata']['history'] for member in members
+                             if member['metadata'].get('history', {}).get('status') in
+                             ('collected', 'partially_collected')]
+        metadata['history'] = {
+            'status': ('collected' if len(collected_history) == len(members) else
+                       'partially_collected' if collected_history else 'not_collected'),
+            'matched_pages': sum(item.get('matched_pages', 0) for item in collected_history),
+        }
+    historical = all(member['metadata'].get('creators', {}).get('status') not in
+                     ('collected', 'partially_collected') for member in members)
+    historical = historical and any(member['metadata'].get('history', {}).get('status') in
+                                    ('collected', 'partially_collected') for member in members)
+    summary = DashboardSummaryAccumulator(metadata['language'], aggregate, historical)
+    sources = []
+    for member in members:
+        path = Path(member['path'])
+        initial = path.stat()
+        sources.append({'language': member['language'], 'file': path.name,
+                        'size': initial.st_size, 'mtime_ns': initial.st_mtime_ns})
+        events = iter_export_sections(path)
+        count, batch = 0, []
+        try:
+            first = next(events)
+            if first[0] != 'metadata' or first[2] != member['metadata']:
+                raise ValueError('Metadati del riepilogo aggregato non corrispondenti')
+            for section, _, record in events:
+                if section != 'pages':
+                    break
+                batch.append({**record, 'language': member['language']} if aggregate else record)
+                count += 1
+                if len(batch) == 512:
+                    summary.add_batch(json.dumps(batch, ensure_ascii=False))
+                    batch.clear()
+            if batch:
+                summary.add_batch(json.dumps(batch, ensure_ascii=False))
+        finally:
+            events.close()
+        current = path.stat()
+        if (count != member['page_count'] or
+                (current.st_size, current.st_mtime_ns) != (initial.st_size, initial.st_mtime_ns)):
+            raise ValueError('Censimento modificato o incompleto durante il riepilogo aggregato')
+    total, report_json = summary.finish()
+    if total != sum(member['page_count'] for member in members):
+        raise ValueError('Popolazione del riepilogo aggregato incompleta')
+    creators_output = Path(output).with_name(Path(output).name.replace('-summary.json', '-creators.json'))
+    if creators_output == Path(output):
+        raise ValueError('Il file del riepilogo deve terminare con -summary.json')
+    write_summary_files(output, creators_output, metadata, total, report_json, sources)
 
 
 def iter_export_sections(path):
@@ -831,8 +1037,8 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
             temporary.unlink(missing_ok=True)
 
 
-def attach_creators(rows, graph_metadata, creators):
-    """Attach a PAWS-only supplementary census without changing the observed graph."""
+def initialize_creator_rows(rows):
+    """Keep unsupported creator measures explicitly missing in dump observations."""
     fields = (
         'creator_key', 'creator_attribution', 'creator_account_type', 'creator_is_bot_now',
         'creator_account_type_at_creation', 'creator_registered_at', 'creator_tenure_days',
@@ -841,56 +1047,72 @@ def attach_creators(rows, graph_metadata, creators):
         'creator_languages_created', 'creator_languages_before', 'origin', 'creation_tags',
         'import_log_observed', 'move_log_observed', 'creator_experience_status',
     )
-    by_id = {}
-    metadata = {'status': 'not_collected', 'languages_scanned': [], 'matched_pages': 0,
-                'orphan_30d_status': 'unavailable_no_historical_link_graph'}
-    if creators is not None:
-        cm = creators['metadata']
-        if cm.get('language') != graph_metadata['language'] or cm.get('complete') is not True:
-            raise ValueError('La raccolta dei creatori deve essere completa e della stessa lingua del grafo')
-        database = replica_database(graph_metadata['language'], graph_metadata.get('database'))
-        expected_source = 'Wiki Replicas / ' + database
-        if replica_database(cm['language'], cm.get('database')) != database:
-            raise ValueError('Le raccolte del grafo e dei creatori devono usare la stessa replica')
-        if cm.get('source') != expected_source and not (cm.get('demo') and graph_metadata.get('demo')):
-            raise ValueError('Fonte dei creatori non consentita: usare le repliche tramite PAWS')
-        by_id = {p['page_id']: p for p in creators['pages']}
-        if len(by_id) != len(creators['pages']):
-            raise ValueError('Identificativi duplicati nella raccolta dei creatori')
-        metadata = {**cm, 'status': 'collected', 'matched_pages': 0,
-                    'input_sha256': json_sha256(creators)}
-    from ._native import creator_matches, creator_counts
-    matches = creator_matches([
-        (row.get('first_public_revision_at'), record.get('article_created_at'),
-         'page_created_at' in record, record.get('page_created_at'))
-        for row in rows for record in [by_id.get(row['page_id'], {})]])
-    for row, (matched, unconfirmed) in zip(rows, matches):
+    for row in rows:
         row.update({field: None for field in fields})
         row['origin'] = 'unknown'
-        record = by_id.get(row['page_id'])
-        row['creator_data_status'] = 'not_collected' if creators is None else 'missing_page'
-        if record is not None:
-            if matched:
-                row.update({field: record.get(field) for field in fields})
-                if 'page_created_at' in record:
-                    for field in ('page_created_at', 'creation_date_source', 'creation_date_status'):
-                        row[field] = record.get(field)
-                    if unconfirmed:
-                        # Experience from the first revision cannot be relabeled
-                        # as experience at a different or unknown creation event.
-                        for field in fields:
-                            if field.startswith('creator_'):
-                                row[field] = None
-                        row['creator_attribution'] = 'creation_event_unconfirmed'
-                row['creator_data_status'] = 'matched'
-                metadata['matched_pages'] += 1
-            else:
-                row['creator_data_status'] = 'creation_date_mismatch'
+        row['creator_data_status'] = 'not_collected'
         row['creator_orphans_at_30_days'] = None
         row['creator_orphans_at_30_days_status'] = 'unavailable_no_historical_link_graph'
-    counts = creator_counts([(row['creator_key'], row['orphan']) for row in rows])
-    for row, (total, orphans, share) in zip(rows, counts):
-        row.update(creator_articles_in_census=total, creator_orphans_current=orphans,
-                   creator_orphans_current_share=share)
-    metadata['unmatched_pages'] = len(rows) - metadata['matched_pages']
-    return metadata
+        row.update(creator_articles_in_census=None, creator_orphans_current=None,
+                   creator_orphans_current_share=None)
+    return {'status': 'not_collected', 'languages_scanned': [], 'matched_pages': 0,
+            'unmatched_pages': len(rows),
+            'orphan_30d_status': 'unavailable_no_historical_link_graph'}
+
+
+def attach_history(rows, graph_metadata, supplement):
+    """Join separately labelled dump history without rewriting creation dates."""
+    if supplement is None:
+        _join_history_rows(rows, {}, missing_status='not_collected')
+        return {'status': 'not_collected', 'matched_pages': 0}
+    meta = supplement.get('metadata', {})
+    database = wiki_database(graph_metadata['language'], graph_metadata.get('database'))
+    if (meta.get('language') != graph_metadata['language'] or meta.get('database') != database
+            or meta.get('source') != 'MediaWiki History dumps / ' + database
+            or meta.get('complete') is not True
+            or not isinstance(meta.get('history_release'), str)):
+        raise ValueError('Supplemento MediaWiki History non valido per questa wiki')
+    if (graph_metadata.get('source') == 'Wikimedia SQL dumps / ' + database
+            and graph_metadata.get('sql_release') != meta.get('sql_release')):
+        raise ValueError('Release SQL del grafo e della cronologia diverse')
+    by_id = {record['page_id']: record for record in supplement.get('pages', [])}
+    if len(by_id) != len(supplement.get('pages', [])):
+        raise ValueError('Identificativi duplicati nella cronologia')
+    matched = _join_history_rows(rows, by_id)
+    return {**meta, 'status': 'collected', 'matched_pages': matched,
+            'unmatched_pages': len(rows) - matched,
+            'input_sha256': json_sha256(supplement)}
+
+
+def _join_history_rows(rows, by_id, missing_status='missing_page'):
+    """Apply one verified history mapping to a bounded observation batch."""
+    fields = ('history_first_revision_at', 'history_creator_key', 'history_creator_status',
+              'creator_groups_at_creation_history', 'creator_continuity_months_before_creation',
+              'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history',
+              'creator_prior_edits_other_history')
+    for row in rows:
+        row.update({field: None for field in fields})
+        row['history_data_status'] = missing_status
+    matched = 0
+    for row in rows:
+        record = by_id.get(row['page_id'])
+        if record is None:
+            continue
+        historical_date = record.get('article_created_at')
+        if not historical_date:
+            row['history_data_status'] = 'history_creation_unknown'
+            continue
+        row['history_first_revision_at'] = historical_date
+        row['history_creator_status'] = record.get('creator_attribution')
+        if record.get('creator_history_status') != 'observed_surviving_history':
+            row['history_data_status'] = 'unattributed_history'
+            continue
+        row.update(history_creator_key=record.get('creator_key'),
+                   creator_groups_at_creation_history=record.get('creator_groups_at_creation'),
+                   creator_continuity_months_before_creation=record.get('creator_continuity_months_before_creation'),
+                   creator_continuity_bucket_before_creation=record.get('creator_continuity_bucket_before_creation'),
+                   creator_prior_edits_main_history=record.get('creator_prior_edits_main_history'),
+                   creator_prior_edits_other_history=record.get('creator_prior_edits_other_history'),
+                   history_data_status='matched_reconstructed_history')
+        matched += 1
+    return matched

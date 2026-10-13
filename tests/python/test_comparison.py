@@ -15,7 +15,7 @@ from orphanwiki.core import analyze, compare_files, compare_languages
 
 def fixture(language, links):
     titles = [f'{language}-{i}' for i in range(1, 7)]
-    return {'metadata': {'language': language, 'source': 'Wiki Replicas / ' + language + 'wiki',
+    return {'metadata': {'language': language, 'source': 'Synthetic complete graph',
                         'complete': True, 'demo': True,
                         'started_at': '2026-01-01T00:00:00Z', 'finished_at': '2026-01-02T00:00:00Z',
                         'item_mapping': {'source': 'page_props.wikibase_item', 'complete': True}},
@@ -68,6 +68,42 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(list(work.iterdir()), [])
             self.assertEqual([p.read_bytes() for p in inputs], originals)
 
+    def test_staged_comparison_preserves_history_creator_and_age_parity(self):
+        raws = [fixture('vec', {2: [1]}), fixture('lmo', {2: [1]})]
+        histories = {}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            inputs, supplements = [], []
+            for raw in raws:
+                language = raw['metadata']['language']
+                database = language + 'wiki'
+                history = {'metadata': {'language': language, 'database': database,
+                           'source': 'MediaWiki History dumps / ' + database,
+                           'history_release': '2026-09', 'complete': True},
+                           'pages': [{'page_id': 1,
+                                      'article_created_at': '2025-01-01T00:00:00+00:00',
+                                      'creator_attribution': 'history_initial_revision_observed',
+                                      'creator_history_status': 'observed_surviving_history',
+                                      'creator_key': database + ':history-user:7',
+                                      'creator_prior_edits_main_history': 4}]}
+                histories[language] = history
+                source = root / f'{language}-raw.json'
+                supplement = root / f'{language}-history.json'
+                source.write_text(json.dumps(raw))
+                supplement.write_text(json.dumps(history))
+                inputs.append(source)
+                supplements.append(supplement)
+            expected = compare_languages(raws, histories=histories)
+            with compare_files(inputs, work_dir=root, histories=supplements) as results:
+                actual = {language: {**result, 'pages': list(result['pages']),
+                                     'link_candidates': dict(result['link_candidates'].items())}
+                          for language, result in results.items()}
+            self.assertEqual(actual, expected)
+            first = actual['vec']['pages'][0]
+            self.assertIsNone(first['age_days'])
+            self.assertGreater(first['history_first_revision_age_days'], 0)
+            self.assertEqual(first['history_creator_key'], 'vecwiki:history-user:7')
+
     def test_worker_failure_preserves_old_exports_and_cleans_staging(self):
         from orphanwiki.__main__ import main
         import sys
@@ -110,7 +146,8 @@ class ComparisonTests(unittest.TestCase):
         results = compare_languages([fixture('vec', {}), fixture('lmo', {})])
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / 'web';output.mkdir()
-            for name in ['manifest.json', 'vec-demo.json', 'lmo-demo.csv']:
+            (output / 'manifest.json').write_text('[]')
+            for name in ['vec-demo.json', 'lmo-demo.csv']:
                 (output / name).write_text('old')
             def fail(result, path, **options):
                 if path.name == 'vec-demo.json':
@@ -118,7 +155,8 @@ class ComparisonTests(unittest.TestCase):
                 return export_result(result, path, **options)
             with patch('orphanwiki.__main__.export_result', side_effect=fail), self.assertRaises(OSError):
                 publish_comparison(results, output)
-            self.assertTrue(all(p.read_text() == 'old' for p in output.iterdir()))
+            self.assertEqual((output / 'manifest.json').read_text(), '[]')
+            self.assertTrue(all((output / name).read_text() == 'old' for name in ('vec-demo.json', 'lmo-demo.csv')))
             self.assertFalse(list(Path(folder).glob('orphanwiki-publish-*')))
 
     def test_empty_wikis_missing_items_and_zero_candidates_in_staged_matching(self):

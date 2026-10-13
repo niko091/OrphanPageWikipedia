@@ -1,29 +1,32 @@
 import argparse
 import csv
+import hashlib
 import json
 import math
 import re
-import sqlite3
 import tempfile
 import time
-from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import (
     aggregate_index,
     analyze,
     compare_files,
+    configured_languages,
     json_sha256,
     load_topic_model,
+    prepared_summaries_match,
     predict_topics,
-    replica_database,
+    wiki_database,
     write_dashboard_exports,
+    write_aggregate_summary,
     write_json,
 )
 
 
-def export(raw, output, rules, creators=None, topics=None):
-    result = analyze(raw, rules, creators, topics=topics)
+def export(raw, output, rules, topics=None, history=None):
+    result = analyze(raw, rules, topics=topics, history=history)
     result['metadata']['input_sha256'] = json_sha256(raw)
     export_result(result, output)
 
@@ -33,7 +36,7 @@ def export_result(result, output, update_manifest=True, announce=True):
     write_json(output, result, arrays={'pages': result['pages']},
                mappings={'link_candidates': result['link_candidates'].items()} if 'link_candidates' in result else None)
     with output.with_suffix('.csv').open('w', encoding='utf-8', newline='') as stream:
-        fields = ['page_id', 'title', 'category', 'category_status', 'orphan', 'in_degree', 'out_degree', 'created_at', 'age_days', 'length_bytes', 'origin', 'creator_key', 'creator_data_status', 'creator_account_type', 'creator_tenure_days', 'creator_prior_edits_main', 'creator_prior_edits_other', 'creator_prior_articles', 'creator_articles_created_total', 'creator_articles_in_census', 'creator_orphans_current', 'creator_orphans_current_share', 'creator_orphans_at_30_days']
+        fields = ['page_id', 'title', 'category', 'category_status', 'orphan', 'in_degree', 'out_degree', 'created_at', 'age_days', 'history_first_revision_at', 'history_first_revision_age_days', 'length_bytes', 'origin', 'creator_key', 'creator_data_status', 'creator_account_type', 'creator_tenure_days', 'creator_prior_edits_main', 'creator_prior_edits_other', 'creator_prior_articles', 'creator_articles_created_total', 'creator_articles_in_census', 'creator_orphans_current', 'creator_orphans_current_share', 'creator_orphans_at_30_days', 'history_creator_key', 'history_creator_status', 'history_data_status', 'creator_groups_at_creation_history', 'creator_continuity_months_before_creation', 'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history', 'creator_prior_edits_other_history']
         fields += ['creator_attribution', 'creator_registered_at', 'creator_tenure_status', 'creator_experience_status',
                    'topic_labels', 'topic_status', 'topic_input_count',
                    'wikibase_item', 'candidate_count', 'candidate_status',
@@ -63,9 +66,141 @@ def export_result(result, output, update_manifest=True, announce=True):
 def manifest_entry(result, filename, transports=None):
     meta = result['metadata']
     return {'language': meta['language'], 'file': filename, 'date': meta['finished_at'],
+            'published_at': datetime.now(timezone.utc).isoformat(),
             'demo': meta.get('demo', False), 'kind': meta.get('kind', 'wiki'),
             **(transports or {'observations_file': filename.removesuffix('.json') + '-observations.json'}
                if meta.get('kind') != 'aggregate' else {})}
+
+
+def _publish_prepared(prepared, destination, excluded=()):
+    """Move prepared transports, then publish their manifest last."""
+    prepared, destination = Path(prepared), Path(destination)
+    manifest = prepared / 'manifest.json'
+    excluded = set(excluded)
+    for path in sorted(prepared.rglob('*')):
+        if path.is_file() and path != manifest and path not in excluded:
+            target = destination / path.relative_to(prepared)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(target)
+    manifest.replace(destination / 'manifest.json')
+
+
+def comparison_filename(language, result, languages):
+    """Name dump comparisons by release and inputs so older exports remain addressable."""
+    meta = result['metadata']
+    release = meta.get('sql_release')
+    if not isinstance(release, str) or not re.fullmatch(r'\d{8}', release):
+        return f"{language}{'-demo' if meta.get('demo') else ''}.json"
+    identity = {'language': language, 'release': release,
+                'input': meta.get('input_sha256'), 'history': meta.get('history'),
+                'topics': meta.get('topics'), 'references': sorted(languages)}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                                       default=str).encode()).hexdigest()[:12]
+    return f'{language}-{release}-{digest}.json'
+
+
+def publish_available_aggregate(output_dir):
+    """Index the latest complete dump export per language without reading article arrays.
+
+    Independently analyzed editions remain in the aggregate, but their absent
+    cross-language comparisons are identified rather than treated as zero.
+    """
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, list):
+        raise ValueError('Manifest non valido')
+    latest = {}
+    for entry in manifest:
+        if not isinstance(entry, dict) or entry.get('kind') == 'aggregate' or entry.get('demo'):
+            continue
+        language, filename, cards = entry.get('language'), entry.get('file'), entry.get('cards_file')
+        if not all(isinstance(value, str) and re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', value)
+                   for value in (filename, cards)) or not isinstance(language, str):
+            raise ValueError('Manifest con file non valido')
+        if language not in latest or (entry['date'], entry.get('published_at', '')) > (
+                latest[language]['date'], latest[language].get('published_at', '')):
+            latest[language] = entry
+    if len(latest) < 2:
+        return None
+    from .dumps import _read_first_metadata
+    results, files = {}, {}
+    for language, entry in sorted(latest.items()):
+        filename = entry['file']
+        meta = _read_first_metadata(output_dir / filename)
+        if (meta.get('language') != language or meta.get('complete') is not True or
+                meta.get('source') != 'Wikimedia SQL dumps / ' + meta.get('database', '')):
+            raise ValueError(f'Export non verificato per {language}')
+        with (output_dir / entry['cards_file']).open('rb') as stream:
+            header = stream.read(1024 * 1024)
+        match = re.search(rb'"census_page_count"\s*:\s*(\d+)', header)
+        if match is None:
+            raise ValueError(f'Trasporto delle schede incompleto per {language}')
+        count = int(match.group(1))
+        results[language] = {'metadata': meta, 'pages': range(count)}
+        files[language] = filename
+    index = aggregate_index(results, files)
+    if any(set(results[language]['metadata'].get('comparison', {}).get('reference_languages', []))
+           != set(results) - {language} for language in results):
+        index['metadata']['comparison_coverage'] = 'partial'
+    else:
+        index['metadata']['comparison_coverage'] = 'complete'
+    release = index['metadata']['finished_at'][:10].replace('-', '')
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:12]
+    filename = f'all-{release}-available-{digest}.json'
+    summary_name = filename.removesuffix('.json') + '-summary.json'
+    creator_name = filename.removesuffix('.json') + '-creators.json'
+    sources = [{'language': member['language'], 'path': output_dir / member['file'],
+                'page_count': member['page_count'], 'metadata': member['metadata']}
+               for member in index['members']]
+    fingerprints = []
+    for source in sources:
+        info = source['path'].stat()
+        fingerprints.append({'language': source['language'], 'file': source['path'].name,
+                             'size': info.st_size, 'mtime_ns': info.st_mtime_ns})
+    fingerprints_by_language = {item['language']: item for item in fingerprints}
+    with tempfile.TemporaryDirectory(prefix='orphanwiki-aggregate-', dir=output_dir.parent) as folder:
+        prepared = Path(folder)
+        new_member_summaries = []
+        for member in index['members']:
+            entry = latest[member['language']]
+            existing_name = entry.get('summary_file')
+            existing_creators = entry.get('creator_index_file')
+            source_path = output_dir / member['file']
+            fingerprint = [fingerprints_by_language[member['language']]]
+            if (existing_name and re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', existing_name) and
+                    existing_creators and re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', existing_creators) and
+                    prepared_summaries_match(output_dir / existing_name, output_dir / existing_creators,
+                                             member['metadata'], fingerprint, member['page_count'])):
+                continue
+            name = member['file'].removesuffix('.json') + '-summary.json'
+            write_aggregate_summary([{'language': member['language'],
+                                      'path': output_dir / member['file'],
+                                      'page_count': member['page_count'],
+                                      'metadata': member['metadata']}],
+                                    prepared / name, member['metadata'], aggregate=False)
+            entry['summary_file'] = name
+            entry['creator_index_file'] = name.removesuffix('-summary.json') + '-creators.json'
+            new_member_summaries.extend((name, entry['creator_index_file']))
+        write_json(prepared / filename, index)
+        prior_summary = output_dir / summary_name
+        prior_creators = output_dir / creator_name
+        reuse = prepared_summaries_match(prior_summary, prior_creators, index['metadata'],
+                                         fingerprints, sum(source['page_count'] for source in sources))
+        if not reuse:
+            write_aggregate_summary(sources, prepared / summary_name, index['metadata'])
+        manifest = [entry for entry in manifest if entry.get('file') != filename]
+        manifest.append({**manifest_entry(index, filename), 'summary_file': summary_name,
+                         'creator_index_file': creator_name})
+        write_json(prepared / 'manifest.json', manifest)
+        for name in new_member_summaries:
+            (prepared / name).replace(output_dir / name)
+        (prepared / filename).replace(output_dir / filename)
+        if not reuse:
+            (prepared / summary_name).replace(prior_summary)
+            (prepared / creator_name).replace(prior_creators)
+        (prepared / 'manifest.json').replace(manifest_path)
+    return filename
 
 
 def rebuild_dashboard(folder):
@@ -78,20 +213,17 @@ def rebuild_dashboard(folder):
     manifest = json.loads((folder / 'manifest.json').read_text())
     if not isinstance(manifest, list) or not manifest:
         raise ValueError('Manifest non valido')
-    files, languages = set(), set()
+    files = set()
     for entry in manifest:
         name = entry.get('file', '')
         if not re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', name) or name in files:
             raise ValueError('Nome dataset non valido o duplicato')
         files.add(name)
         if entry.get('kind') != 'aggregate':
-            replica_database(entry['language'])
-            if entry['language'] in languages:
-                raise ValueError('Una sola raccolta per lingua nel manifest')
-            languages.add(entry['language'])
+            wiki_database(entry['language'])
     targets = {entry['file'].removesuffix('.json') + suffix
                for entry in manifest if entry.get('kind') != 'aggregate'
-               for suffix in ('-observations.json', '-cards.json')}
+               for suffix in ('-observations.json', '-summary.json', '-creators.json', '-cards.json')}
     if targets & files or 'manifest.json' in targets:
         raise ValueError('I file compatti devono essere distinti dai dataset originali')
     with tempfile.TemporaryDirectory(prefix='orphanwiki-dashboard-', dir=folder.parent) as temporary:
@@ -105,12 +237,7 @@ def rebuild_dashboard(folder):
             print(f"Dashboard: {entry['language']}; schede "
                   f"{(prepared / filename).stat().st_size / 2**20:.1f} MiB; evidenze separate per voce", flush=True)
         write_json(prepared / 'manifest.json', manifest)
-        for path in sorted(prepared.rglob('*')):
-            if path.is_file() and path != prepared / 'manifest.json':
-                destination = folder / path.relative_to(prepared)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                path.replace(destination)
-        (prepared / 'manifest.json').replace(folder / 'manifest.json')
+        _publish_prepared(prepared, folder)
 
 
 def discover_collections(folder):
@@ -121,140 +248,46 @@ def discover_collections(folder):
     return paths
 
 
-def collection_languages(args):
-    config = json.loads(Path(args.languages_file).read_text()) if args.languages_file else {}
-    if config and config.get('version') != 1:
-        raise ValueError('Versione della configurazione lingue non supportata')
-    languages = config.get('languages') if args.languages_file else (args.languages or [args.language or 'vec'])
-    if not isinstance(languages, list) or not languages or len(languages) != len(set(languages)):
-        raise ValueError('Specificare codici lingua distinti')
-    if args.database and len(languages) != 1:
-        raise ValueError('--database richiede una sola lingua; per più lingue usare languages-file')
-    databases = config.get('databases', {})
-    if not isinstance(databases, dict) or set(databases) - set(languages):
-        raise ValueError('Database configurati senza la lingua corrispondente')
-    for language in languages:
-        replica_database(language, args.database or databases.get(language))
-    validate_size_selection(config)
-    return [(language, args.database or databases.get(language)) for language in languages]
-
-
-def validate_size_selection(config):
-    """A configuration policy, independent of wiki codes and extraction limits."""
-    policy = config.get('size_selection')
-    if policy is None:
-        return
-    if not isinstance(policy, dict):
-        raise ValueError('size_selection deve essere un oggetto')
-    languages = config.get('languages', [])
-    multiplier = policy.get('multiplier')
-    always = policy.get('always_include', [])
-    if (policy.get('reference_language') not in languages or
-            type(multiplier) not in (int, float) or not math.isfinite(multiplier) or multiplier <= 0 or
-            not isinstance(always, list) or any(code not in languages for code in always) or
-            len(always) != len(set(always))):
-        raise ValueError('Soglia o lingue di size_selection non valide')
-
-
-def select_by_size(config, records):
-    """Select whole wiki censuses using measured counts; equality is excluded."""
-    validate_size_selection(config)
-    policy = config['size_selection']
-    counts = {}
-    for record in records:
-        language, count = record['language'], record['census_pages']
-        if language in counts or type(count) is not int or count < 0:
-            raise ValueError('Conteggi PAWS duplicati o non validi')
-        counts[language] = count
-    if set(counts) != set(config['languages']) or counts[policy['reference_language']] <= 0:
-        raise ValueError('La selezione richiede tutte le dimensioni e un censimento di riferimento non vuoto')
-    threshold = counts[policy['reference_language']] * policy['multiplier']
-    selected = [code for code in config['languages']
-                if code in policy.get('always_include', []) or counts[code] < threshold]
-    return {'policy': policy, 'threshold_pages': threshold, 'selected_languages': selected,
-            'excluded_languages': [code for code in config['languages'] if code not in selected]}
-
-
-def measured_language_selection(args, languages):
-    """Sequential PAWS census queries; retain intervals in a separate small report."""
-    from .replicas import collect_sizes
-    config = json.loads(Path(args.languages_file).read_text())
-    records = []
-    for language, database in languages:
-        record = collect_sizes(language, args.credentials, database)
-        records.append(record)
-        print(f"Dimensioni PAWS: {language}: {record['census_pages']:,} voci", flush=True)
-    selection = select_by_size(config, records)
-    report = {'source': 'Wiki Replicas through PAWS', 'wikis': records, 'selection': selection}
-    return selection, report
-
-
-def collect_one(language, credentials, output, creator_output, database=None, low_memory=False, batch_size=1000, work_dir=None):
-    from .replicas import collect_replicas, collect_creators
-    if low_memory:
-        from .replicas import DiskPages
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='orphanwiki-', dir=work_dir or output.parent) as folder:
-            with closing(sqlite3.connect(Path(folder) / 'staging.sqlite')) as stage:
-                stage.executescript('PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;')
-                pages = DiskPages(stage)
-                raw = collect_replicas(language, credentials, database, page_store=pages)
-                pages.prepare_export()
-                raw['metadata'].update(creator_collection_status='pending', collection_storage='sqlite_staging')
-                write_json(output, raw, arrays={'pages': pages.export_pages()})
-                print(f'Grafo integrale salvato: {output}; raccolta dei creatori a blocchi', flush=True)
-                creators = collect_creators(language, credentials, database, stage=stage, batch_size=batch_size)
-                creators['metadata']['collection_storage'] = 'sqlite_staging'
-                write_json(creator_output, creators, arrays={'pages': creators['pages']})
-                print(f'Creatori salvati: {creator_output}; aggiornamento del file completo', flush=True)
-                raw['metadata']['creator_collection_status'] = 'collected'
-                raw['creator_data'] = None
-                write_json(output, raw, arrays={'pages': pages.export_pages()}, embedded_paths={'creator_data': creator_output})
-        print(f'Dati grezzi completi, inclusi i creatori: {output}')
-        return
-    # Retain the two-argument API for ordinary wiki codes.
-    options = {'database': database} if database else {}
-    raw = collect_replicas(language, credentials, **options)
-    raw['metadata']['creator_collection_status'] = 'pending'
-    write_json(output, raw)
-    print(f'Grafo salvato: {output}; raccolta dei creatori in corso', flush=True)
-    creators = collect_creators(language, credentials, **options)
-    print(f'Dati dei creatori acquisiti; salvataggio: {creator_output}', flush=True)
-    write_json(creator_output, creators)
-    print(f'Creatori salvati: {creator_output}; aggiornamento del file completo', flush=True)
-    raw['creator_data'] = creators
-    raw['metadata']['creator_collection_status'] = 'collected'
-    write_json(output, raw)
-    print(f'Dati grezzi completi, inclusi i creatori: {output}')
-
-
 def publish_comparison(results, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    files, manifest = {}, []
-    # Prepare every JSON/CSV before replacing any previous published dataset.
+    files = {}
+    manifest_path = output_dir / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+    if not isinstance(manifest, list):
+        raise ValueError('Manifest non valido')
     with tempfile.TemporaryDirectory(prefix='orphanwiki-publish-', dir=output_dir.parent) as folder:
         prepared = Path(folder)
         for language, result in results.items():
-            suffix = '-demo' if result['metadata'].get('demo') else ''
-            files[language] = f'{language}{suffix}.json'
+            files[language] = comparison_filename(language, result, results)
             print(f"Preparazione JSON/CSV: {language}; {len(result['pages'])} voci", flush=True)
             transports = export_result(result, prepared / files[language], update_manifest=False, announce=False)
+            manifest = [entry for entry in manifest if entry.get('file') != files[language]]
             manifest.append(manifest_entry(result, files[language], transports))
         index = aggregate_index(results, files)
-        filename = 'all-demo.json' if index['metadata']['demo'] else 'all.json'
+        releases = {result['metadata'].get('sql_release') for result in results.values()}
+        if len(releases) == 1 and isinstance(next(iter(releases)), str) and re.fullmatch(r'\d{8}', next(iter(releases))):
+            release = next(iter(releases))
+            digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:12]
+            filename = f'all-{release}-{digest}.json'
+        else:
+            filename = 'all-demo.json' if index['metadata']['demo'] else 'all.json'
         write_json(prepared / filename, index)
-        manifest.append(manifest_entry(index, filename))
+        summary_name = filename.removesuffix('.json') + '-summary.json'
+        creator_name = filename.removesuffix('.json') + '-creators.json'
+        write_aggregate_summary([{'language': member['language'], 'path': prepared / member['file'],
+                                  'page_count': member['page_count'], 'metadata': member['metadata']}
+                                 for member in index['members']], prepared / summary_name, index['metadata'])
+        manifest = [entry for entry in manifest if entry.get('file') != filename]
+        manifest.append({**manifest_entry(index, filename), 'summary_file': summary_name,
+                         'creator_index_file': creator_name})
         write_json(prepared / 'manifest.json', manifest)
-        for path in sorted(prepared.rglob('*')):
-            if path.is_file() and path != prepared / 'manifest.json':
-                destination = output_dir / path.relative_to(prepared)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                path.replace(destination)
-        # Publish only this complete comparison set; discard stale selector entries.
-        (prepared / 'manifest.json').replace(output_dir / 'manifest.json')
+        _publish_prepared(prepared, output_dir)
     for language, result in results.items():
         print(f"Esportate {len(result['pages'])} voci: {output_dir / files[language]}", flush=True)
+    if all(result['metadata'].get('source', '').startswith('Wikimedia SQL dumps / ')
+           for result in results.values()):
+        publish_available_aggregate(output_dir)
 
 
 def main():
@@ -262,57 +295,45 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     dashboard = sub.add_parser('dashboard', help='Prepara grafici, schede e dettagli dagli export esistenti; nessuna nuova query')
     dashboard.add_argument('--data-dir', default='web/data')
-    collect = sub.add_parser('collect', help='Raccogli grafo, categorie, date, provenienza e creatori da PAWS')
-    selection = collect.add_mutually_exclusive_group()
-    selection.add_argument('--language')
-    selection.add_argument('--languages', nargs='+')
-    selection.add_argument('--languages-file', help='Configurazione JSON con version, languages e databases opzionali')
-    collect.add_argument('--database', help='Nome replica esplicito per codici storici, senza _p')
-    collect.add_argument('--credentials')
-    collect.add_argument('--output-dir', default='data')
-    collect.add_argument('--low-memory', action='store_true', help='Staging SQLite su disco e creatori a blocchi; conserva l’intero censimento')
-    collect.add_argument('--batch-size', type=int, default=1000, help='Voci per blocco di arricchimento dei creatori, non limite al censimento')
-    collect.add_argument('--work-dir', help='Cartella con spazio per lo staging su disco')
-    collect.add_argument('--output', help='Predefinito: data/<lingua>-raw.json')
-    collect.add_argument('--creators-output', help='Copia separata dei creatori; predefinito: <nome-grafo senza -raw>-creators.json')
-    compare = sub.add_parser('compare', help='Confronto interlingua in tutte le direzioni; solo dati PAWS')
+    downloads = sub.add_parser('fetch-dumps', help='Scarica e verifica dump Wikimedia completi per le lingue richieste')
+    downloads.add_argument('--languages-file', default='config/languages.json')
+    downloads.add_argument('--languages', nargs='+', help=argparse.SUPPRESS)
+    downloads.add_argument('--sql-release', required=True, help='Data SQL in formato YYYYMMDD')
+    downloads.add_argument('--history-release', required=True, help='Release della cronologia in formato YYYY-MM')
+    downloads.add_argument('--root', default='data/dumps')
+    downloads.add_argument('--plan', action='store_true', help='Mostra file e dimensioni senza scaricare')
+    imported = sub.add_parser('import-dumps', help='Importa grafo SQL e cronologia verificata, con evidenze storiche separate')
+    imported.add_argument('--manifest', required=True, help='Manifest prodotto da fetch-dumps')
+    imported.add_argument('--output', help='Predefinito: data/imported/<lingua>-raw.json')
+    imported.add_argument('--history-output', help='Predefinito: data/imported/<lingua>-history.json')
+    imported.add_argument('--work-dir', default='data/dumps/staging')
+    history_import = sub.add_parser('import-history', help='Riprende la cronologia da uno staging SQL già importato')
+    history_import.add_argument('--manifest', required=True)
+    history_import.add_argument('--output', help='Predefinito: data/imported/<lingua>-history.json')
+    history_import.add_argument('--work-dir', default='data/dumps/staging')
+    compare = sub.add_parser('compare', help='Confronto interlingua in tutte le direzioni')
     compare.add_argument('inputs', nargs='*', help='Raccolte complete, una per lingua; senza argomenti legge tutti i *-raw.json')
     compare.add_argument('--input-dir', default='data')
     compare.add_argument('--output-dir', default='web/data')
     compare.add_argument('--work-dir', help='Directory dello staging SQLite temporaneo; predefinita: directory di output')
-    compare.add_argument('--creators', nargs='*', default=[], help='Supplementi opzionali, una raccolta per lingua')
     compare.add_argument('--topics', nargs='*', default=[], help='Predizioni locali opzionali; altrimenti usa i file fratelli *-topics.json')
+    compare.add_argument('--histories', nargs='*', default=[], help='Cronologie dei dump verificate, una per lingua')
     compare.add_argument('--rules', default='config/categories.json')
-    creators_parser = sub.add_parser('collect-creators', help='Query aggiuntiva su PAWS: provenienza ed esperienza dei creatori')
-    creators_parser.add_argument('--language', default='vec')
-    creators_parser.add_argument('--database')
-    creators_parser.add_argument('--credentials')
-    creators_parser.add_argument('--low-memory', action='store_true')
-    creators_parser.add_argument('--batch-size', type=int, default=1000)
-    creators_parser.add_argument('--work-dir')
-    creators_parser.add_argument('--output', help='Predefinito: data/<lingua>-creators.json')
-    sizes = sub.add_parser('sizes', help='Dimensioni del censimento da PAWS; nessuna raccolta del grafo')
-    selection = sizes.add_mutually_exclusive_group()
-    selection.add_argument('--language')
-    selection.add_argument('--languages', nargs='+')
-    selection.add_argument('--languages-file')
-    sizes.add_argument('--database')
-    sizes.add_argument('--credentials')
-    sizes.add_argument('--output', default='data/sizes.json')
-    topics = sub.add_parser('topics', help='Modello Johnson locale sui soli collegamenti PAWS; nessuna query o API')
+    topics = sub.add_parser('topics', help='Modello locale sui collegamenti dei dump importati')
     topics.add_argument('--input-dir', default='data')
     topics.add_argument('--output-dir', default='data')
-    selection = topics.add_mutually_exclusive_group()
-    selection.add_argument('--languages', nargs='+')
-    selection.add_argument('--languages-file')
+    topics.add_argument('--languages-file', default='config/languages.json')
+    topics.add_argument('--languages', nargs='+', help=argparse.SUPPRESS)
     topics.add_argument('--model', default='data/models/johnson-outlink-20220727.bin')
     topics.add_argument('--model-config', default='config/topics.json')
     topics.add_argument('--batch-size', type=int, default=256)
+    topics.add_argument('--work-dir', help='Staging SQL verificato per inferenza a blocchi')
     topics.add_argument('--time-budget-seconds', type=float, default=3300, help='Budget locale; stop tra blocchi, nessun supplemento incompleto pubblicato')
-    command = sub.add_parser('analyze', help='Analisi nativa di un censimento PAWS completo')
+    command = sub.add_parser('analyze', help='Analisi nativa di un censimento completo')
     command.add_argument('input')
-    command.add_argument('--creators', help='Supplemento creatori raccolto su PAWS')
     command.add_argument('--topics', help='Predizioni locali; altrimenti usa il file fratello *-topics.json')
+    command.add_argument('--history', help='Supplemento storico verificato da MediaWiki History')
+    command.add_argument('--work-dir', help='Staging SQLite dell’importazione SQL, se non usa il percorso predefinito')
     command.add_argument('--output')
     command.add_argument('--rules', default='config/categories.json')
     args = parser.parse_args()
@@ -320,27 +341,45 @@ def main():
         parser.error('--batch-size deve essere compreso tra 1 e 10000; non limita il numero di voci')
     if args.command == 'dashboard':
         rebuild_dashboard(args.data_dir)
+    elif args.command == 'fetch-dumps':
+        from .dumps import fetch_dumps
+        selected = configured_languages(args.languages_file)
+        configured = [language for language, _ in selected]
+        languages = args.languages or configured
+        if len(languages) != len(set(languages)) or set(languages) - set(configured):
+            parser.error('Le lingue richieste devono appartenere alla configurazione unica')
+        databases = {language: database for language, database in selected if language in languages}
+        fetch_dumps(languages, args.sql_release, args.history_release, args.root, databases,
+                    plan_only=args.plan)
+    elif args.command == 'import-dumps':
+        from .dumps import import_graph, import_history
+        manifest = json.loads(Path(args.manifest).read_text())
+        language = manifest['language']
+        wiki_database(language, manifest.get('database'))
+        output = args.output or f'data/imported/{language}-raw.json'
+        import_graph(args.manifest, output, args.work_dir)
+        history_output = args.history_output or f'data/imported/{language}-history.json'
+        import_history(args.manifest, history_output, args.work_dir)
+    elif args.command == 'import-history':
+        from .dumps import import_history
+        manifest = json.loads(Path(args.manifest).read_text())
+        language = manifest['language']
+        wiki_database(language, manifest.get('database'))
+        output = args.output or f'data/imported/{language}-history.json'
+        import_history(args.manifest, output, args.work_dir)
     elif args.command == 'topics':
         if not math.isfinite(args.time_budget_seconds) or args.time_budget_seconds <= 0:
             parser.error('Il budget deve essere un numero positivo finito')
         began = time.monotonic()
         deadline = began + args.time_budget_seconds
-        config_path = Path(args.languages_file or 'config/languages.json')
-        if args.languages:
-            languages = args.languages
-        else:
-            config = json.loads(config_path.read_text())
-            if config.get('version') != 1:
-                parser.error('Versione della configurazione lingue non supportata')
-            languages = config.get('topic_languages', config.get('languages'))
-        if (not isinstance(languages, list) or not languages or
-                any(not isinstance(code, str) for code in languages) or len(set(languages)) != len(languages)):
-            parser.error('Selezionare lingue distinte per il modello')
-        for code in languages:
-            replica_database(code)
+        selected = configured_languages(args.languages_file)
+        configured = [language for language, _ in selected]
+        languages = args.languages or configured
+        if not languages or len(languages) != len(set(languages)) or set(languages) - set(configured):
+            parser.error('I blocchi dei temi devono appartenere all’unico elenco configurato')
         paths = [Path(args.input_dir) / f'{code}-raw.json' for code in languages]
         if any(not path.is_file() for path in paths):
-            parser.error('Manca un censimento completo delle lingue selezionate; eseguire collect su PAWS')
+            parser.error('Manca un censimento completo: importare prima i dump')
         model, spec = load_topic_model(args.model, args.model_config)
         report = {'time_budget_seconds': args.time_budget_seconds, 'completed_languages': [], 'deferred_languages': [], 'wikis': []}
         rate = None
@@ -350,92 +389,43 @@ def main():
                 report['deferred_languages'] = languages[position:]
                 break
             before = time.monotonic()
-            raw = json.loads(path.read_text())
-            if raw['metadata']['language'] != languages[position]:
+            output = Path(args.output_dir) / f'{languages[position]}-topics.json'
+            from .dumps import _read_first_metadata, predict_imported_topics
+            metadata = _read_first_metadata(path)
+            if metadata['language'] != languages[position]:
                 raise ValueError('Lingua del censimento non corrispondente al file selezionato')
             try:
-                supplement = predict_topics(raw, model, spec, args.batch_size, deadline)
+                if metadata.get('source', '').startswith('Wikimedia SQL dumps / '):
+                    topic_meta = predict_imported_topics(
+                        path, output, model, spec, args.batch_size, deadline, args.work_dir)
+                    census = topic_meta['predicted_pages'] + topic_meta['missing_pages']
+                else:
+                    raw = json.loads(path.read_text())
+                    supplement = predict_topics(raw, model, spec, args.batch_size, deadline)
+                    write_json(output, supplement)
+                    topic_meta = supplement['metadata']
+                    census = len(raw['pages'])
+                    del raw, supplement
             except TimeoutError:
                 report['deferred_languages'] = languages[position:]
                 break
-            output = Path(args.output_dir) / f'{languages[position]}-topics.json'
-            write_json(output, supplement)
             elapsed = time.monotonic() - before
             rate = max(rate or 0, elapsed / max(1, path.stat().st_size))
             report['completed_languages'].append(languages[position])
-            report['wikis'].append({'language': languages[position], 'seconds': elapsed, 'census_pages': len(raw['pages']),
-                                   'predicted_pages': supplement['metadata']['predicted_pages'], 'timing': supplement['metadata']['timing']})
+            report['wikis'].append({'language': languages[position], 'seconds': elapsed, 'census_pages': census,
+                                   'predicted_pages': topic_meta['predicted_pages'], 'timing': topic_meta['timing']})
             print(f'Temi salvati: {output}; {elapsed:.1f}s', flush=True)
-            del raw, supplement
         report['elapsed_seconds'] = time.monotonic() - began
         write_json(Path(args.output_dir) / 'topic-run.json', report)
         if report['deferred_languages']:
             print('Rinviate senza campionamento: ' + ' '.join(report['deferred_languages']), flush=True)
-    elif args.command == 'collect':
-        selected = collection_languages(args)
-        config = json.loads(Path(args.languages_file).read_text()) if args.languages_file else {}
-        if len(selected) > 1 and (args.output or args.creators_output):
-            parser.error('Per più lingue usare --output-dir, senza percorsi dei singoli file')
-        paths, jobs = set(), []
-        for language, database in selected:
-            output = Path(args.output or Path(args.output_dir) / f'{language}-raw.json')
-            creator_output = Path(args.creators_output) if args.creators_output else output.with_name(output.stem.removesuffix('-raw') + '-creators.json')
-            for path in (output, creator_output):
-                pair = {path.resolve(), path.with_suffix(path.suffix + '.tmp').resolve()}
-                if paths & pair:
-                    parser.error('Il file dei creatori deve essere distinto dal grafo e dai file temporanei')
-                paths.update(pair)
-            jobs.append((language, database, output, creator_output))
-        if config.get('size_selection') is not None:
-            report_path = Path(args.output_dir) / 'language-selection.json'
-            if {report_path.resolve(), report_path.with_suffix('.json.tmp').resolve()} & paths:
-                parser.error('Il rapporto dimensioni deve essere distinto dai dati raccolti')
-            selection, report = measured_language_selection(args, selected)
-            jobs = [job for job in jobs if job[0] in selection['selected_languages']]
-            write_json(report_path, report)
-            print('Lingue selezionate: ' + ' '.join(selection['selected_languages']), flush=True)
-        for language, database, output, creator_output in jobs:
-            print(f'Raccolta integrale: {language}', flush=True)
-            collect_one(language, args.credentials, output, creator_output, database, args.low_memory, args.batch_size, args.work_dir)
-    elif args.command == 'collect-creators':
-        from .replicas import collect_creators
-        output = Path(args.output or f'data/{args.language}-creators.json')
-        if args.low_memory:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix='orphanwiki-', dir=args.work_dir or output.parent) as folder:
-                with closing(sqlite3.connect(Path(folder) / 'staging.sqlite')) as stage:
-                    stage.executescript('PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;')
-                    raw = collect_creators(args.language, args.credentials, args.database, stage=stage, batch_size=args.batch_size)
-                    raw['metadata']['collection_storage'] = 'sqlite_staging'
-                    write_json(output, raw, arrays={'pages': raw['pages']})
-            print(f'Dati dei creatori: {output}')
-            return
-        options = {'database': args.database} if args.database else {}
-        raw = collect_creators(args.language, args.credentials, **options)
-        write_json(output, raw)
-        print(f'Dati dei creatori: {output}')
-    elif args.command == 'sizes':
-        from .replicas import collect_sizes
-        records = []
-        for language, database in collection_languages(args):
-            record = collect_sizes(language, args.credentials, database)
-            records.append(record)
-            print(f"{language}: {record['census_pages']:,} pagine; {record['wikitext_bytes'] / 2**20:,.1f} MiB di wikitext (non peso JSON o RAM)", flush=True)
-        report = {'source': 'Wiki Replicas through PAWS', 'wikis': records}
-        if args.languages_file:
-            config = json.loads(Path(args.languages_file).read_text())
-            if config.get('size_selection') is not None:
-                selection = select_by_size(config, records)
-                report['selection'] = selection
-                print('Lingue sotto soglia o incluse esplicitamente: ' + ' '.join(selection['selected_languages']), flush=True)
-        write_json(args.output, report)
     elif args.command == 'compare':
         paths = [Path(p) for p in args.inputs] if args.inputs else discover_collections(args.input_dir)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         with compare_files(paths, json.loads(Path(args.rules).read_text()),
-                           args.creators, args.topics, args.work_dir or output_dir) as results:
-            protected = {Path(path).resolve() for path in [*paths, *args.creators, *args.topics]}
+                           args.topics, args.work_dir or output_dir, args.histories) as results:
+            protected = {Path(path).resolve() for path in [*paths, *args.topics, *args.histories]}
             filenames = ['manifest.json', 'all.json', 'all-demo.json']
             for language, result in results.items():
                 name = language + ('-demo' if result['metadata'].get('demo') else '')
@@ -445,15 +435,25 @@ def main():
             publish_comparison(results, output_dir)
     else:
         rules = json.loads(Path(args.rules).read_text())
-        raw = json.loads(Path(args.input).read_text())
-        creators = json.loads(Path(args.creators).read_text()) if args.creators else None
-        topics = None
         topic_path = Path(args.topics) if args.topics else Path(args.input).with_name(Path(args.input).stem.removesuffix('-raw') + '-topics.json')
         if args.topics and not topic_path.is_file():
             raise ValueError('File dei temi esplicitamente richiesto non trovato')
-        if topic_path.exists():
-            topics = json.loads(topic_path.read_text())
-        export(raw, args.output or f"web/data/{raw['metadata']['language']}.json", rules, creators, topics)
+        source = Path(args.input)
+        if source.stat().st_size >= 128 * 1024**2:
+            from .dumps import _read_first_metadata, analyze_imported_dump
+            metadata = _read_first_metadata(source)
+        else:
+            metadata = {}
+        if metadata.get('source', '').startswith('Wikimedia SQL dumps / '):
+            analyze_imported_dump(source, args.history,
+                                  args.output or f"web/data/{metadata['language']}.json",
+                                  rules, args.work_dir, topic_path if topic_path.is_file() else None)
+        else:
+            raw = json.loads(source.read_text())
+            topics = json.loads(topic_path.read_text()) if topic_path.exists() else None
+            history = json.loads(Path(args.history).read_text()) if args.history else None
+            export(raw, args.output or f"web/data/{raw['metadata']['language']}.json",
+                   rules, topics, history)
 
 
 if __name__ == '__main__':

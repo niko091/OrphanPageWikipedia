@@ -1,24 +1,32 @@
 'use strict';
 // Static interface and transport contracts; analytical work belongs to Rust.
 // PyO3 prepares observations; WebAssembly computes displayed statistics.
-type MetricField = 'age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'creator_prior_edits_other' |
-  'creator_prior_articles' | 'creator_tenure_days' | 'creator_articles_created_total' | 'creator_orphans_current';
+type MetricField = 'age_days' | 'history_first_revision_age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'creator_prior_edits_other' |
+  'creator_prior_articles' | 'creator_tenure_days' | 'creator_articles_created_total' | 'creator_orphans_current' |
+  'creator_continuity_months_before_creation' | 'creator_prior_edits_main_history' |
+  'creator_prior_edits_other_history';
 type PageObservation = Partial<Record<MetricField, number | null>> & {
   page_id: number; title: string; orphan: boolean; language?: string;
   category?: string | null; category_status?: string; revision_id?: number | null;
   created_at?: string | null; page_created_at?: string | null;
   in_degree?: number | null; out_degree?: number | null;
   creator_key?: string | null; creator_account_type?: string | null;
+  history_creator_key?: string | null;
   creator_is_bot_now?: boolean | null; creator_languages_created?: string[] | null;
+  creator_groups_at_creation_history?: string[] | null;
   topic_status?: string | null; topic_labels?: string[] | null; origin?: string | null;
 };
 interface CreatorMetadata {
   status: string; language?: string; languages_scanned?: string[];
   started_at?: string; finished_at?: string; collected_languages?: number;
 }
+interface HistoryMetadata { status: string; language?: string; matched_pages?: number; }
 interface DatasetMetadata {
   language: string; complete?: boolean; demo?: boolean; kind?: string; age_rule?: string;
+  historical_age_rule?: string;
   started_at: string; finished_at: string; languages?: string[]; creators?: CreatorMetadata;
+  history?: HistoryMetadata; comparison_coverage?: 'complete' | 'partial';
+  topics?: {status?: string};
   biographies?: unknown;
 }
 interface ReferenceEdge {
@@ -43,8 +51,9 @@ interface AggregateMember {
   language: string; file: string; page_count: number; metadata: DatasetMetadata;
 }
 interface ManifestEntry {
-  language: string; file: string; date: string; kind?: string; demo?: boolean;
-  observations_file?: string; cards_file?: string; connections_dir?: string;
+  language: string; file: string; date: string; published_at?: string; kind?: string; demo?: boolean;
+  observations_file?: string; summary_file?: string; creator_index_file?: string;
+  cards_file?: string; connections_dir?: string;
 }
 interface CompactObservations {
   format: string; metadata: DatasetMetadata; columns: string[]; rows: unknown[][];
@@ -79,24 +88,48 @@ interface NumericGroup {
   total: number; known: number; missing: number; median: number | null;
   counts: number[]; percentages: (number | null)[]; cumulative: [number, number][];
 }
-interface NumericReport { known: number; available: boolean; groups: NumericGroup[]; count_max: number; bin_edges: number[]; ticks: number[]; }
+interface NumericReport { known: number; available: boolean; groups: NumericGroup[]; count_max: number; bin_edges: number[]; ticks: number[]; cumulative_ticks?: number[]; }
 interface OriginsReport { origins: CategoryReportRow[]; bots: CategoryReportRow[]; known_bots: number; }
 interface OverviewReport {
   total: number; orphans: number; percent: number | null; dead_ends: number;
   attributed_orphans: number; missing_creators: number; distinct_creators: number;
 }
+interface DashboardSummaryData {
+  format: 'dashboard_summary_v1'; metadata: DatasetMetadata; census_page_count: number;
+  reports: {
+    overview: OverviewReport; categories: CategoryReportRow[]; profiles: ProfilesReport;
+    numeric: Record<string, NumericReport>; origins: OriginsReport;
+    creator_groups: CategoryReportRow[];
+  };
+}
+interface CreatorIndexData {
+  format: 'creator_index_v1'; metadata: DatasetMetadata;
+  census_page_count: number; creators: CreatorRow[];
+}
+interface RecentEdit { language: string; page_id: number; namespace: number; timestamp: string; topic_labels: string[] | null; }
+interface InterestReport {
+  total_edits: number; known_topic_edits: number;
+  scores: {key: string; topic: number; language: number}[];
+}
+interface GlobalWiki { wiki: string; url: string; id: number; editcount?: number; }
+interface GlobalUser { id: number; name: string; merged: GlobalWiki[]; missing?: boolean; }
+interface UserContribution { userid: number; pageid: number; ns: number; timestamp: string; }
 
 interface UIElements {
   'age': HTMLElement;
   'age-note': HTMLElement;
   'article-categories': HTMLElement;
   'article-category': HTMLInputElement;
+  'article-category-control': HTMLElement;
+  'article-macro': HTMLSelectElement;
+  'article-macro-control': HTMLElement;
   'article-category-heading': HTMLElement;
   'article-category-label': HTMLElement;
   'article-classification': HTMLSelectElement;
   'article-group': HTMLSelectElement;
   'article-info': HTMLElement;
   'article-more': HTMLButtonElement;
+  'article-load': HTMLButtonElement;
   'article-rows': HTMLElement;
   'article-search': HTMLInputElement;
   'article-sort': HTMLSelectElement;
@@ -110,6 +143,10 @@ interface UIElements {
   'candidate-search': HTMLInputElement;
   'candidate-section': HTMLElement;
   'candidate-sort': HTMLSelectElement;
+  'profile-sort-option': HTMLOptionElement;
+  'profile-username': HTMLInputElement;
+  'profile-apply': HTMLButtonElement;
+  'profile-status': HTMLElement;
   'categories': HTMLElement;
   'category-metric': HTMLSelectElement;
   'chart-type': HTMLSelectElement;
@@ -121,6 +158,11 @@ interface UIElements {
   'connection-title': HTMLElement;
   'creator-bots': HTMLElement;
   'creator-bots-note': HTMLElement;
+  'creator-groups': HTMLElement;
+  'creator-groups-note': HTMLElement;
+  'history-section': HTMLElement;
+  'creator_continuity_months_before_creation-chart': HTMLElement;
+  'creator_continuity_months_before_creation-note': HTMLElement;
   'creator-info': HTMLElement;
   'creator-more': HTMLButtonElement;
   'creator-rows': HTMLElement;
@@ -142,10 +184,10 @@ interface UIElements {
   'creators-empty': HTMLElement;
   'creators-link': HTMLAnchorElement;
   'dataset': HTMLSelectElement;
+  'dataset-date': HTMLSelectElement;
   'download': HTMLAnchorElement;
   'deorphanize-link': HTMLAnchorElement;
   'features-paper': HTMLElement;
-  'features-thresholds': HTMLElement;
   'length': HTMLElement;
   'llm-prompt': HTMLDialogElement;
   'llm-prompt-close': HTMLButtonElement;
@@ -158,7 +200,6 @@ interface UIElements {
   'metrics': HTMLElement;
   'origin-section': HTMLElement;
   'origins': HTMLElement;
-  'source': HTMLElement;
   'status': HTMLElement;
   'theme-dark-icon': HTMLElement;
   'theme-light-icon': HTMLElement;
@@ -194,12 +235,9 @@ const translations: Record<string, string> = {
   "Lunghezza maggiore (≥ mediana)": "Longer articles (≥ median)",
   "Qualità alta (Johnson 2021)": "High quality (Johnson 2021)",
   "Qualità bassa (Johnson 2021)": "Low quality (Johnson 2021)",
-  "Totali: {orphans} orfane; {others} non orfane.": "Totals: {orphans} orphans; {others} non-orphans.",
   "I temi del modello non sono presenti nella raccolta. Nessun tema viene dedotto dalle categorie o dal genere della voce.": "Model topics are absent from the collection. No topic is inferred from categories or the article subject’s gender.",
   "Temi assegnati con probabilità > 0,5. Una voce può avere più temi; le percentuali non devono sommare a 100%. I macrotemi uniscono le etichette dei propri sottotemi. Women è un tema predetto, non una misura del genere biografico.": "Topics assigned with probability > 0.5. An article can have multiple topics; percentages need not sum to 100%. Top-level topics combine their subtopic labels. Women is a predicted topic, not a biographical gender measurement.",
-  "Copertura del modello: {orphans}/{orphanTotal} orfane; {others}/{otherTotal} non orfane.": "Model coverage: {orphans}/{orphanTotal} orphans; {others}/{otherTotal} non-orphans.",
   "La qualità richiede conteggi di riferimenti, sezioni e immagini non presenti nella raccolta attuale.": "Quality requires reference, section and image counts absent from the current collection.",
-  "{language}: mediana età {age} giorni; mediana lunghezza {length} byte": "{language}: median age {age} days; median length {length} bytes",
   "Modello LLM": "LLM provider",
   "Apri {provider} con il prompt già compilato": "Open {provider} with a prefilled prompt",
   "Apri {provider} e copia il prompt": "Open {provider} and copy the prompt",
@@ -213,7 +251,6 @@ const translations: Record<string, string> = {
   "Nessuna pagina candidata disponibile per preparare il prompt.": "No candidate pages are available to prepare the prompt.",
   "Tutte le lingue": "All languages",
   "Scarica l’indice delle raccolte JSON": "Download the dataset index as JSON",
-  "Lingue aggregate: {languages}.": "Pooled languages: {languages}.",
   "Date con criteri diversi tra lingue: creazione osservata oppure prima revisione pubblica.": "Different date criteria across languages: observed creation or earliest public revision.",
   "Indice aggregato non valido": "Invalid aggregate index",
   "Interfaccia italiana: passa all’inglese": "Italian interface: switch to English",
@@ -223,7 +260,9 @@ const translations: Record<string, string> = {
   "Categorie, età e lunghezza delle voci senza collegamenti entranti.": "Categories, age and length of articles with no incoming links.",
   "Analisi delle voci": "Article analysis",
   "Pagine di analisi": "Analysis pages",
-  "Lingua e raccolta": "Wikipedia language and dataset",
+  "Lingua di Wikipedia": "Wikipedia language",
+  "Data di estrazione": "Extraction date",
+  "Ultima disponibile": "Latest",
   "Caricamento {language}: {current}/{total} lingue…": "Loading {language}: {current}/{total} languages…",
   "Osservazioni compatte non valide": "Invalid compact observations",
   "Dataset troppo grande per il browser: esegui python -m orphanwiki dashboard --data-dir web/data": "Dataset too large for the browser: run python -m orphanwiki dashboard --data-dir web/data",
@@ -231,6 +270,7 @@ const translations: Record<string, string> = {
   "Categorie Wikipedia": "Wikipedia categories",
   "Quattro macrotemi": "Four broad topics",
   "Macrotema": "Broad topic",
+  "Tutti i macrotemi": "All broad topics",
   "Tema": "Topic",
   "Categoria / tema": "Category / topic",
   "Temi non disponibili": "Topics unavailable",
@@ -250,7 +290,9 @@ const translations: Record<string, string> = {
   "Percentuale di orfane": "Orphan percentage",
   "Numero di orfane": "Orphan count",
   "Età delle voci": "Article age",
+  "Età dalla prima revisione osservata": "Age since first observed revision",
   "Anni dalla creazione della pagina": "Years since page creation",
+  "Anni dalla prima revisione registrata in MediaWiki History alla raccolta del grafo; non è una data di creazione verificata.": "Years since the first revision recorded in MediaWiki History at graph collection; this is not a verified creation date.",
   "Lunghezza delle voci": "Article length",
   "Byte del wikitesto, asse logaritmico": "Wikitext bytes, logarithmic axis",
   "Esplora le voci": "Explore articles",
@@ -276,6 +318,9 @@ const translations: Record<string, string> = {
   "Link entranti": "Incoming links",
   "Collegamenti possibili": "Possible links",
   "Mostra altre 25 voci": "Show 25 more articles",
+  "Carica l’elenco completo delle voci": "Load the complete article list",
+  "Grafici pronti per {n} voci. Carica l’elenco completo solo per cercare o ordinare le singole voci.": "Charts ready for {n} articles. Load the complete list to search or sort individual articles.",
+  "Caricamento dell’elenco completo delle voci…": "Loading the complete article list…",
   "Studio di riferimento": "Reference study",
   "Analisi descrittiva": "Descriptive analysis",
   "Provenienza delle voci ed esperienza dei loro creatori.": "Article origins and creator experience.",
@@ -286,6 +331,17 @@ const translations: Record<string, string> = {
   "Anzianità del profilo alla creazione": "Account age at article creation",
   "Voci create, ancora esistenti": "Created articles still in existence",
   "Voci orfane del creatore nel censimento": "Creator’s orphan articles in the census",
+  "Voci attribuite al creatore storico nel censimento": "Articles attributed to the historical creator in the census",
+  "Orfane attuali attribuite al creatore storico": "Current orphans attributed to the historical creator",
+  "Attribuzione ricostruita dalla prima revisione in MediaWiki History; conteggio delle voci ancora nel censimento, non totale delle creazioni dell’account. Disponibile per {n}/{total} voci.": "Attribution reconstructed from the first revision in MediaWiki History; count of articles still in this census, not the account’s total creations. Available for {n}/{total} articles.",
+  "Modifiche strettamente precedenti alla prima revisione osservata in MediaWiki History; non equivalgono alla creazione verificata tramite log. Disponibile per {n}/{total} voci.": "Edits strictly before the first revision observed in MediaWiki History; this is not equivalent to creation verified by logs. Available for {n}/{total} articles.",
+  "Questa misura non è ricostruibile dai dump attuali; il grafico resta visibile senza valori. Disponibile per {n}/{total} voci.": "This measure cannot be reconstructed from the current dumps; the chart remains visible without values. Available for {n}/{total} articles.",
+  "Continuità prima della creazione": "Continuity before article creation",
+  "Gruppi del creatore alla creazione": "Creator groups at article creation",
+  "Gruppo non disponibile": "Group unavailable",
+  "Mesi consecutivi": "Consecutive months",
+  "Adattamento della stabilità Vital Signs: mesi completi consecutivi prima della creazione con almeno cinque modifiche. Sono escluse le modifiche nel mese di creazione. Cronologia pubblica ricostruita; disponibile per {n}/{total} voci.": "Vital Signs stability adaptation: consecutive complete months before creation with at least five edits. Edits in the creation month are excluded. Reconstructed public history; available for {n}/{total} articles.",
+  "Gruppi storici ricostruiti da MediaWiki History alla prima revisione. Una voce può comparire in più gruppi; i gruppi assenti restano sconosciuti. Ogni barra mostra orfane/tutte le voci del gruppo.": "Historical groups reconstructed from MediaWiki History at the first revision. An article can appear in multiple groups; missing groups remain unknown. Each bar shows orphans/all articles in the group.",
   "Provenienza delle voci": "Article origins",
   "Percentuale di orfane per provenienza osservata. Una nuova pagina senza tag non è necessariamente scritta da zero.": "Orphan percentage by observed origin. A new page without tags was not necessarily written from scratch.",
   "Esplora i creatori delle voci": "Explore article creators",
@@ -294,6 +350,8 @@ const translations: Record<string, string> = {
   "Più orfane": "Most orphans first",
   "Meno orfane": "Fewest orphans first",
   "Più voci create": "Most created articles first",
+  "Più voci attribuite": "Most attributed articles first",
+  "Meno voci attribuite": "Fewest attributed articles first",
   "Meno voci create": "Fewest created articles first",
   "Creatore": "Creator",
   "Tipo account attuale": "Current account type",
@@ -309,6 +367,21 @@ const translations: Record<string, string> = {
   "Cerca una voce orfana": "Search orphan articles",
   "Cerca una categoria…": "Search categories…",
   "Mostra altre 25 schede": "Show 25 more cards",
+  "Nome utente Wikimedia": "Wikimedia username",
+  "Nome utente": "Username",
+  "Personalizza le proposte": "Personalize suggestions",
+  "Affinità con i miei temi": "Affinity with my topics",
+  "Caricamento delle ultime 100 modifiche…": "Loading the last 100 edits…",
+  "Profilo: {edits} modifiche in tutte le Wikipedie; temi osservabili per {known}. Le altre modifiche non hanno un tema nel dataset selezionato.": "Profile: {edits} edits across all Wikipedias; topics observable for {known}. Other edits have no topic in the selected dataset.",
+  "Personalizzazione non disponibile: {error}": "Personalization unavailable: {error}",
+  "Nessun tema osservabile nelle ultime 100 modifiche per le lingue raccolte: non è possibile ordinare per interessi.": "No topics are observable in the last 100 edits for the collected languages: interest-based ordering is unavailable.",
+  "Le raccolte selezionate non contengono ancora le predizioni dei temi. Esegui la fase topics e ripubblica l’analisi per attivare l’ordinamento per interessi.": "The selected collections do not yet contain topic predictions. Run the topics stage and republish the analysis to enable interest-based ordering.",
+  "Nessuna delle ultime 100 modifiche è in una Wikipedia con temi predetti nella raccolta selezionata.": "None of the last 100 edits is in a Wikipedia with predicted topics in the selected collection.",
+  "Nome utente Wikimedia non valido": "Invalid Wikimedia username",
+  "Identità globale Wikimedia non verificata": "Global Wikimedia identity could not be verified",
+  "Identità globale Wikimedia ambigua": "Ambiguous global Wikimedia identity",
+  "Nessuna Wikipedia collegata all’account globale": "No Wikipedia is attached to the global account",
+  "L’utente non ha modifiche pubbliche nelle Wikipedie collegate": "The user has no public edits on attached Wikipedias",
   "Connetti una pagina orfana": "Connect an orphan page",
   "Confronta le pagine candidate con i collegamenti già presenti nelle altre lingue.": "Compare candidate pages with existing links in other languages.",
   "Caricamento…": "Loading…",
@@ -357,13 +430,16 @@ const translations: Record<string, string> = {
   "Nessuna pagina candidata individuata con le corrispondenze disponibili.": "No candidate pages found using the available matches.",
   "Dataset non disponibile": "Dataset unavailable",
   "Codice lingua non valido": "Invalid language code",
-  "Dataset con arricchimento esterno: rigenera i risultati dalla raccolta originale della lingua su PAWS": "Dataset contains external enrichment: regenerate results from the original PAWS collection for this language",
+  "Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali": "Dataset contains external enrichment: regenerate results from the official dumps",
   "Anni dalla creazione della pagina; date non determinabili escluse.": "Years since page creation; unknown dates excluded.",
-  "Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.": "Legacy dataset: years since the earliest available public revision. Creation dates require a new PAWS collection.",
+  "Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.": "Legacy dataset: years since the earliest available public revision; creation date is undetermined.",
   "DEMO · Dati sintetici per verificare il sistema. Questi non sono risultati di Wikipedia.": "DEMO · Synthetic data for testing. These are not Wikipedia results.",
   "Pagine orfane": "Orphan pages",
   "Orfane con creatore attribuito": "Orphans with attributed creator",
   "Creatori distinti delle orfane attribuite": "Distinct creators of attributed orphans",
+  "Orfane con creatore storico ricostruito": "Orphans with reconstructed historical creator",
+  "Creatori storici distinti delle orfane": "Distinct historical creators of orphan articles",
+  "{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo di account e totale delle creazioni non disponibili.": "{n} reconstructed creators · {shown} shown. Local historical IDs; attribution from the first observed revision. Account type and lifetime creations are unavailable.",
   "Orfane senza creatore attribuito": "Orphans without attributed creator",
   "Voci analizzate": "Analyzed articles",
   "Percentuale orfane": "Orphan percentage",
@@ -372,11 +448,8 @@ const translations: Record<string, string> = {
   "Nessuna raccolta reale presente": "No real datasets available",
   "Nome dataset non valido": "Invalid dataset filename",
   "Raccolta richiesta non disponibile": "Requested dataset unavailable",
-  "Totali: {orphans} orfane, {others} non orfane; nessun valore disponibile.": "Totals: {orphans} orphans, {others} non-orphans; no available values.",
   "Mediana orfane: {a} {unit} (n={n}) · Non orfane: {b} {unit} (n={m})": "Orphan median: {a} {unit} (n={n}) · Non-orphans: {b} {unit} (n={m})",
   "Dati mancanti esclusi dal grafico: {a} orfane, {b} non orfane.": "Missing values excluded from chart: {a} orphans, {b} non-orphans.",
-  "Denominatori: tutte le {a} orfane e tutte le {b} non orfane del dataset, inclusi i dati mancanti. Le percentuali delle barre sommano al 100% solo se il gruppo ha tutti i dati disponibili. Un gruppo vuoto non ha percentuali definite.": "Denominators: all {a} orphans and all {b} non-orphans in the dataset, including missing values. Bar percentages sum to 100% only with complete coverage. Percentages are undefined for an empty group.",
-  "20 intervalli uguali sull’asse {scale}, comuni ai due gruppi. Estremo inferiore incluso, superiore escluso salvo nell’ultimo intervallo. Le barre mostrano {mode}, non valori cumulativi.": "20 shared bins equally spaced on the {scale} axis. Lower endpoints are included; upper endpoints are excluded except in the final bin. Bars show {mode}, not cumulative values.",
   "logaritmico": "logarithmic",
   "lineare": "linear",
   "percentuali del rispettivo gruppo": "within-group percentages",
@@ -393,9 +466,9 @@ const translations: Record<string, string> = {
   "{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.": "{n} candidate pages · {shown} displayed. Review the content before adding a link.",
   "Collegamento da valutare in {language}": "Proposed link in {language}",
   "Collegamento esistente in {language}": "Existing link in {language}",
-  "Periodo di raccolta: {start} — {end}": "Collection period: {start} — {end}",
-  " · Dati dei creatori: {start} — {end}": " · Creator data: {start} — {end}",
-  "Impossibile caricare: {error}. Esporta i dati PAWS con analyze o compare e servi la cartella web tramite HTTP.": "Unable to load: {error}. Export PAWS data with analyze or compare and serve the web folder over HTTP.",
+  "Data di creazione non disponibile nei dump SQL; la cronologia storica non prova automaticamente la creazione della pagina.": "Creation date is unavailable in the SQL dumps; reconstructed history does not automatically prove page creation.",
+  "Date con criteri diversi tra lingue: creazione osservata, prima revisione pubblica o dato non disponibile.": "Date definitions differ between languages: observed creation, first public revision, or unavailable data.",
+  "Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.": "Unable to load: {error}. Run the dump pipeline and serve the web folder over HTTP.",
   "Voci attribuite ad account bot": "Articles attributed to bot accounts",
   "Bot (stato attuale)": "Bot (current status)",
   "Non bot (stato attuale)": "Non-bot (current status)",
@@ -445,15 +518,177 @@ function applyTranslations() {
 const number = (value: number | null | undefined) => value == null ? '—' : new Intl.NumberFormat(locale(), {maximumFractionDigits: 1}).format(value);
 const pageLanguage = (row: PageObservation) => row.language || data.metadata.language;
 const pageKey = (row: PageObservation) => data.metadata.kind==='aggregate'?`${pageLanguage(row)}:${row.page_id}`:String(row.page_id);
-const creatorKey = (row: PageObservation) => `${pageLanguage(row)}:${row.creator_key}`;
-const creatorsAvailable = () => ['collected','partially_collected'].includes(data.metadata.creators?.status ?? '');
+const creatorMode = (): 'observed' | 'history' | 'missing' =>
+  ['collected','partially_collected'].includes(data.metadata.creators?.status??'')?'observed':
+  ['collected','partially_collected'].includes(data.metadata.history?.status??'')?'history':'missing';
+const creatorsAvailable = () => creatorMode()!=='missing';
+const attributedCreator = (row: PageObservation) => creatorMode()==='history'?row.history_creator_key:row.creator_key;
+const attributedCreatorKey = (row: PageObservation) => {
+  const key=attributedCreator(row);
+  return key?(data.metadata.kind==='aggregate'?`${pageLanguage(row)}:${key}`:key):null;
+};
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, candidateLimit = 25, connectionLimit = 50, articleLimit = 25, creatorLimit = 25, creatorRows: CreatorRow[] = [];
+let precomputed: DashboardSummaryData | null = null, precomputedCreators: CreatorRow[] | null = null;
+let summaryOnly = false, articleListLoading = false;
+let profileRequestVersion = 0;
+let profileContributions: RecentEdit[] | null = null;
+let profileScores: Map<string, {topic: number; language: number}> | null = null;
+
+async function wikimediaAPI(url: URL): Promise<unknown> {
+  if(url.protocol!=='https:' || !(url.hostname==='meta.wikimedia.org'||/^[a-z][a-z0-9-]{0,19}\.wikipedia\.org$/.test(url.hostname)))
+    throw new Error('API Wikimedia non valida');
+  url.searchParams.set('format','json');url.searchParams.set('origin','*');
+  const response=await fetch(url.href,{cache:'no-store'});
+  if(!response.ok)throw new Error('API Wikimedia non disponibile');
+  const payload: unknown=await response.json();
+  if(!payload||typeof payload!=='object'||'error' in payload)throw new Error('Risposta API Wikimedia non valida');
+  return payload;
+}
+function attachedWikipedia(value: unknown): {language: string; id: number; url: string} | null {
+  if(!value||typeof value!=='object')return null;
+  const wiki=value as Partial<GlobalWiki>;
+  if(typeof wiki.url!=='string'||typeof wiki.id!=='number'||!Number.isSafeInteger(wiki.id)||wiki.id<=0)return null;
+  const match=/^https:\/\/([a-z][a-z0-9-]{0,19})\.wikipedia\.org\/?$/.exec(wiki.url);
+  if(!match||typeof wiki.wiki!=='string'||!wiki.wiki.endsWith('wiki'))return null;
+  return {language:match[1],id:wiki.id,url:`https://${match[1]}.wikipedia.org`};
+}
+async function recentWikipediaEdits(username: string): Promise<RecentEdit[]> {
+  if(!username||username.length>255||/[\u0000-\u001f\u007f#<>|\[\]{}]/.test(username))throw new Error('Nome utente Wikimedia non valido');
+  const globalURL=new URL('https://meta.wikimedia.org/w/api.php');
+  globalURL.searchParams.set('action','query');globalURL.searchParams.set('meta','globaluserinfo');
+  globalURL.searchParams.set('guiuser',username);globalURL.searchParams.set('guiprop','merged');
+  const payload=await wikimediaAPI(globalURL) as {query?: {globaluserinfo?: GlobalUser}};
+  const user=payload.query?.globaluserinfo;
+  if(!user||user.missing||!Number.isSafeInteger(user.id)||user.id<=0||!Array.isArray(user.merged)||typeof user.name!=='string')
+    throw new Error('Identità globale Wikimedia non verificata');
+  const attached=new Map<string,{language: string; id: number; url: string}>();
+  for(const merged of user.merged){const wiki=attachedWikipedia(merged);if(wiki){if(attached.has(wiki.language))throw new Error('Identità globale Wikimedia ambigua');attached.set(wiki.language,wiki);}}
+  if(!attached.size)throw new Error('Nessuna Wikipedia collegata all’account globale');
+  const wikis=[...attached.values()], edits: RecentEdit[]=[];
+  let next=0, failure: unknown=null;
+  async function worker() {
+    while(next<wikis.length&&failure===null) {
+      const wiki=wikis[next++],url=new URL(wiki.url+'/w/api.php');
+      url.searchParams.set('action','query');url.searchParams.set('list','usercontribs');
+      url.searchParams.set('ucuserids',String(wiki.id));url.searchParams.set('uclimit','100');
+      url.searchParams.set('ucprop','ids|title|timestamp');url.searchParams.set('ucdir','older');
+      try {
+        const result=await wikimediaAPI(url) as {query?: {usercontribs?: UserContribution[]}};
+        const rows=result.query?.usercontribs;
+        if(!Array.isArray(rows)||rows.length>100)throw new Error('Modifiche Wikimedia non verificabili');
+        for(const row of rows) {
+          if(row.userid!==wiki.id||!Number.isSafeInteger(row.ns)||
+            typeof row.timestamp!=='string'||!Number.isFinite(Date.parse(row.timestamp)))throw new Error('Modifiche Wikimedia non verificabili');
+          edits.push({language:wiki.language,page_id:Number.isSafeInteger(row.pageid)&&row.pageid>0?row.pageid:0,
+            namespace:row.ns,timestamp:row.timestamp,topic_labels:null});
+        }
+      } catch(error) {
+        failure=error;
+      }
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(4,wikis.length)},()=>worker()));
+  if(failure!==null)throw failure;
+  edits.sort((a,b)=>b.timestamp.localeCompare(a.timestamp)||a.language.localeCompare(b.language)||a.page_id-b.page_id);
+  return edits.slice(0,100);
+}
+async function observedTopics(edits: RecentEdit[], version: number): Promise<RecentEdit[] | null> {
+  const enriched=edits.map(edit=>({...edit,topic_labels:null as string[] | null}));
+  const relevant=new Set(enriched.filter(edit=>edit.namespace===0).map(edit=>edit.language));
+  for(const language of relevant) {
+    if(version!==profileRequestVersion||!data)return null;
+    const member=data.metadata.kind==='aggregate'?data.members?.find(item=>item.language===language):undefined;
+    const selectedFile=member?.file??(data.metadata.language===language?datasetFile:undefined);
+    const metadata=member?.metadata??(data.metadata.language===language?data.metadata:undefined);
+    if(metadata?.topics?.status!=='predicted')continue;
+    const entry=datasetEntries.find(item=>item.file===selectedFile&&item.language===language&&item.kind!=='aggregate'&&item.observations_file);
+    if(!entry||!data.pages.some(page=>pageLanguage(page)===language))continue;
+    const filename=entry.observations_file!;
+    if(!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Trasporto osservazioni non valido');
+    const response=await fetch('data/'+filename,{cache:'no-store'});
+    if(!response.ok)throw new Error('Trasporto osservazioni non disponibile');
+    const observations=await response.json() as CompactObservations;
+    const columns=observations.columns;
+    if(observations.format!=='observations_v1'||observations.metadata?.language!==language||observations.metadata.finished_at!==entry.date||
+      !Array.isArray(columns)||!Array.isArray(observations.rows)||new Set(columns).size!==columns.length||
+      !['page_id','topic_labels','topic_status'].every(field=>columns.includes(field)))throw new Error('Trasporto osservazioni non valido');
+    const indexes=['page_id','topic_labels','topic_status'].map(field=>columns.indexOf(field));
+    const wanted=new Set(enriched.filter(edit=>edit.language===language&&edit.namespace===0).map(edit=>edit.page_id));
+    const found=new Map<number,string[] | null>();
+    for(const row of observations.rows) {
+      if(!Array.isArray(row)||row.length!==columns.length)throw new Error('Trasporto osservazioni non valido');
+      const id=row[indexes[0]];
+      if(typeof id==='number'&&wanted.has(id)) {
+        if(found.has(id))throw new Error('Trasporto osservazioni non valido');
+        const labels=row[indexes[1]],status=row[indexes[2]];
+        found.set(id,status==='predicted'&&Array.isArray(labels)&&labels.every(label=>typeof label==='string'&&topicDisplayNames.has(label))?labels:null);
+      }
+    }
+    for(const edit of enriched)if(edit.language===language&&edit.namespace===0)edit.topic_labels=found.get(edit.page_id)??null;
+  }
+  return enriched;
+}
+async function scoreProfile(edits: RecentEdit[], version: number) {
+  const enriched=await observedTopics(edits,version);
+  if(version!==profileRequestVersion||!enriched||!data)return;
+  const report=calculateReport<InterestReport>('interests',{edits:enriched,candidates:data.pages.filter(page=>page.orphan).map(page=>({
+    key:pageKey(page),language:pageLanguage(page),topic_labels:page.topic_status==='predicted'?page.topic_labels??null:null
+  })),aggregate:data.metadata.kind==='aggregate'});
+  if(report.known_topic_edits===0){
+    profileScores=null;$('profile-sort-option')!.disabled=true;
+    if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+    candidateCards();
+    const modeled=data.metadata.kind==='aggregate'?
+      data.members?.filter(member=>member.metadata.topics?.status==='predicted').map(member=>member.language)??[]:
+      data.metadata.topics?.status==='predicted'?[data.metadata.language]:[];
+    $('profile-status')!.textContent=t(!modeled.length?
+      'Le raccolte selezionate non contengono ancora le predizioni dei temi. Esegui la fase topics e ripubblica l’analisi per attivare l’ordinamento per interessi.':
+      !edits.some(edit=>edit.namespace===0&&modeled.includes(edit.language))?
+        'Nessuna delle ultime 100 modifiche è in una Wikipedia con temi predetti nella raccolta selezionata.':
+        'Nessun tema osservabile nelle ultime 100 modifiche per le lingue raccolte: non è possibile ordinare per interessi.');
+    return;
+  }
+  profileScores=new Map(report.scores.map(row=>[row.key,{topic:row.topic,language:row.language}]));
+  $('profile-sort-option')!.disabled=false;
+  $('candidate-sort')!.value='personalized';candidateLimit=25;candidateCards();
+  $('profile-status')!.textContent=t('Profilo: {edits} modifiche in tutte le Wikipedie; temi osservabili per {known}. Le altre modifiche non hanno un tema nel dataset selezionato.',
+    {edits:number(report.total_edits),known:number(report.known_topic_edits)});
+}
+async function applyProfile() {
+  const version=++profileRequestVersion;
+  const button=$('profile-apply')!;button.disabled=true;
+  profileScores=null;$('profile-sort-option')!.disabled=true;
+  if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+  $('profile-status')!.textContent=t('Caricamento delle ultime 100 modifiche…');
+  try {
+    const edits=await recentWikipediaEdits($('profile-username')!.value.trim());
+    if(version!==profileRequestVersion)return;
+    profileContributions=edits;
+    if(!edits.length)throw new Error('L’utente non ha modifiche pubbliche nelle Wikipedie collegate');
+    await scoreProfile(edits,version);
+  } catch(error) {
+    if(version===profileRequestVersion) {
+      profileContributions=null;profileScores=null;$('profile-sort-option')!.disabled=true;
+      if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+      $('profile-status')!.textContent=t('Personalizzazione non disponibile: {error}',{error:t(error instanceof Error?error.message:String(error))});
+      candidateCards();
+    }
+  } finally {if(version===profileRequestVersion)button.disabled=false;}
+}
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string | null, className?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
   if (text != null) node.textContent = text;
   if (className) node.className = className;
   return node;
+}
+function appendBarRow(box: HTMLElement, label: string, value: number | null, maximum: number, display: string, title?: string) {
+  const row=element('div',null,'bar-row'),track=element('div',null,'bar-bg'),bar=element('div',null,'bar');
+  bar.style.width=value==null?'0%':`${value/maximum*100}%`;
+  track.append(bar);
+  if(title)row.title=title;
+  row.append(element('span',label,'bar-label'),track,element('span',display,'bar-value'));
+  box.append(row);
 }
 // Taxonomy labels are supplied by the same Rust configuration as inference.
 let topicTaxonomy: Record<string, string[]> = {};
@@ -466,25 +701,20 @@ function featureBars(id: string, summary: FeatureSummary, count=false) {
     // A known empty category has zero observed orphans, but no defined rate.
     // Without any observations, neither counts nor percentages are available.
     const value=count?(feature.known?feature.orphans:null):feature.percent;
-    const row=element('div',null,'bar-row'),track=element('div',null,'bar-bg'),bar=element('div',null,'bar');
-    bar.style.width=value==null?'0%':`${value/maximum*100}%`;track.append(bar);
     const description=feature.known===0
       ?t('{label}: dato non disponibile; copertura {known}/{population}.',{label:feature.label,known:number(feature.known),population:number(population)})
       :feature.total===0&&!count
         ?t('{label}: Nessuna voce soddisfa questo requisito; percentuale non definita. Copertura {known}/{population}.',{label:feature.label,known:number(feature.known),population:number(population)})
         :t('{label}: {orphans}/{total} voci orfane; copertura {known}/{population}.',{label:feature.label,orphans:number(feature.orphans),total:number(feature.total),known:number(feature.known),population:number(population)});
-    row.title=description;
     const display=`${number(value)}${value!=null&&!count?'%':''} (${number(feature.orphans)}/${number(feature.total)})`;
-    row.append(element('span',feature.label,'bar-label'),track,element('span',display,'bar-value'));
-    box.append(row);
+    appendBarRow(box,feature.label,value,maximum,display,description);
   }
-  box.append(element('p',t('Totali: {orphans} orfane; {others} non orfane.',{orphans:number(summary.totals[0]),others:number(summary.totals[1])})),
-    element('p',t(count
+  box.append(element('p',t(count
       ?'Ogni barra conta le orfane che soddisfano il requisito; tra parentesi: orfane/tutte le voci con il requisito. I dati mancanti sono esclusi. — indica dati non disponibili.'
       :'Ogni barra mostra la percentuale di orfane fra le voci che soddisfano il requisito: orfane/tutte le voci con il requisito. I dati mancanti sono esclusi. — indica dati non disponibili o un denominatore vuoto.')));
 }
 function paperProfiles() {
-  const report=calculateReport<ProfilesReport>('profiles',data.pages.map(page=>[
+  const report=precomputed?JSON.parse(JSON.stringify(precomputed.reports.profiles)) as ProfilesReport:calculateReport<ProfilesReport>('profiles',data.pages.map(page=>[
     pageLanguage(page), page.orphan,
     page.topic_status==='predicted'&&Array.isArray(page.topic_labels)?page.topic_labels:null,
     page.page_created_at?metricValue(page.age_days):null,
@@ -493,11 +723,9 @@ function paperProfiles() {
   for(const row of report.topics.rows)row.label=topicDisplayNames.get(row.label)??row.label;
   featureBars('topics-full',report.topics,$('topics-full-metric')!.value==='count');
   featureBars('topics-paper',report.macrothemes,$('topics-paper-metric')!.value==='count');
-  for(const id of ['topics-full','topics-paper']) {
-    const group=report.macrothemes.rows[0].groups;
-    $(id)!.append(element('p',t(report.topics.rows[0].known>0?'Temi assegnati con probabilità > 0,5. Una voce può avere più temi; le percentuali non devono sommare a 100%. I macrotemi uniscono le etichette dei propri sottotemi. Women è un tema predetto, non una misura del genere biografico.':'I temi del modello non sono presenti nella raccolta. Nessun tema viene dedotto dalle categorie o dal genere della voce.')),
-      element('p',t('Copertura del modello: {orphans}/{orphanTotal} orfane; {others}/{otherTotal} non orfane.',{orphans:number(group[0].known),orphanTotal:number(group[0].total),others:number(group[1].known),otherTotal:number(group[1].total)})));
-  }
+  $('topics-full')!.append(element('p',t(report.topics.rows[0].known>0?
+    'Temi assegnati con probabilità > 0,5. Una voce può avere più temi; le percentuali non devono sommare a 100%. I macrotemi uniscono le etichette dei propri sottotemi. Women è un tema predetto, non una misura del genere biografico.':
+    'I temi del modello non sono presenti nella raccolta. Nessun tema viene dedotto dalle categorie o dal genere della voce.')));
   const featureLabels: Record<string,string> = {
     new:'Voci nuove (< mediana)',old:'Voci vecchie (≥ mediana)',
     quality_high:'Qualità alta (Johnson 2021)',quality_low:'Qualità bassa (Johnson 2021)',
@@ -506,36 +734,33 @@ function paperProfiles() {
   for(const row of report.features.rows)row.label=t(featureLabels[row.label]);
   featureBars('features-paper',report.features);
   $('features-paper')!.append(element('p',t('La qualità richiede conteggi di riferimenti, sezioni e immagini non presenti nella raccolta attuale.')));
-  $('features-thresholds')!.textContent=Object.entries(report.thresholds).map(([code,[age,length]])=>t('{language}: mediana età {age} giorni; mediana lunghezza {length} byte',
-    {language:code.toUpperCase(),age:number(age),length:number(length)})).join(' · ');
 }
 function categories() {
-  const ordered=calculateReport<CategoryReportRow[]>('categories',data.pages.map(page=>[label(page),page.orphan]));
+  const ordered=precomputed?.reports.categories??calculateReport<CategoryReportRow[]>('categories',data.pages.map(page=>[label(page),page.orphan]));
   const box = $('categories')!; box.replaceChildren();
   const count = $('category-metric')!.value === 'count';
   const max = count ? Math.max(1,ordered[0]?.orphans??0) : 100;
   for (const g of ordered.slice(0,20)) {
-    const value = count ? g.orphans : g.percent!;
-    const row = element('div', null, 'bar-row');
-    const track = element('div', null, 'bar-bg'), bar = element('div', null, 'bar');
-    bar.style.width = `${value/max*100}%`; track.append(bar);
-    row.append(element('span', g.label, 'bar-label'), track, element('span', `${number(value)}${count ? '' : '%'} (${g.orphans}/${g.total})`, 'bar-value'));
-    box.append(row);
+    const value = count ? g.orphans : g.percent;
+    appendBarRow(box,g.label,value,max,`${number(value)}${count ? '' : '%'} (${g.orphans}/${g.total})`);
   }
   if (!ordered.length) box.append(element('p', t('Nessuna voce disponibile.')));
 }
-function distribution(id: string, field: MetricField, unit: string, axisLabel: string | null = null, logarithmic=false): NumericReport {
+function distribution(id: string, field: MetricField, unit: string, axisLabel: string | null = null,
+  logarithmic=false, valueFor?: (page: PageObservation) => number | null): NumericReport {
   unit=t(unit);
   const box = $(id)!; box.replaceChildren();
   const mode = $('chart-type')!.value || 'percent';
   const histogram = mode !== 'cumulative', percent = mode === 'percent';
-  const report=calculateReport<NumericReport>('numeric',{
-    rows:data.pages.map(page=>[page.orphan,metricValue(page[field])]),
-    logarithmic:field==='length_bytes'||logarithmic,age:field==='age_days'
+  const summaryKey=id==='age'?field:id==='length'?'length_bytes':id.replace(/-chart$/,'');
+  const report=precomputed?.reports.numeric[summaryKey]??calculateReport<NumericReport>('numeric',{
+    rows:data.pages.map(page=>[page.orphan,valueFor?valueFor(page):metricValue(page[field])]),
+    logarithmic:field==='length_bytes'||logarithmic,
+    age:field==='age_days'||field==='history_first_revision_age_days'
   });
   const groups=report.groups,totals=groups.map(group=>group.total);
   if(!report.available) {
-    box.append(element('p',t('Dati non disponibili.')),element('p',t('Totali: {orphans} orfane, {others} non orfane; nessun valore disponibile.',{orphans:number(totals[0]),others:number(totals[1])})));
+    box.append(element('p',t('Dati non disponibili.')));
     return report;
   }
   const ns = 'http://www.w3.org/2000/svg';
@@ -546,7 +771,7 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   const width=Math.max(260, box.clientWidth || 900), height=width<600?380:520;
   const left=64, right=24, top=32, bottom=height-76;
   const plotWidth=width-left-right, plotHeight=bottom-top;
-  const binCount=20,bins=groups.map(group=>group.counts);
+  const binCount=20,bins=groups.map(group=>group.counts),groupedTails=Array.isArray(report.cumulative_ticks);
   const yMax=mode==='count'?report.count_max:100;
   const chartLabel=t(percent?'Percentuale del gruppo per intervallo':histogram?'Numero di pagine per intervallo':'Percentuale cumulativa per gruppo');
   const svg = svgNode('svg', {viewBox:`0 0 ${width} ${height}`, role:'img', 'aria-label':`${chartLabel}: ${field}`});
@@ -563,7 +788,9 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
       const boundary=(value: number)=>new Intl.NumberFormat(locale(),{maximumSignificantDigits:6}).format(value);
       const value=percent?groups[group].percentages[bin]:count;
       if(value===null)return;
-      const description=`${t(group===0?'Orfane':'Non orfane')} · [${boundary(lo)}, ${boundary(hi)}${bin===binCount-1?']':')'} ${unit}: ${percent?`${number(value)}% (${count}/${totals[group]} ${t('pagine del gruppo')})`:`${count} ${t('pagine')}`}`;
+      const range=groupedTails&&bin===0?`<${boundary(hi)}`:groupedTails&&bin===binCount-1?`>${boundary(lo)}`:
+        `[${boundary(lo)}, ${boundary(hi)}${bin===(groupedTails?binCount-2:binCount-1)?']':')'}`;
+      const description=`${t(group===0?'Orfane':'Non orfane')} · ${range} ${unit}: ${percent?`${number(value)}% (${count}/${totals[group]} ${t('pagine del gruppo')})`:`${count} ${t('pagine')}`}`;
       const bar=svgNode('rect',{x:left+bin*binWidth+binWidth*0.06+group*barWidth,y:bottom-value/yMax*plotHeight,width:barWidth,height:value/yMax*plotHeight,fill:group===0?'var(--orange)':'var(--teal)','aria-label':description});
       bar.append(svgNode('title',{},description));
       svg.append(bar);
@@ -576,11 +803,13 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   });
   const positions=width<600?[0,2,4]:[0,1,2,3,4];
   for(const index of positions) {
-    const original=report.ticks[index];
-    const tick=field==='length_bytes'?new Intl.NumberFormat(locale(),{notation:'compact',maximumFractionDigits:1}).format(original):number(original);
-    svg.append(svgNode('text',{x:left+index/4*plotWidth,y:bottom+30,'text-anchor':index===0?'start':index===4?'end':'middle',fill:'var(--muted)','font-size':16},tick));
+    const original=(histogram?report.ticks:report.cumulative_ticks??report.ticks)[index];
+    const value=field==='length_bytes'?new Intl.NumberFormat(locale(),{notation:'compact',maximumFractionDigits:1}).format(original):number(original);
+    const tick=histogram&&groupedTails&&index===0?`<${value}`:histogram&&groupedTails&&index===4?`>${value}`:value;
+    const x=histogram&&groupedTails?(1+index*18/4)/20:index/4;
+    svg.append(svgNode('text',{x:left+x*plotWidth,y:bottom+30,'text-anchor':index===0?'start':index===4?'end':'middle',fill:'var(--muted)','font-size':16},tick));
   }
-  svg.append(svgNode('text',{x:left+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel || (field==='age_days'?t('Età (anni)'):t('Lunghezza (byte, scala logaritmica)'))));
+  svg.append(svgNode('text',{x:left+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel || (field==='age_days'||field==='history_first_revision_age_days'?t('Età (anni)'):t('Lunghezza (byte, scala logaritmica)'))));
   box.append(svg);
   const orphanMedian=groups[0].median,otherMedian=groups[1].median;
   box.append(element('p',t('Mediana orfane: {a} {unit} (n={n}) · Non orfane: {b} {unit} (n={m})',{a:number(orphanMedian),b:number(otherMedian),unit,n:groups[0].known,m:groups[1].known})));
@@ -589,16 +818,17 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   box.append(legend);
   const missing=groups.map(group=>group.missing);
   box.append(element('p',t('Dati mancanti esclusi dal grafico: {a} orfane, {b} non orfane.',{a:number(missing[0]),b:number(missing[1])})));
-  if(percent) box.append(element('p',t('Denominatori: tutte le {a} orfane e tutte le {b} non orfane del dataset, inclusi i dati mancanti. Le percentuali delle barre sommano al 100% solo se il gruppo ha tutti i dati disponibili. Un gruppo vuoto non ha percentuali definite.',{a:number(totals[0]),b:number(totals[1])})));
-  box.append(element('p',histogram?t('20 intervalli uguali sull’asse {scale}, comuni ai due gruppi. Estremo inferiore incluso, superiore escluso salvo nell’ultimo intervallo. Le barre mostrano {mode}, non valori cumulativi.',{scale:t(field==='length_bytes'||logarithmic?'logaritmico':'lineare'),mode:t(percent?'percentuali del rispettivo gruppo':'conteggi')}):t('Ogni curva usa come denominatore le voci del proprio gruppo con dato disponibile; arriva al 100%. Le mediane sono calcolate separatamente per gruppo.')));
+  if(!histogram)box.append(element('p',t('Ogni curva usa come denominatore le voci del proprio gruppo con dato disponibile; arriva al 100%. Le mediane sono calcolate separatamente per gruppo.')));
   return report;
 }
 const originLabels: Record<string, string> = {translation_tagged:'Traduzione segnalata',new_page_unclassified:'Nuova pagina, modalità non documentata',imported_history_observed:'Cronologia importata',unknown:'Origine non determinabile'};
 function creatorCharts() {
-  const available=creatorsAvailable();
+  const mode=creatorMode(),available=mode!=='missing';
   $('creators-empty')!.hidden=available;
   $('creator-section')!.hidden=!available; $('origin-section')!.hidden=!available;
   if(!available)return;
+  const history=mode==='history';
+  const byCreator=new Map(creatorRows.map(row=>[row.key,row]));
   const definitions: Partial<Record<MetricField, [string, string]>> = {
     creator_prior_edits_main:['Modifiche precedenti sulle voci','modifiche'],
     creator_prior_edits_other:['Modifiche precedenti negli altri namespace','modifiche'],
@@ -608,30 +838,71 @@ function creatorCharts() {
     creator_orphans_current:['Voci orfane del creatore nel censimento','voci'],
   };
   for(const [field,[title,unit]] of Object.entries(definitions) as [MetricField, [string, string]][]) {
-    const report=distribution(field+'-chart',field,unit,t('{unit} (scala logaritmica)',{unit:t(unit)}),true);
-    const coverage=(data.metadata.creators!.languages_scanned||[]).join(', ').toUpperCase();
-    $(field+'-note')!.textContent=t('{title}. {coverage}; ogni voce è un’osservazione. Disponibile per {n}/{total} voci. {scope}',{
-      title:t(title),coverage:t('Lingue esaminate: {languages}',{languages:coverage}),n:number(report.known),total:number(data.pages.length),
-      scope:t(field.includes('prior')?'Conteggi strettamente precedenti alla creazione, sulla cronologia pubblica disponibile.':field==='creator_tenure_days'?'Registrazione locale, non creazione dell’account globale.':'Conteggi osservati nella raccolta, non totali storici comprensivi di pagine cancellate.')
-    });
+    const sourceField=history&&field==='creator_prior_edits_main'?'creator_prior_edits_main_history':
+      history&&field==='creator_prior_edits_other'?'creator_prior_edits_other_history':field;
+    const censusCount=history&&(field==='creator_articles_created_total'||field==='creator_orphans_current');
+    const valueFor=censusCount?(page: PageObservation)=>{
+      const creator=attributedCreatorKey(page),row=creator?byCreator.get(creator):undefined;
+      return row?(field==='creator_articles_created_total'?row.total:row.orphans):null;
+    }:history&&(field==='creator_prior_articles'||field==='creator_tenure_days')?
+      (_page: PageObservation)=>null:undefined;
+    const report=distribution(field+'-chart',sourceField,unit,t('{unit} (scala logaritmica)',{unit:t(unit)}),true,valueFor);
+    const heading=$(field+'-heading');
+    if(heading)heading.textContent=t(history&&censusCount?
+      field==='creator_articles_created_total'?'Voci attribuite al creatore storico nel censimento':'Orfane attuali attribuite al creatore storico':title);
+    if(history) {
+      $(field+'-note')!.textContent=t(censusCount?
+        'Attribuzione ricostruita dalla prima revisione in MediaWiki History; conteggio delle voci ancora nel censimento, non totale delle creazioni dell’account. Disponibile per {n}/{total} voci.':
+        field==='creator_prior_edits_main'||field==='creator_prior_edits_other'?
+          'Modifiche strettamente precedenti alla prima revisione osservata in MediaWiki History; non equivalgono alla creazione verificata tramite log. Disponibile per {n}/{total} voci.':
+          'Questa misura non è ricostruibile dai dump attuali; il grafico resta visibile senza valori. Disponibile per {n}/{total} voci.',
+        {n:number(report.known),total:number(precomputed?.census_page_count??data.pages.length)});
+    } else {
+      const coverage=(data.metadata.creators!.languages_scanned||[]).join(', ').toUpperCase();
+      $(field+'-note')!.textContent=t('{title}. {coverage}; ogni voce è un’osservazione. Disponibile per {n}/{total} voci. {scope}',{
+        title:t(title),coverage:t('Lingue esaminate: {languages}',{languages:coverage}),n:number(report.known),total:number(precomputed?.census_page_count??data.pages.length),
+        scope:t(field.includes('prior')?'Conteggi strettamente precedenti alla creazione, sulla cronologia pubblica disponibile.':field==='creator_tenure_days'?'Registrazione locale, non creazione dell’account globale.':'Conteggi osservati nella raccolta, non totali storici comprensivi di pagine cancellate.')
+      });
+    }
   }
   const box=$('origins')!;box.replaceChildren();
-  const report=calculateReport<OriginsReport>('origins',data.pages.map(page=>[
+  const report=precomputed?.reports.origins??calculateReport<OriginsReport>('origins',data.pages.map(page=>[
     page.origin||'unknown',page.creator_key&&typeof page.creator_is_bot_now==='boolean'?page.creator_is_bot_now:null,page.orphan
   ]));
   for(const group of report.origins) {
-    const row=element('div',null,'bar-row'),track=element('div',null,'bar-bg'),bar=element('div',null,'bar');
-    bar.style.width=`${group.percent??0}%`;track.append(bar);
-    row.append(element('span',t(originLabels[group.label]||group.label),'bar-label'),track,element('span',`${number(group.percent)}% (${group.orphans}/${group.total})`,'bar-value'));box.append(row);
+    appendBarRow(box,t(originLabels[group.label]||group.label),group.percent,100,
+      `${number(group.percent)}% (${group.orphans}/${group.total})`);
   }
   const botNames=['Bot (stato attuale)','Non bot (stato attuale)','Creatore o stato bot non disponibile'];
-  $('creator-bots-note')!.textContent=t('Stato bot attuale del creatore, non stato storico alla creazione. Disponibile per {n}/{total} voci. Ogni barra mostra la percentuale di orfane nel gruppo (orfane/tutte le voci del gruppo); i dati mancanti sono separati.',{n:number(report.known_bots),total:number(data.pages.length)});
+  $('creator-bots-note')!.textContent=t('Stato bot attuale del creatore, non stato storico alla creazione. Disponibile per {n}/{total} voci. Ogni barra mostra la percentuale di orfane nel gruppo (orfane/tutte le voci del gruppo); i dati mancanti sono separati.',{n:number(report.known_bots),total:number(precomputed?.census_page_count??data.pages.length)});
   const botBox=$('creator-bots')!;botBox.replaceChildren();
   for(const group of report.bots) {
     const value=group.percent;
-    const row=element('div',null,'bar-row'),track=element('div',null,'bar-bg'),bar=element('div',null,'bar');
-    bar.style.width=`${value??0}%`;track.append(bar);
-    row.append(element('span',t(botNames[Number(group.label)]),'bar-label'),track,element('span',`${number(value)}${value==null?'':'%'} (${group.orphans}/${group.total})`,'bar-value'));botBox.append(row);
+    appendBarRow(botBox,t(botNames[Number(group.label)]),value,100,
+      `${number(value)}${value==null?'':'%'} (${group.orphans}/${group.total})`);
+  }
+}
+function historyCharts() {
+  const available=['collected','partially_collected'].includes(data.metadata.history?.status??'');
+  $('history-section')!.hidden=!available;
+  if(!available)return;
+  const report=distribution('creator_continuity_months_before_creation-chart',
+    'creator_continuity_months_before_creation','Mesi consecutivi',null,false);
+  $('creator_continuity_months_before_creation-note')!.textContent=t(
+    'Adattamento della stabilità Vital Signs: mesi completi consecutivi prima della creazione con almeno cinque modifiche. Sono escluse le modifiche nel mese di creazione. Cronologia pubblica ricostruita; disponibile per {n}/{total} voci.',
+    {n:number(report.known),total:number(precomputed?.census_page_count??data.pages.length)});
+  $('creator-groups-note')!.textContent=t(
+    'Gruppi storici ricostruiti da MediaWiki History alla prima revisione. Una voce può comparire in più gruppi; i gruppi assenti restano sconosciuti. Ogni barra mostra orfane/tutte le voci del gruppo.');
+  const groups=precomputed?.reports.creator_groups??calculateReport<CategoryReportRow[]>('categories',data.pages.flatMap(page=>{
+    const labels=page.creator_groups_at_creation_history?.length
+      ? [...new Set(page.creator_groups_at_creation_history)] : ['__missing__'];
+    return labels.map(group=>[group,page.orphan]);
+  }));
+  const box=$('creator-groups')!;box.replaceChildren();
+  for(const group of groups) {
+    const label=group.label==='__missing__'?t('Gruppo non disponibile'):group.label;
+    appendBarRow(box,label,group.percent,100,
+      `${number(group.percent)}${group.percent==null?'':'%'} (${group.orphans}/${group.total})`);
   }
 }
 function wikiLink(title: string, language: string) {
@@ -767,7 +1038,17 @@ function articleLabels(page: PageObservation): string[] {
 }
 function articleList() {
   if(!$('article-rows')!)return;
-  const search=$('article-search')!.value.toLocaleLowerCase(),category=$('article-category')!.value.toLocaleLowerCase(),group=$('article-group')!.value||'orphans';
+  if(summaryOnly){
+    $('article-rows')!.replaceChildren();
+    $('article-info')!.textContent=t('Grafici pronti per {n} voci. Carica l’elenco completo solo per cercare o ordinare le singole voci.',
+      {n:number(precomputed!.census_page_count)});
+    $('article-load')!.hidden=false;$('article-more')!.hidden=true;
+    return;
+  }
+  $('article-load')!.hidden=true;
+  const search=$('article-search')!.value.toLocaleLowerCase();
+  const category=($('article-classification')!.value==='macro'?$('article-macro')!.value:$('article-category')!.value).toLocaleLowerCase();
+  const group=$('article-group')!.value||'orphans';
   const pages=data.pages.filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
   sortArticles(pages,$('article-sort')!.value||'title-asc');
   const box=$('article-rows')!;box.replaceChildren();
@@ -781,16 +1062,19 @@ function articleList() {
 }
 function prepareCreators() {
   if(!creatorsAvailable()) {creatorRows=[];return;}
-  creatorRows=calculateReport<CreatorRow[]>('creators',data.pages.filter(page=>page.creator_key).map(page=>[
-    data.metadata.kind==='aggregate'?creatorKey(page):page.creator_key,
-    page.creator_account_type??null,page.creator_articles_created_total??null,page.orphan,page.creator_languages_created??[]
+  if(precomputedCreators){creatorRows=precomputedCreators;return;}
+  const historical=creatorMode()==='history';
+  creatorRows=calculateReport<CreatorRow[]>('creators',data.pages.filter(page=>attributedCreator(page)).map(page=>[
+    attributedCreatorKey(page),historical?null:page.creator_account_type??null,
+    historical?null:page.creator_articles_created_total??null,page.orphan,
+    historical?[pageLanguage(page)]:page.creator_languages_created??[]
   ]));
 }
 function creatorList() {
   if(!$('creator-rows')!)return;
   const search=$('creator-search')!.value.toLocaleLowerCase(),order=$('creator-sort')!.value||'orphans-desc';
   const rows=creatorRows.filter(row=>row.key.toLocaleLowerCase().includes(search));
-  const field=order.startsWith('articles')?'articles':'orphans';
+  const field=order.startsWith('articles')?(creatorMode()==='history'?'total':'articles'):'orphans';
   rows.sort((a,b)=>numericOrder(a[field],b[field],order.endsWith('asc')?1:-1)||a.key.localeCompare(b.key));
   const box=$('creator-rows')!;box.replaceChildren();
   const types: Record<string, string> = {registered:'Registrato',bot:'Bot',temporary:'Temporaneo'};
@@ -799,7 +1083,10 @@ function creatorList() {
     row.append(...[creator.key,t(types[creator.type ?? '']||'—'),number(creator.articles),number(creator.total),number(creator.orphans),number(creator.percent)+'%',[...creator.languages].sort().join(', ').toUpperCase()||'—'].map(value=>element('td',value)));
     box.append(row);
   }
-  $('creator-info')!.textContent=creatorsAvailable()?t('{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.',{n:number(rows.length),shown:number(Math.min(creatorLimit,rows.length))}):t('Dati sui creatori non disponibili per questa raccolta.');
+  $('creator-info')!.textContent=creatorsAvailable()?t(creatorMode()==='history'?
+    '{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo di account e totale delle creazioni non disponibili.':
+    '{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.',
+    {n:number(rows.length),shown:number(Math.min(creatorLimit,rows.length))}):t('Dati sui creatori non disponibili per questa raccolta.');
   $('creator-more')!.hidden=creatorLimit>=rows.length;
 }
 function candidateCards() {
@@ -809,7 +1096,14 @@ function candidateCards() {
   const orphans=data.pages.filter(p=>p.orphan);
   const sorted=orphans.filter(p=>p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category));
   const order=$('candidate-sort')!.value||'candidates-desc';
-  sortArticles(sorted,order);
+  if(order==='personalized'&&profileScores) {
+    const counts=(page: PageObservation)=>records[pageKey(page)]?.candidate_count??0;
+    sorted.sort((a,b)=>{
+      const left=profileScores!.get(pageKey(a)),right=profileScores!.get(pageKey(b));
+      return (right?.topic??0)-(left?.topic??0)||(right?.language??0)-(left?.language??0)||
+        counts(b)-counts(a)||a.title.localeCompare(b.title)||a.page_id-b.page_id;
+    });
+  } else sortArticles(sorted,order==='personalized'?'candidates-desc':order);
   $('candidate-info')!.textContent=t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
   const box=$('candidate-cards')!;box.replaceChildren();
   for(const page of sorted.slice(0,candidateLimit)) {
@@ -864,7 +1158,7 @@ function renderConnections() {
 }
 function validateDataset(next: Dataset) {
   if(!next?.metadata||!Array.isArray(next.pages)||!/^[a-z][a-z0-9-]{0,19}$/.test(next.metadata.language)||next.metadata.language==='all')throw new Error('Codice lingua non valido');
-  if(next.metadata.biographies || next.biographies || next.pages.some(p=>'gender_group' in p || 'biography' in p)) throw new Error('Dataset con arricchimento esterno: rigenera i risultati dalla raccolta originale della lingua su PAWS');
+  if(next.metadata.biographies || next.biographies || next.pages.some(p=>'gender_group' in p || 'biography' in p)) throw new Error('Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali');
 }
 function unpackObservations(next: CompactObservations): Dataset {
   if(!next||typeof next!=='object')throw new Error('Osservazioni compatte non valide');
@@ -915,10 +1209,40 @@ async function readDataset(entry: ManifestEntry): Promise<Dataset> {
   }
   return compact?unpackObservations(next):next;
 }
+async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> {
+  const filename=entry.summary_file;
+  if(!filename||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome riepilogo non valido');
+  const response=await fetch('data/'+filename,{cache:'no-store'});
+  if(!response.ok)throw new Error('Riepilogo non disponibile');
+  const summary=await response.json() as DashboardSummaryData;
+  if(summary?.format!=='dashboard_summary_v1'||summary.metadata?.language!==entry.language||
+    summary.metadata.finished_at!==entry.date||summary.metadata.complete!==true||
+    Boolean(summary.metadata.demo)!==Boolean(entry.demo)||
+    !Number.isSafeInteger(summary.census_page_count)||summary.census_page_count<0||
+    !summary.reports||!summary.reports.overview||!Array.isArray(summary.reports.categories)||
+    !summary.reports.profiles||!summary.reports.numeric||!summary.reports.origins||
+    !Array.isArray(summary.reports.creator_groups)||
+    summary.reports.overview.total!==summary.census_page_count)
+    throw new Error('Riepilogo non valido');
+  return summary;
+}
+async function readCreatorIndex(entry: ManifestEntry, summary: DashboardSummaryData): Promise<CreatorRow[]> {
+  const filename=entry.creator_index_file;
+  if(!filename||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome indice dei creatori non valido');
+  const response=await fetch('data/'+filename,{cache:'no-store'});
+  if(!response.ok)throw new Error('Indice dei creatori non disponibile');
+  const index=await response.json() as CreatorIndexData;
+  if(index?.format!=='creator_index_v1'||canonicalJSON(index.metadata)!==canonicalJSON(summary.metadata)||
+    index.census_page_count!==summary.census_page_count||!Array.isArray(index.creators)||
+    index.creators.some(row=>typeof row.key!=='string'||!Number.isSafeInteger(row.total)||
+      !Number.isSafeInteger(row.orphans)||row.orphans>row.total||!Array.isArray(row.languages)))
+    throw new Error('Indice dei creatori non valido');
+  return index.creators;
+}
 async function loadAggregate(index: Dataset,version: number): Promise<Dataset | null> {
   if(!Array.isArray(index.members)||!index.members.length||index.metadata.language!=='all'||index.metadata.complete!==true||!Array.isArray(index.metadata.languages))throw new Error('Indice aggregato non valido');
   const pooled: Dataset & {link_candidates: Record<string, CandidateRecord>} = {metadata:{...index.metadata},pages:[],link_candidates:{}};
-  const languages=new Set<string>(),creatorMetadata: CreatorMetadata[] = [];
+  const languages=new Set<string>(),creatorMetadata: CreatorMetadata[] = [],historyMetadata: HistoryMetadata[] = [];
   const targetLanguage=new URLSearchParams(window.location.search).get('language');
   if(connectionsPage&&!index.members.some(member=>member.language===targetLanguage))throw new Error('Pagina orfana non presente in questa raccolta');
   const focused=connectionsPage&&index.members.some(member=>member.language===targetLanguage&&datasetEntries.some(entry=>entry.file===member.file&&entry.connections_dir));
@@ -930,6 +1254,7 @@ async function loadAggregate(index: Dataset,version: number): Promise<Dataset | 
       !Number.isSafeInteger(member.page_count)||member.page_count<0||Boolean(member.metadata.demo)!==Boolean(index.metadata.demo))throw new Error('Indice aggregato non valido');
     languages.add(member.language);
     if(member.metadata.creators?.status==='collected')creatorMetadata.push(member.metadata.creators);
+    if(member.metadata.history?.status==='collected')historyMetadata.push(member.metadata.history);
     if(focused&&member.language!==targetLanguage)continue;
     if(version!==loadVersion)return null;
     $('status')!.textContent=t('Caricamento {language}: {current}/{total} lingue…',{language:member.language.toUpperCase(),current:position+1,total:index.members.length});
@@ -948,6 +1273,9 @@ async function loadAggregate(index: Dataset,version: number): Promise<Dataset | 
     pooled.metadata.creators!.started_at=creatorMetadata.map(m=>m.started_at).sort()[0];
     pooled.metadata.creators!.finished_at=creatorMetadata.map(m=>m.finished_at).sort().at(-1);
   }
+  const historyCount=historyMetadata.length;
+  pooled.metadata.history={status:historyCount===languages.size?'collected':historyCount?'partially_collected':'not_collected',
+    matched_pages:historyMetadata.reduce((total,item)=>total+(item.matched_pages??0),0)};
   return pooled;
 }
 function canonicalJSON(value: unknown): string {
@@ -956,10 +1284,24 @@ function canonicalJSON(value: unknown): string {
   return JSON.stringify(value);
 }
 let datasetEntries: ManifestEntry[] = [];
-function datasetLabel(entry: ManifestEntry) {return `${entry.kind==='aggregate'?t('Tutte le lingue'):entry.language.toUpperCase()} · ${entry.date.slice(0,10)}`;}
+function languageEntries(language: string): ManifestEntry[] {return datasetEntries.filter(entry=>entry.language===language);}
+function refreshDateChoices(preferred='latest') {
+  const dates=$('dataset-date');if(!dates)return;
+  const available=[...new Set(languageEntries($('dataset')!.value).map(entry=>entry.date.slice(0,10)))].sort().reverse();
+  dates.replaceChildren(new Option(t('Ultima disponibile'),'latest'),...available.map(date=>new Option(date,date)));
+  dates.value=available.includes(preferred)?preferred:'latest';
+}
+function selectedEntry(): ManifestEntry | undefined {
+  const choices=languageEntries($('dataset')!.value);
+  const date=$('dataset-date')!.value;
+  return date==='latest'?choices[0]:choices.find(entry=>entry.date.startsWith(date));
+}
 async function load(entry: ManifestEntry) {
   if($('llm-prompt')?.open)$('llm-prompt')!.close();
   const version=++loadVersion;
+  ++profileRequestVersion;profileScores=null;
+  if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
+  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
   connectionCopyRequest=null;
   if($('connection-copy-prompt')!)$('connection-copy-prompt')!.disabled=true;
   document.body.dataset.loading='true';
@@ -967,9 +1309,19 @@ async function load(entry: ManifestEntry) {
   $('status')!.textContent=t('Caricamento…');
   let next;
   try {
-    next=await readDataset(entry);
-    if(version!==loadVersion)return;
-    if(next.metadata?.kind==='aggregate')next=await loadAggregate(next,version);else validateDataset(next);
+    if(entry.summary_file&&!deorphanizePage&&!connectionsPage) {
+      const summary=await readSummary(entry);
+      if(version!==loadVersion)return;
+      precomputedCreators=creatorsPage?await readCreatorIndex(entry,summary):null;
+      if(version!==loadVersion)return;
+      next={metadata:summary.metadata,pages:[],link_candidates:{}};
+      precomputed=summary;summaryOnly=true;
+    } else {
+      precomputed=null;precomputedCreators=null;summaryOnly=false;
+      next=await readDataset(entry);
+      if(version!==loadVersion)return;
+      if(next.metadata?.kind==='aggregate')next=await loadAggregate(next,version);else validateDataset(next);
+    }
     if(version!==loadVersion)return;
   } catch(error) {
     if(version===loadVersion)throw error;
@@ -977,8 +1329,8 @@ async function load(entry: ManifestEntry) {
   }
   if(!next)return;
   data=next; datasetFile=entry.file; candidateLimit=25; connectionLimit=50; articleLimit=25; creatorLimit=25;
-  for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category'] as const)if($(id)!)$(id)!.value='';
-  $('download')!.href='data/'+(entry.kind==='aggregate'?entry.file:entry.file.replace(/\.json$/,'.csv'));
+  for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
+  if($('download'))$('download')!.href='data/'+(entry.kind==='aggregate'?entry.file:entry.file.replace(/\.json$/,'.csv'));
   $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
   $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
   $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
@@ -987,40 +1339,76 @@ async function load(entry: ManifestEntry) {
   lastError=null;
   document.body.dataset.loading='false';
   renderDataset();
+  if(deorphanizePage&&profileContributions){const profileVersion=++profileRequestVersion;void scoreProfile(profileContributions,profileVersion).catch(error=>{
+    if(profileVersion===profileRequestVersion)$('profile-status')!.textContent=t('Personalizzazione non disponibile: {error}',{error:String(error)});
+  });}
+}
+async function loadFullArticles() {
+  if(!summaryOnly||articleListLoading)return;
+  const version=loadVersion,entry=datasetEntries.find(item=>item.file===datasetFile);
+  if(!entry)return;
+  articleListLoading=true;$('article-load')!.disabled=true;
+  $('article-info')!.textContent=t('Caricamento dell’elenco completo delle voci…');
+  try {
+    let full=await readDataset(entry);
+    if(version!==loadVersion)return;
+    if(full.metadata.kind==='aggregate')full=await loadAggregate(full,version) as Dataset;
+    else validateDataset(full);
+    if(version!==loadVersion||!full)return;
+    data=full;summaryOnly=false;
+    refreshCategoryChoices();articleList();
+  } catch(error) {
+    if(version===loadVersion)$('article-info')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',
+      {error:t(error instanceof Error?error.message:String(error))});
+  } finally {if(version===loadVersion){articleListLoading=false;$('article-load')!.disabled=false;}}
 }
 function refreshCategoryChoices() {
   for(const prefix of ['candidate','article'])if($(prefix+'-categories')!) {
     $(prefix+'-categories')!.replaceChildren();
     const mode=prefix==='article'?$('article-classification')?.value||'categories':'categories';
-    const names=mode==='macro'?Object.keys(topicTaxonomy):mode==='topics'?[...topicDisplayNames.values()]:[...new Set(data.pages.filter(p=>prefix==='article'||p.orphan).map(label))].sort();
+    const names=mode==='macro'?Object.keys(topicTaxonomy):mode==='topics'?[...topicDisplayNames.values()]:
+      summaryOnly&&prefix==='article'?[...new Set(precomputed?.reports.categories.map(row=>row.label)??[])].sort():
+      [...new Set(data.pages.filter(p=>prefix==='article'||p.orphan).map(label))].sort();
     for(const name of names)$(prefix+'-categories')!.append(new Option(name,name));
     if(prefix==='article')for(const id of ['article-category-label','article-category-heading'])if($(id)!)$(id)!.textContent=t(mode==='macro'?'Macrotema':mode==='topics'?'Tema':'Categoria');
-    if(prefix==='article')$('article-category')!.placeholder=t(mode==='macro'?'Macrotema':mode==='topics'?'Tema':'Categoria');
+    if(prefix==='article') {
+      $('article-category-control')!.hidden=mode==='macro';
+      $('article-macro-control')!.hidden=mode!=='macro';
+      const selected=$('article-macro')!.value;
+      $('article-macro')!.replaceChildren(new Option(t('Tutti i macrotemi'),''),...Object.keys(topicTaxonomy).map(name=>new Option(name,name)));
+      $('article-macro')!.value=Object.hasOwn(topicTaxonomy,selected)?selected:'';
+      $('article-category')!.placeholder=t(mode==='topics'?'Tema':'Categoria');
+    }
   }
 }
 function renderDataset() {
   if(document.body.dataset.loading==='true')return;
   const creationEvents=data.metadata.age_rule==='page_creation_event';
-  if($('age-note')!) $('age-note')!.textContent=data.metadata.age_rule==='mixed_per_language'?t('Date con criteri diversi tra lingue: creazione osservata oppure prima revisione pubblica.'):creationEvents?t('Anni dalla creazione della pagina; date non determinabili escluse.'):t('Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.');
-  $('download')!.textContent=t(data.metadata.kind==='aggregate'?'Scarica l’indice delle raccolte JSON':'Scarica tutti i dati CSV');
-  if($('dataset')!) for(const [i,entry] of datasetEntries.entries())$('dataset')!.children[i].textContent=datasetLabel(entry);
+  if($('age-note')!) $('age-note')!.textContent=data.metadata.age_rule==='mixed_per_language'?t('Date con criteri diversi tra lingue: creazione osservata, prima revisione pubblica o dato non disponibile.'):
+    data.metadata.age_rule==='unavailable_no_approved_creation_event'?t('Data di creazione non disponibile nei dump SQL; la cronologia storica non prova automaticamente la creazione della pagina.'):
+    creationEvents?t('Anni dalla creazione della pagina; date non determinabili escluse.'):t('Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.');
+  if($('download'))$('download')!.textContent=t(data.metadata.kind==='aggregate'?'Scarica l’indice delle raccolte JSON':'Scarica tutti i dati CSV');
+  if($('dataset')) for(const option of $('dataset')!.children)if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
+  if($('dataset-date'))$('dataset-date')!.children[0].textContent=t('Ultima disponibile');
+  if($('creator-sort'))for(const child of $('creator-sort')!.children) {
+    const option=child as HTMLOptionElement;
+    if(option.value==='articles-desc')option.textContent=t(creatorMode()==='history'?'Più voci attribuite':'Più voci create');
+    if(option.value==='articles-asc')option.textContent=t(creatorMode()==='history'?'Meno voci attribuite':'Meno voci create');
+  }
   $('status')!.className=data.metadata.demo?'demo':'';
   $('status')!.textContent=data.metadata.demo?t('DEMO · Dati sintetici per verificare il sistema. Questi non sono risultati di Wikipedia.'):'';
   $('status')!.hidden=!data.metadata.demo;
-  $('source')!.textContent=t('Periodo di raccolta: {start} — {end}',{start:data.metadata.started_at.slice(0,10),end:data.metadata.finished_at.slice(0,10)});
-  if(creatorsAvailable()) $('source')!.textContent+=t(' · Dati dei creatori: {start} — {end}',{start:data.metadata.creators!.started_at!.slice(0,10),end:data.metadata.creators!.finished_at!.slice(0,10)});
-  if(data.metadata.kind==='aggregate') $('source')!.textContent+=' · '+t('Lingue aggregate: {languages}.',{languages:data.metadata.languages!.join(', ').toUpperCase()});
   if(connectionsPage) {renderConnections();return;}
   if(deorphanizePage) {candidateCards();return;}
-  const report=calculateReport<OverviewReport>('overview',data.pages.map(page=>[
-    page.orphan,page.out_degree??null,page.creator_key?creatorKey(page):null
+  const report=precomputed?.reports.overview??calculateReport<OverviewReport>('overview',data.pages.map(page=>[
+    page.orphan,page.out_degree??null,attributedCreatorKey(page)
   ]));
   $('metrics')!.replaceChildren();
   const creatorAvailable=creatorsAvailable();
   const metrics=creatorsPage ? [
     ['Pagine orfane',number(report.orphans)],
-    ['Orfane con creatore attribuito',creatorAvailable?`${number(report.attributed_orphans)} / ${number(report.orphans)}`:'—'],
-    ['Creatori distinti delle orfane attribuite',creatorAvailable?number(report.distinct_creators):'—'],
+    [creatorMode()==='history'?'Orfane con creatore storico ricostruito':'Orfane con creatore attribuito',creatorAvailable?`${number(report.attributed_orphans)} / ${number(report.orphans)}`:'—'],
+    [creatorMode()==='history'?'Creatori storici distinti delle orfane':'Creatori distinti delle orfane attribuite',creatorAvailable?number(report.distinct_creators):'—'],
     ['Orfane senza creatore attribuito',number(report.missing_creators)],
   ] : [['Voci analizzate',number(report.total)],['Pagine orfane',number(report.orphans)],['Percentuale orfane',report.percent===null?'—':number(report.percent)+'%'],['Senza link uscenti',number(report.dead_ends)]];
   for(const [name,value] of metrics) {
@@ -1029,16 +1417,21 @@ function renderDataset() {
   renderCharts();articleList();creatorList();
 }
 function renderCharts() {
-  if(creatorsPage) creatorCharts();
+  if(creatorsPage) {creatorCharts();historyCharts();}
   else {
     categories();
     paperProfiles();
-    distribution('age','age_days','anni');
+    const historyAge=data.metadata.historical_age_rule==='mediawiki_history_first_observed_revision_v1'&&
+      data.metadata.age_rule!=='page_creation_event';
+    $('age-heading')!.textContent=t(historyAge?'Età dalla prima revisione osservata':'Età delle voci');
+    if(historyAge)$('age-note')!.textContent=t(
+      'Anni dalla prima revisione registrata in MediaWiki History alla raccolta del grafo; non è una data di creazione verificata.');
+    distribution('age',historyAge?'history_first_revision_age_days':'age_days','anni');
     distribution('length','length_bytes','byte');
   }
 }
 let lastError: Error | null = null;
-function fail(cause: unknown) {const error=cause instanceof Error?cause:new Error(String(cause));lastError=error;$('status')!.hidden=false;$('status')!.textContent=t('Impossibile caricare: {error}. Esporta i dati PAWS con analyze o compare e servi la cartella web tramite HTTP.',{error:t(error.message)});}
+function fail(cause: unknown) {const error=cause instanceof Error?cause:new Error(String(cause));lastError=error;$('status')!.hidden=false;$('status')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',{error:t(error.message)});}
 applyTheme();applyTranslations();
 $('ui-language-toggle')!.addEventListener('click',()=>{
   if($('llm-prompt')?.open)$('llm-prompt')!.close();
@@ -1067,10 +1460,13 @@ $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.l
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
+$('profile-apply')?.addEventListener('click',()=>{if(data)void applyProfile();});
 for(const id of ['article-search','article-category','article-group','article-sort']) $(id)?.addEventListener('input',()=>{articleLimit=25;if(data)articleList();});
+$('article-macro')?.addEventListener('change',()=>{articleLimit=25;if(data)articleList();});
 for(const id of ['creator-search','creator-sort']) $(id)?.addEventListener('input',()=>{creatorLimit=25;if(data)creatorList();});
-$('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';articleLimit=25;refreshCategoryChoices();articleList();}});
+$('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';$('article-macro')!.value='';articleLimit=25;refreshCategoryChoices();articleList();}});
 $('article-more')?.addEventListener('click',()=>{articleLimit+=25;articleList();});
+$('article-load')?.addEventListener('click',()=>{void loadFullArticles();});
 $('creator-more')?.addEventListener('click',()=>{creatorLimit+=25;creatorList();});
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>{candidateLimit+=25;candidateCards();});
@@ -1082,11 +1478,11 @@ const dashboardReady=(async()=>{
     (topicTaxonomy[parent]??=[]).push(child);topicDisplayNames.set(label,parent+' · '+child);
   }
   const response=await fetch('data/manifest.json',{cache:'no-store'});if(!response.ok)throw new Error('Nessuna raccolta presente');
-  const entries=(await response.json() as ManifestEntry[]).filter(entry=>!entry.demo).sort((a,b)=>b.date.localeCompare(a.date));if(!entries.length)throw new Error('Nessuna raccolta reale presente');
+  const entries=(await response.json() as ManifestEntry[]).filter(entry=>!entry.demo).sort((a,b)=>b.date.localeCompare(a.date)||
+    (b.published_at??'').localeCompare(a.published_at??'')||b.file.localeCompare(a.file));if(!entries.length)throw new Error('Nessuna raccolta reale presente');
   datasetEntries=entries;
-  for(const [i,entry] of entries.entries()) {
+  for(const entry of entries) {
     if(!/^[a-zA-Z0-9_.-]+\.json$/.test(entry.file))throw new Error('Nome dataset non valido');
-    $('dataset')?.append(new Option(datasetLabel(entry),String(i)));
   }
   const requested=new URLSearchParams(window.location.search).get('dataset');
   if(connectionsPage) {
@@ -1094,10 +1490,23 @@ const dashboardReady=(async()=>{
     if(!entry)throw new Error('Raccolta richiesta non disponibile');
     await load(entry);return;
   }
-  $('dataset')!.addEventListener('change',()=>load(entries[Number($('dataset')!.value)]).catch(fail));
-  const index=Math.max(0,entries.findIndex(entry=>entry.file===requested));
-  $('dataset')!.value=String(index);
-  await load(entries[index]);
+  const languages=[...new Set(entries.map(entry=>entry.language))].sort();
+  if(languages.includes('all'))$('dataset')!.append(new Option(t('Tutte le lingue'),'all'));
+  for(const language of languages)if(language!=='all')$('dataset')!.append(new Option(language.toUpperCase(),language));
+  const matching=entries.find(entry=>entry.file===requested);
+  $('dataset')!.value=matching?.language??(languages.includes('all')?'all':languages[0]);
+  refreshDateChoices(matching?.date.slice(0,10));
+  $('dataset')!.addEventListener('change',()=>{
+    const previous=$('dataset-date')!.value;
+    refreshDateChoices(previous);
+    const entry=selectedEntry();if(entry)void load(entry).catch(fail);
+  });
+  $('dataset-date')!.addEventListener('change',()=>{
+    const entry=selectedEntry();if(entry)void load(entry).catch(fail);
+  });
+  const initial=matching??selectedEntry();
+  if(!initial)throw new Error('Nessuna raccolta reale presente');
+  await load(initial);
 })().catch(fail);
 
 let chartResizeTimer: ReturnType<typeof setTimeout> | undefined;

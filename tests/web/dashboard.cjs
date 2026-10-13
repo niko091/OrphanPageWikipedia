@@ -53,7 +53,7 @@ async function harness(page,raw,search='?dataset=fixture.json',entries=null,pref
   const copied=[];
   const navigator=preferences.clipboardUnavailable?{}:{clipboard:{writeText:async text=>{if(preferences.clipboardFailure)throw new Error('clipboard denied');copied.push(text);}}};
   let fetchCount=0;const requests=[];
-  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URLSearchParams,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,cache:options?.cache});fetchCount++;return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
+  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,cache:options?.cache});fetchCount++;return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?preferences.apiResponse?.(new URL(url)):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
   await nativeReady;
   vm.runInContext(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
   await vm.runInContext('dashboardReady',context);
@@ -75,6 +75,16 @@ async function checkFreshResources() {
       assert(fs.readFileSync('web/'+file,'utf8').includes(`assets/${asset}?v=${version}`),`${file}: stale ${asset} version`);
     }
   }
+  for(const file of pages) {
+    const html=fs.readFileSync('web/'+file,'utf8');
+    assert(!html.includes('id="source"'));
+    assert(!html.includes('OrphanWiki ·'));
+  }
+  const articlesHtml=fs.readFileSync('web/index.html','utf8');
+  assert(!articlesHtml.includes('id="download"'));
+  assert.match(articlesHtml,/Tassonomia completa: 64 temi[\s\S]*?https:\/\/ojs\.aaai\.org\/index\.php\/ICWSM\/article\/view\/31300/);
+  const deorphanizeHtml=fs.readFileSync('web/deorphanize.html','utf8');
+  assert.match(deorphanizeHtml,/<div class="toolbar">[\s\S]*?id="llm-provider"[\s\S]*?id="profile-username"[\s\S]*?<\/div>/);
   const raw=fixture();
   for(const page of raw.pages) {
     page.topic_status='predicted';page.topic_labels=['Culture.Media.Music'];
@@ -100,8 +110,10 @@ async function checkPage(creatorsPage) {
   assert.match(html, /<div class="toolbar">[\s\S]*?id="dataset"[\s\S]*?id="chart-type"[\s\S]*?<\/div>/);
   assert.match(nodes.status.textContent,/DEMO/);
   assert.equal(nodes.metrics.children.length,4);
-  assert.equal(nodes.dataset.value,'0');
-  assert.equal(nodes.dataset.children.length,2);
+  assert.equal(nodes.dataset.value,'vec');
+  assert.equal(nodes.dataset.children.length,1);
+  assert.equal(nodes['dataset-date'].value,'2026-09-29');
+  assert.equal(nodes['dataset-date'].children.length,3);
   assert(nodes.dataset.children.every(option=>!option.textContent.includes('DEMO')));
   assert.equal(nodes['articles-link'].href,'index.html?dataset=fixture.json');
   assert.equal(nodes['deorphanize-link'].href,'deorphanize.html?dataset=fixture.json');
@@ -161,42 +173,49 @@ async function checkPage(creatorsPage) {
   draw();
   let bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
   assert.equal(bars.length,40);
-  assert.deepEqual(bars.map((bar,i)=>Number(bar.height)>0?i:null).filter(i=>i!==null),[0,1,21,39]);
-  assert(bars.filter(bar=>Number(bar.height)>0).every(bar=>Number(bar.height)===103));
-  assert.match(bars[0]['aria-label'],/\[0, 1\)/);
-  assert.match(bars[39]['aria-label'],/\[19, 20\]/);
+  assert.deepEqual(bars.map((bar,i)=>Number(bar.height)>0?i:null).filter(i=>i!==null),[1,21,38]);
+  assert.equal(Number(bars[1].height),206);
+  assert.equal(Number(bars[21].height),103);
+  assert.match(bars[0]['aria-label'],/<0 unità/);
+  assert.match(bars[39]['aria-label'],/>20 unità/);
   assert.match(nodes[chart].children[3].textContent,/1 orfane, 0 non orfane/);
   nodes['chart-type'].value='percent';draw();
   bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
-  // One orphan per bin / THREE total orphans, including the missing value.
-  assert(Math.abs(Number(bars[0].height)-412/3)<1e-9);
+  // Two orphans share the first central bin; the missing value stays in the denominator.
+  assert(Math.abs(Number(bars[1].height)-824/3)<1e-9);
   assert.equal(Number(bars[21].height),206); // one / two non-orphans
-  assert.match(bars[0]['aria-label'],/33,3% \(1\/3 pagine del gruppo\)/);
-  assert.match(nodes[chart].children[4].textContent,/tutte le 3 orfane e tutte le 2 non orfane/);
+  assert.match(bars[1]['aria-label'],/66,7% \(2\/3 pagine del gruppo\)/);
+  assert(!descendants(nodes[chart]).some(node=>/Denominatori|20 intervalli/.test(node.textContent)));
   const orphanHeight=bars.slice(0,20).reduce((sum,bar)=>sum+Number(bar.height),0);
   assert(Math.abs(orphanHeight/412-2/3)<1e-9); // missing coverage is not redistributed
   raw.pages=[{orphan:true,fixture:0},{orphan:true,fixture:20},
     ...Array.from({length:20},(_,i)=>({orphan:false,fixture:i<10?0:20}))];
   draw();
   bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
-  assert.equal(Number(bars[0].height),206);
-  assert.equal(Number(bars[20].height),206); // 1/2 and 10/20 must be equally tall
-  assert.match(bars[20]['aria-label'],/50% \(10\/20 pagine del gruppo\)/);
+  assert.equal(Number(bars[1].height),206);
+  assert.equal(Number(bars[21].height),206); // 1/2 and 10/20 must be equally tall
+  assert.match(bars[21]['aria-label'],/50% \(10\/20 pagine del gruppo\)/);
   raw.pages=[{orphan:false,fixture:0},{orphan:false,fixture:20}];draw();
   bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
   assert.equal(bars.length,20); // no invented percentages for an empty group
   assert(bars.every(bar=>Number.isFinite(Number(bar.height))));
-  assert.match(nodes[chart].children[4].textContent,/tutte le 0 orfane/);
+  assert.equal(nodes[chart].children.length,4);
   nodes['chart-type'].value='count';
   raw.pages=[{orphan:true,fixture:0},{orphan:true,fixture:0},{orphan:false,fixture:0}];
   draw();
   bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
-  assert.equal(Number(bars[0].height),206);
-  assert.equal(Number(bars[20].height),103);
+  assert.equal(Number(bars[10].height),206);
+  assert.equal(Number(bars[30].height),103);
   nodes['chart-type'].value='cumulative';draw();
   const paths=nodes[chart].children[0].children.filter(n=>n.tag==='path');
   assert.equal(paths.length,2);
   assert(paths.every(path=>path.d.endsWith('V32'))); // original normalization: both reach 100%
+  nodes['chart-type'].value='count';
+  raw.pages=Array.from({length:101},(_,i)=>({orphan:i%2===0,fixture:i}));draw();
+  bars=nodes[chart].children[0].children.filter(n=>n.tag==='rect');
+  assert.match(bars[0]['aria-label'],/<2 unità: 1 pagine/);
+  assert.match(bars[39]['aria-label'],/>98 unità: 1 pagine/);
+  assert.equal(bars.reduce((sum,bar)=>sum+Number(bar['aria-label'].match(/: (\d+) pagine/)[1]),0),101);
   raw.pages=[];draw();
   assert.equal(nodes[chart].children[0].textContent,'Dati non disponibili.');
   raw.metadata.age_rule='first_public_revision';
@@ -246,8 +265,8 @@ async function checkPaperProfiles() {
   assert.match(row('features-paper','Voci nuove (< mediana)').title,/copertura 6\/7/);
   assert.equal(value(row('features-paper','Qualità alta (Johnson 2021)')),'— (0/0)');
   assert(!row('features-paper','Biografie di donne'));
-  assert.match(nodes['features-thresholds'].textContent,/VEC: mediana età 2 giorni/);
-  assert.match(nodes['features-thresholds'].textContent,/EN: mediana età 200 giorni/);
+  assert(!html.includes('id="features-thresholds"'));
+  assert(!descendants(nodes['features-paper']).some(node=>/mediana età/.test(node.textContent)));
   assert.equal(JSON.stringify(raw),before);
   raw.pages[0].topic_status='predicted';raw.pages[0].topic_labels=['Culture.Media.Music','Culture.Media.Films','Culture.Biography.Women','STEM.Physics'];
   raw.pages[1].topic_status='predicted';raw.pages[1].topic_labels=[];
@@ -271,7 +290,7 @@ async function checkPaperProfiles() {
   nodes['ui-language-toggle'].listeners.click();
   assert.deepEqual(bars(),values);
   assert.match(row('features-paper','New articles (< median)').title,/coverage 6\/7/);
-  assert.match(nodes['features-thresholds'].textContent,/median age 200 days/);
+  assert(!descendants(nodes['features-paper']).some(node=>/median age/.test(node.textContent)));
   nodes['theme-toggle'].listeners.click();
   assert.deepEqual(bars(),values);
   nodes['chart-type'].value='count';nodes['chart-type'].listeners.change();
@@ -323,7 +342,8 @@ async function checkDatasetSelection() {
     {language:'vec',file:'older.json',date:'2026-10-01',demo:false},
     {language:'vec',file:'latest.json',date:'2026-10-02',demo:false}
   ]);
-  assert.equal(result.nodes.dataset.children.length,2);
+  assert.equal(result.nodes.dataset.children.length,1);
+  assert.equal(result.nodes['dataset-date'].children.length,3);
   assert.equal(result.nodes['articles-link'].href,'index.html?dataset=latest.json');
   assert.equal(result.nodes.status.hidden,true);
   result=await harness('articles',raw,'?dataset=demo.json',[{language:'vec',file:'demo.json',date:'2026-10-03',demo:true}]);
@@ -714,7 +734,7 @@ async function checkLlmSelection() {
     const before=copied.length;
     nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
     assert.equal(nodes['candidate-cards'].children.length,30);assert.equal(nodes['candidate-search'].value,'Target');
-    assert.equal(nodes.dataset.value,'0');assert.equal(storage.get('orphanwiki-llm'),provider);
+    assert.equal(nodes.dataset.value,'vec');assert.equal(storage.get('orphanwiki-llm'),provider);
     assert.equal(copied.length,before); // no clipboard or external request on selection/rendering
     const fix=findClass(nodes['candidate-cards'].children[0],'fix-link');
     const actual=new URL(fix.href),expected=new URL(url);
@@ -785,7 +805,7 @@ async function checkPreferences() {
     assert.match(nodes['theme-toggle']['aria-label'],/Dark mode: switch to light mode/);
     assert.equal(nodes['articles-link'].textContent,'Article analysis');
     assert.equal(nodes['deorphanize-link'].textContent,'De-orphan articles');
-    assert.match(nodes.source.textContent,/Collection period:/);
+    assert(!nodes.source);
     for(const node of staticNodes) {
       if(node.dataset.i18n && !['status','connection-title','age-note'].some(id=>nodes[id]===node)) {
         const key=JSON.stringify(node.dataset.i18n);
@@ -800,7 +820,7 @@ async function checkPreferences() {
       const chart=nodes.age.children[0],heights=chart.children.filter(node=>node.tag==='rect').map(node=>node.height);
       assert.equal(chart.children[0].textContent,'% of articles in group');
       assert.equal(chart.children[0].fill,'var(--text)');
-      assert.match(nodes.age.children[4].textContent,/Denominators: all/);
+      assert(!descendants(nodes.age).some(node=>/Denominators: all/.test(node.textContent)));
       assert.equal(vm.runInContext('number(1234.5)',context),'1,234.5');
       nodes['article-group'].value='all';nodes['article-group'].listeners.input();
       nodes['article-more'].listeners.click();
@@ -885,18 +905,19 @@ async function checkAggregation() {
     assert(!nodes.status.textContent.includes('Impossibile caricare'),nodes.status.textContent);
     assert.equal(result.requests.length,4);
     assert(result.requests.every(request=>request.cache==='no-store'));
-    assert(!nodes.source.textContent.includes('Ogni versione linguistica'));
+    assert(!nodes.source);
     assert.equal(vm.runInContext('data.metadata.creators.collected_languages',context),2);
     assert.equal(vm.runInContext('data.pages.length',context),4);
     assert.equal(vm.runInContext('data.pages.filter(p=>p.orphan).length',context),3);
-    assert.equal(vm.runInContext('new Set(data.pages.map(creatorKey)).size',context),2);
+    assert.equal(vm.runInContext('new Set(data.pages.map(attributedCreatorKey)).size',context),2);
     assert.equal(vm.runInContext("label(data.pages[0])",context),'VEC · Shared category');
     if(page==='articles') {
       assert.match(nodes['age-note'].textContent,/criteri diversi/);
       assert.equal(nodes['article-rows'].children.length,3);
       assert.match(nodes['article-rows'].children[0].children[0].children[0].href,/vec\.wikipedia/);
-      assert.equal(nodes.download.href,'data/all.json');
-      assert.equal(nodes.dataset.children[0].textContent,'Tutte le lingue · 2026-09-29');
+      assert(!nodes.download);
+      assert.equal(nodes.dataset.children[0].textContent,'Tutte le lingue');
+      assert.equal(nodes['dataset-date'].value,'2026-09-29');
     }
     if(page==='creators') {
       assert.equal(nodes['creator-rows'].children.length,2);
@@ -918,8 +939,8 @@ async function checkAggregation() {
       assert(prompt.includes('https://vec.wikipedia.org/wiki/'));assert(!prompt.includes('https://all.wikipedia.org'));
     }
     nodes['ui-language-toggle'].listeners.click();
-    if(nodes.dataset)assert.equal(nodes.dataset.children[0].textContent,'All languages · 2026-09-29');
-    assert(!nodes.source.textContent.includes('Creators collected'));
+    if(nodes.dataset)assert.equal(nodes.dataset.children[0].textContent,'All languages');
+    assert(!nodes.source);
   }
   let result=await harness('connections',index,'?dataset=all.json&page=1',entries,{},files);
   assert.match(result.nodes.status.textContent,/Pagina orfana non presente/);
@@ -957,7 +978,7 @@ async function checkCompactTransport() {
     assert(!result.nodes.status.textContent.includes('Impossibile'),result.nodes.status.textContent);
     assert.deepEqual(result.requests.map(r=>r.url),['data/manifest.json','data/all.json','data/vec-observations.json','data/lmo-observations.json']);
     assert.equal(vm.runInContext('data.pages.length',result.context),8);
-    assert.match(result.nodes.source.textContent,/Lingue aggregate: VEC, LMO/);
+    assert(!result.nodes.source);
     const full=await harness(page,index,'?dataset=all.json',entries.map(({observations_file,...entry})=>entry),{},files);
     for(const id of page==='articles'?['topics-full','topics-paper','features-paper','categories']:['origins','creator-bots']) {
       const values=nodes=>nodes[id].children.filter(node=>node.className==='bar-row').map(node=>[node.children[0].textContent,node.children[1].children[0].style.width,node.children[2].textContent]);
@@ -991,11 +1012,21 @@ async function checkTopicExplorer() {
   assert.equal(nodes['article-rows'].children.length,25);
   assert.equal(nodes['article-categories'].children.length,4);
   assert.equal(nodes['article-category-label'].textContent,'Macrotema');
-  nodes['article-category'].value='STEM';nodes['article-category'].listeners.input();
+  assert.equal(nodes['article-category-control'].hidden,true);
+  assert.equal(nodes['article-macro-control'].hidden,false);
+  assert.deepEqual(nodes['article-macro'].children.map(option=>option.value),['','Culture','Geography','History and Society','STEM']);
+  nodes['article-macro'].value='STEM';nodes['article-macro'].listeners.change();
   assert.equal(nodes['article-rows'].children.length,16);
   assert(nodes['article-rows'].children.every(row=>row.children[1].textContent==='STEM'));
+  nodes['ui-language-toggle'].listeners.click();
+  assert.equal(nodes['article-macro'].value,'STEM');
+  assert.equal(nodes['article-macro'].children[0].textContent,'All broad topics');
+  assert.equal(nodes['article-rows'].children.length,16);
+  nodes['ui-language-toggle'].listeners.click();
   nodes['article-classification'].value='topics';nodes['article-classification'].listeners.change();
   assert.equal(nodes['article-category'].value,'');
+  assert.equal(nodes['article-category-control'].hidden,false);
+  assert.equal(nodes['article-macro-control'].hidden,true);
   assert.equal(nodes['article-categories'].children.length,64);
   assert.equal(nodes['article-category-heading'].textContent,'Tema');
   nodes['article-category'].value='Media.Music';nodes['article-category'].listeners.input();
@@ -1131,6 +1162,131 @@ async function checkConnectionCopy() {
   await disabled.nodes['connection-copy-prompt'].listeners.click();assert.equal(disabled.copied.length,0);
   console.log('Connection copy: explicit click only, five priority candidates, unchanged single-card scope, direct clipboard, manual fallback and disabled empty state passed.');
 }
+async function checkPersonalization() {
+  const raw=fixture();raw.metadata.demo=false;
+  raw.metadata.topics={status:'predicted'};
+  const target=raw.pages.find(page=>page.orphan);
+  for(const page of raw.pages){page.topic_status='predicted';page.topic_labels=page.page_id===target.page_id?['Culture.Media.Music']:[];}
+  const entries=[{language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,observations_file:'fixture-observations.json'}];
+  const files={'fixture.json':raw,'fixture-observations.json':{
+    format:'observations_v1',metadata:raw.metadata,columns:['page_id','topic_labels','topic_status'],
+    rows:[[target.page_id,['Culture.Media.Music'],'predicted']]}};
+  const apiResponse=url=>{
+    if(url.hostname==='meta.wikimedia.org')return {query:{globaluserinfo:{id:1,name:'Editor',merged:[
+      {wiki:'vecwiki',url:'https://vec.wikipedia.org',id:11,editcount:1},
+      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1}]}}};
+    if(url.hostname==='vec.wikipedia.org')return {query:{usercontribs:[{userid:11,pageid:target.page_id,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}};
+    if(url.hostname==='en.wikipedia.org')return {query:{usercontribs:[{userid:22,pageid:999,ns:0,timestamp:'2026-09-30T00:00:00Z'}]}};
+    throw new Error('Unapproved API');
+  };
+  const result=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiResponse},files);
+  assert.equal(result.requests.filter(request=>request.url.startsWith('https://')).length,0);
+  result.nodes['profile-username'].value='Editor';
+  result.nodes['profile-apply'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(result.nodes['candidate-sort'].value,'personalized');
+  assert.equal(result.nodes['profile-sort-option'].disabled,false);
+  assert.equal(titleLink(result.nodes['candidate-cards'].children[0]).textContent,target.title);
+  assert.match(result.nodes['profile-status'].textContent,/2 modifiche.*1/);
+  const api=result.requests.filter(request=>request.url.startsWith('https://')).map(request=>new URL(request.url));
+  assert.equal(api.length,3);
+  assert(api.every(url=>url.searchParams.get('origin')==='*'&&['globaluserinfo','usercontribs'].includes(url.searchParams.get('meta')||url.searchParams.get('list'))));
+  assert(api.filter(url=>url.searchParams.get('list')==='usercontribs').every(url=>url.searchParams.get('uclimit')==='100'&&url.searchParams.has('ucuserids')));
+  const uncovered=await harness('deorphanize',raw,'?dataset=fixture.json',entries.map(({observations_file,...entry})=>entry),{apiResponse},{'fixture.json':raw});
+  uncovered.nodes['profile-username'].value='Editor';uncovered.nodes['profile-apply'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(uncovered.nodes['profile-sort-option'].disabled,true);
+  assert.match(uncovered.nodes['profile-status'].textContent,/Nessun tema osservabile/);
+  const outside=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiResponse:url=>{
+    if(url.hostname==='meta.wikimedia.org')return {query:{globaluserinfo:{id:1,name:'Editor',merged:[
+      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1}]}}};
+    return {query:{usercontribs:[{userid:22,pageid:999,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}};
+  }},files);
+  outside.nodes['profile-username'].value='Editor';outside.nodes['profile-apply'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  assert.match(outside.nodes['profile-status'].textContent,/Nessuna delle ultime 100 modifiche/);
+  const missing=JSON.parse(JSON.stringify(raw));delete missing.metadata.topics;
+  const noModel=await harness('deorphanize',missing,'?dataset=fixture.json',entries,{apiResponse},
+    {'fixture.json':missing,'fixture-observations.json':files['fixture-observations.json']});
+  noModel.nodes['profile-username'].value='Editor';noModel.nodes['profile-apply'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  assert.match(noModel.nodes['profile-status'].textContent,/non contengono ancora le predizioni/);
+  assert.equal(noModel.requests.filter(request=>request.url.endsWith('-observations.json')).length,0);
+  console.log('Personalization: explicit identity lookup, two Wikipedia contribution reads, local topic coverage and topic-first ranking passed.');
+}
+async function checkCreatorHistory() {
+  const raw=fixture();
+  raw.metadata.history={status:'collected',matched_pages:raw.pages.length};
+  raw.pages.forEach((page,index)=>{
+    page.creator_continuity_months_before_creation=index%4;
+    page.creator_groups_at_creation_history=index%3===0?['sysop','rollbacker']:['editor'];
+  });
+  const {nodes}=await harness('creators',raw);
+  assert.equal(nodes['history-section'].hidden,false);
+  assert(nodes['creator_continuity_months_before_creation-chart'].children[0].children.some(node=>node.tag==='rect'));
+  assert(nodes['creator-groups'].children.some(node=>node.className==='bar-row'));
+  assert.match(nodes['creator-groups-note'].textContent,/prima revisione/);
+  console.log('Historical creators: prior continuity and multilabel groups are rendered separately from current bot status.');
+}
+async function checkPreparedSummaries() {
+  const raw=fixture(),summary=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-summary.json')));
+  const creatorIndex=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-creators.json')));
+  raw.metadata.demo=false;summary.metadata.demo=false;creatorIndex.metadata.demo=false;
+  const entry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,
+    summary_file:'fixture-summary.json',creator_index_file:'fixture-creators.json'};
+  assert.equal(summary.census_page_count,raw.pages.length);
+  assert.equal(summary.reports.overview.orphans,raw.pages.filter(page=>page.orphan).length);
+  const files={'fixture-summary.json':summary,'fixture-creators.json':creatorIndex,'fixture.json':raw};
+  const articles=await harness('articles',raw,'?dataset=fixture.json',[entry],{},files);
+  assert.deepEqual(articles.requests.map(request=>request.url),['data/manifest.json','data/fixture-summary.json']);
+  assert.equal(articles.nodes['article-load'].hidden,false);
+  assert(articles.nodes['topics-full'].children.some(row=>row.className==='bar-row'));
+  assert.match(articles.nodes['article-info'].textContent,/Grafici pronti per 240 voci/);
+  articles.nodes['article-load'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(articles.nodes['article-rows'].children.length,25);
+  assert(articles.requests.some(request=>request.url==='data/fixture.json'));
+  const creators=await harness('creators',raw,'?dataset=fixture.json',[entry],{},files);
+  assert.deepEqual(creators.requests.map(request=>request.url),
+    ['data/manifest.json','data/fixture-summary.json','data/fixture-creators.json']);
+  assert.equal(creators.nodes['creator-section'].hidden,false);
+  assert.equal(creators.nodes['creator-rows'].children.length,15);
+  console.log('Prepared Rust summaries: charts and creator index load without article transport; full article list loads on request.');
+}
+async function checkReconstructedCreatorFallback() {
+  const raw=fixture();raw.metadata.creators.status='not_collected';
+  raw.metadata.history={status:'collected',matched_pages:raw.pages.length};
+  for(const [index,page] of raw.pages.entries()) {
+    page.creator_key=null;page.history_creator_key=`vec:history:${index%7}`;
+    page.creator_prior_edits_main_history=index%9;
+    page.creator_prior_edits_other_history=index%4;
+  }
+  const {nodes}=await harness('creators',raw);
+  assert.equal(nodes['creator-section'].hidden,false);
+  assert.equal(nodes['creator-rows'].children.length,7);
+  assert.match(nodes['creator-info'].textContent,/creatori ricostruiti/);
+  assert.equal(nodes['creator_prior_articles-chart'].children[0].textContent,'Dati non disponibili.');
+  assert(nodes['creator_prior_edits_main-chart'].children[0].children.some(node=>node.tag==='rect'));
+  assert(!nodes.source);
+  console.log('Reconstructed creators: all six panels remain visible, observed history is labeled and unsupported measures stay missing.');
+}
+async function checkHistoricalArticleAge() {
+  const raw=fixture();
+  raw.metadata.age_rule='unavailable_no_approved_creation_event';
+  raw.metadata.historical_age_rule='mediawiki_history_first_observed_revision_v1';
+  raw.pages.forEach((page,index)=>{
+    page.age_days=null;page.page_created_at=null;
+    page.history_first_revision_age_days=index%5===0?null:index*30;
+  });
+  const {nodes}=await harness('articles',raw);
+  assert.equal(nodes['age-heading'].textContent,'Età dalla prima revisione osservata');
+  assert.match(nodes['age-note'].textContent,/non è una data di creazione verificata/);
+  assert(nodes.age.children[0].children.some(node=>node.tag==='rect'));
+  const newArticles=nodes['features-paper'].children.find(node=>
+    node.className==='bar-row'&&node.children[0].textContent==='Voci nuove (< mediana)');
+  assert.equal(newArticles.children[2].textContent,'— (0/0)');
+  console.log('Historical article age: dated History revisions render a separate, clearly labeled distribution without filling creation-age features.');
+}
 function checkThemeContrast() {
   const css=fs.readFileSync('web/assets/style.css','utf8');
   const light=css.match(/:root\s*\{([^}]+)\}/)[1],dark=css.match(/:root\[data-theme="dark"\]\s*\{([^}]+)\}/)[1];
@@ -1148,4 +1304,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkHistoricalArticleAge();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

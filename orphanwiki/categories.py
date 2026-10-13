@@ -4,10 +4,18 @@
 def classify(pages, parents, rules):
     from ._native import classify_categories
     choices = classify_categories(
-        [(p['page_id'], p.get('categories', [])) for p in pages], parents,
-        (rules.get('exclude_patterns', []), set(rules.get('exclude_categories', [])),
-         rules.get('category_priority', {}), rules.get('page_overrides', {}),
-         rules.get('min_support', 5)))
+        [(p['page_id'], p.get('categories', [])) for p in pages], parents, native_rules(rules))
+    return format_choices(pages, choices)
+
+
+def native_rules(rules):
+    return (rules.get('exclude_patterns', []), set(rules.get('exclude_categories', [])),
+            rules.get('category_priority', {}), rules.get('page_overrides', {}),
+            rules.get('min_support', 5))
+
+
+def format_choices(pages, choices):
+    """Give bulk and staged classification the same public fields."""
     return {p['page_id']: {
         'category': category,
         'category_candidates': [dict(zip(('category', 'score', 'support', 'priority'), row)) for row in ranked],

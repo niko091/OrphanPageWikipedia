@@ -1,4 +1,5 @@
 import copy
+import csv
 import hashlib
 import json
 import random
@@ -11,7 +12,7 @@ from orphanwiki._native import graph_counts
 from fixtures import demo, graph_reference
 from orphanwiki.__main__ import export, export_result, rebuild_dashboard, main
 from orphanwiki.categories import classify
-from orphanwiki.core import analyze, write_json, json_sha256, write_observations, iter_export_sections, write_dashboard_exports, OBSERVATION_COLUMNS
+from orphanwiki.core import analyze, write_json, json_sha256, write_observations, iter_export_sections, write_dashboard_exports, prepared_summaries_match, OBSERVATION_COLUMNS
 
 
 class GraphTests(unittest.TestCase):
@@ -234,6 +235,51 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(len(path.with_suffix('.csv').read_text().splitlines()), 241)
             self.assertTrue(json.loads(first)['metadata']['demo'])
 
+    def test_csv_keeps_historical_age_separate_from_verified_creation_age(self):
+        result = analyze(demo())
+        result['pages'][0].update(age_days=None, created_at=None,
+                                  history_first_revision_at='2020-01-01T00:00:00+00:00',
+                                  history_first_revision_age_days=42.5)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'ages.json'
+            export_result(result, path)
+            with path.with_suffix('.csv').open(newline='', encoding='utf-8') as stream:
+                first = next(csv.DictReader(stream))
+        self.assertEqual(first['age_days'], '')
+        self.assertEqual(first['created_at'], '')
+        self.assertEqual(first['history_first_revision_at'], '2020-01-01T00:00:00+00:00')
+        self.assertEqual(first['history_first_revision_age_days'], '42.5')
+
+    def test_chart_preparation_handles_multiple_native_batches(self):
+        raw = demo()
+        next_id = max(page['page_id'] for page in raw['pages']) + 1
+        raw['pages'].extend({'page_id': next_id + index, 'title': f'Extra {index}',
+                             'links': [], 'categories': []} for index in range(300))
+        result = analyze(raw)
+        with tempfile.TemporaryDirectory() as folder:
+            export_result(result, Path(folder) / 'large.json')
+            summary = json.loads((Path(folder) / 'large-summary.json').read_text())
+            creators = json.loads((Path(folder) / 'large-creators.json').read_text())
+        self.assertEqual(summary['census_page_count'], 540)
+        self.assertEqual(creators['census_page_count'], 540)
+        self.assertEqual(summary['reports']['overview']['orphans'],
+                         sum(page['orphan'] for page in result['pages']))
+
+    def test_cached_summary_rejects_stale_creator_index(self):
+        result = analyze(demo())
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'wiki.json'
+            export_result(result, source)
+            summary_path = source.with_name('wiki-summary.json')
+            creator_path = source.with_name('wiki-creators.json')
+            summary = json.loads(summary_path.read_text())
+            expected = (summary_path, creator_path, result['metadata'], summary['sources'], len(result['pages']))
+            self.assertTrue(prepared_summaries_match(*expected))
+            creators = json.loads(creator_path.read_text())
+            creators['metadata']['history'] = {'status': 'stale'}
+            write_json(creator_path, creators)
+            self.assertFalse(prepared_summaries_match(*expected))
+
     def test_compact_observations_preserve_values_counts_and_original_input(self):
         result = analyze(demo())
         result['pages'][0]['topic_labels'] = ['Culture.Media.Music', 'Culture.Media.Films']
@@ -278,7 +324,20 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(compact.read_bytes(), expected)
             self.assertEqual(path.read_bytes(), complete)
             self.assertEqual(path.with_suffix('.csv').read_bytes(), csv_bytes)
-            self.assertEqual(json.loads((Path(folder) / 'manifest.json').read_text())[0]['observations_file'], compact.name)
+            entry = json.loads((Path(folder) / 'manifest.json').read_text())[0]
+            self.assertEqual(entry['observations_file'], compact.name)
+            summary = json.loads((Path(folder) / entry['summary_file']).read_text())
+            creators = json.loads((Path(folder) / entry['creator_index_file']).read_text())
+            self.assertEqual(summary['format'], 'dashboard_summary_v1')
+            self.assertEqual(summary['histogram_rule'], 'shared_p2_p98_tails_v1')
+            self.assertEqual(creators['format'], 'creator_index_v1')
+            self.assertEqual(summary['census_page_count'], len(result['pages']))
+            self.assertEqual(summary['reports']['overview']['orphans'],
+                             sum(page['orphan'] for page in result['pages']))
+            self.assertEqual(summary['reports']['numeric']['length_bytes']['known'],
+                             sum(page.get('length_bytes') is not None for page in result['pages']))
+            self.assertEqual(len(summary['reports']['numeric']['length_bytes']['cumulative_ticks']), 5)
+            self.assertNotIn('creators', summary['reports'])
             self.assertFalse(list(Path(folder).glob('*.tmp')))
         self.assertEqual(result, original)
 

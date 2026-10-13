@@ -1,4 +1,4 @@
-"""Local inference and exact-graph joins; synthetic PAWS fixtures only."""
+"""Local inference and exact-graph joins on synthetic fixtures."""
 import copy
 import hashlib
 import json
@@ -92,7 +92,7 @@ class TopicTests(unittest.TestCase):
         raw['pages'] = []
         self.assertEqual(predict_topics(raw, Model(), SPEC)['pages'], [])
 
-    def test_reject_partial_non_paws_and_invalid_batch_inputs(self):
+    def test_reject_partial_unapproved_and_invalid_batch_inputs(self):
         for change in [lambda r: r['metadata'].update(complete=False),
                        lambda r: r['metadata']['item_mapping'].update(complete=False),
                        lambda r: r['metadata'].update(demo=False, source='external'),
@@ -181,7 +181,7 @@ class TopicTests(unittest.TestCase):
                 raw['metadata']['language'] = language
                 write_json(root / f'{language}-raw.json', raw)
             config = root / 'languages.json'
-            write_json(config, {'version': 1, 'languages': ['it', 'vec', 'lmo'], 'topic_languages': ['vec', 'lmo']})
+            write_json(config, {'version': 1, 'languages': ['vec', 'lmo']})
             with patch('orphanwiki.__main__.load_topic_model', return_value=(Model(), SPEC)), \
                     patch('sys.argv', ['orphanwiki', 'topics', '--languages-file', str(config),
                                        '--input-dir', folder, '--output-dir', folder]):

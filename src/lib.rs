@@ -1,11 +1,66 @@
 pub mod dashboard;
+pub mod dumps;
 
 #[cfg(feature = "python")]
 mod native {
     use pyo3::prelude::*;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
 
     type Counts = (Vec<u64>, Vec<u64>, usize);
+
+    #[pyclass]
+    struct DashboardSummaryAccumulator {
+        inner: Mutex<crate::dashboard::SummaryAccumulator>,
+    }
+
+    #[pymethods]
+    impl DashboardSummaryAccumulator {
+        #[new]
+        fn new(language: String, aggregate: bool, historical_creators: bool) -> Self {
+            Self {
+                inner: Mutex::new(crate::dashboard::SummaryAccumulator::new(
+                    language,
+                    aggregate,
+                    historical_creators,
+                )),
+            }
+        }
+
+        fn add_batch(&self, py: Python<'_>, rows_json: String) -> PyResult<()> {
+            py.detach(move || {
+                self.inner
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .add_json(&rows_json)
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+
+        fn finish(&self, py: Python<'_>) -> PyResult<(usize, String)> {
+            py.detach(|| -> Result<(usize, String), String> {
+                let accumulator = self.inner.lock().map_err(|e| e.to_string())?;
+                Ok((accumulator.len(), accumulator.finish()?))
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+    }
+
+    #[pyfunction]
+    fn parse_dump_insert(py: Python<'_>, statement: String) -> PyResult<Vec<Vec<Option<String>>>> {
+        py.detach(move || crate::dumps::parse_insert(&statement))
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    #[pyfunction]
+    fn history_activity(
+        py: Python<'_>,
+        events: Vec<(String, i32)>,
+        creations: Vec<String>,
+    ) -> PyResult<Vec<(usize, usize, usize, String)>> {
+        py.detach(move || crate::dumps::history_activity(events, creations))
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
     type GraphDetails = (Vec<u64>, Vec<u64>, usize, Vec<Vec<usize>>);
 
     // Expected O(V + E + R) hash-table work, plus string hashing/copying.
@@ -120,6 +175,280 @@ mod native {
     ) -> PyResult<GraphDetails> {
         validate_graph(&titles, &links)?;
         Ok(py.detach(move || compute_graph(titles, links, redirects, true)))
+    }
+
+    struct IncrementalGraph {
+        index: HashMap<String, usize>,
+        redirects: HashMap<String, String>,
+        resolved: HashMap<String, Option<usize>>,
+        incoming: Vec<u64>,
+        outgoing: Vec<u64>,
+        unresolved: usize,
+        next_source: usize,
+    }
+
+    impl IncrementalGraph {
+        fn resolve(&mut self, original: &str) -> Option<usize> {
+            if let Some(found) = self.resolved.get(original) {
+                return *found;
+            }
+            let mut current = original;
+            let mut visited = HashSet::new();
+            let mut path = Vec::new();
+            let found = loop {
+                if let Some(value) = self.resolved.get(current) {
+                    break *value;
+                }
+                if !visited.insert(current) {
+                    break None;
+                }
+                path.push(current);
+                if let Some(next) = self.redirects.get(current) {
+                    current = next;
+                } else {
+                    break self.index.get(current).copied();
+                }
+            };
+            for item in path {
+                self.resolved.insert(item.to_owned(), found);
+            }
+            found
+        }
+
+        fn add(
+            &mut self,
+            batch: Vec<Vec<String>>,
+            eligible: Option<&HashSet<usize>>,
+        ) -> Result<Vec<(usize, usize)>, String> {
+            if self.next_source + batch.len() > self.incoming.len() {
+                return Err(String::from("Troppi blocchi di collegamenti"));
+            }
+            let mut edges = Vec::new();
+            for targets in batch {
+                let source = self.next_source;
+                self.next_source += 1;
+                let mut distinct = HashSet::with_capacity(targets.len());
+                for original in targets {
+                    let destination = self.resolve(&original);
+                    match destination {
+                        Some(target) if target != source => {
+                            distinct.insert(target);
+                        }
+                        Some(_) => {}
+                        None => self.unresolved += 1,
+                    }
+                }
+                self.outgoing[source] = distinct.len() as u64;
+                for target in distinct {
+                    self.incoming[target] += 1;
+                    if eligible
+                        .is_some_and(|items| items.contains(&source) && items.contains(&target))
+                    {
+                        edges.push((target, source));
+                    }
+                }
+            }
+            Ok(edges)
+        }
+    }
+
+    /// Keep only titles, redirects, degrees and memoized paths in memory.
+    /// Source adjacency crosses PyO3 in bounded batches.
+    #[pyclass]
+    struct GraphAccumulator {
+        inner: Mutex<IncrementalGraph>,
+        eligible: Option<HashSet<usize>>,
+    }
+
+    #[pymethods]
+    impl GraphAccumulator {
+        #[new]
+        #[pyo3(signature = (titles, redirects, eligible_indices=None))]
+        fn new(
+            titles: Vec<String>,
+            redirects: HashMap<String, String>,
+            eligible_indices: Option<Vec<usize>>,
+        ) -> PyResult<Self> {
+            let count = titles.len();
+            if eligible_indices
+                .as_ref()
+                .is_some_and(|positions| positions.iter().any(|&i| i >= count))
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "invalid eligible index",
+                ));
+            }
+            let index: HashMap<String, usize> = titles
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (t, i))
+                .collect();
+            if index.len() != count {
+                return Err(pyo3::exceptions::PyValueError::new_err("duplicate titles"));
+            }
+            Ok(Self {
+                eligible: eligible_indices.map(|positions| positions.into_iter().collect()),
+                inner: Mutex::new(IncrementalGraph {
+                    index,
+                    redirects,
+                    resolved: HashMap::new(),
+                    incoming: vec![0; count],
+                    outgoing: vec![0; count],
+                    unresolved: 0,
+                    next_source: 0,
+                }),
+            })
+        }
+
+        fn add_batch(&self, py: Python<'_>, batch: Vec<Vec<String>>) -> PyResult<()> {
+            py.detach(move || {
+                self.inner
+                    .lock()
+                    .map_err(|_| String::from("Stato del grafo non disponibile"))?
+                    .add(batch, None)
+                    .map(|_| ())
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+
+        fn add_batch_edges(
+            &self,
+            py: Python<'_>,
+            batch: Vec<Vec<String>>,
+        ) -> PyResult<Vec<(usize, usize)>> {
+            py.detach(move || {
+                self.inner
+                    .lock()
+                    .map_err(|_| String::from("Stato del grafo non disponibile"))?
+                    .add(batch, self.eligible.as_ref())
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+
+        fn finish(&self) -> PyResult<Counts> {
+            let state = self.inner.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Stato del grafo non disponibile")
+            })?;
+            if state.next_source != state.incoming.len() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Blocchi di collegamenti incompleti",
+                ));
+            }
+            Ok((
+                state.incoming.clone(),
+                state.outgoing.clone(),
+                state.unresolved,
+            ))
+        }
+    }
+
+    /// Resolve one bounded batch of article outlinks to unique local QIDs.
+    /// Memory is O(V + R + batch edges), independent of the complete edge set.
+    #[pyclass]
+    struct TopicInputAccumulator {
+        graph: Mutex<IncrementalGraph>,
+        items: Vec<Option<String>>,
+        known: HashSet<String>,
+    }
+
+    #[pymethods]
+    impl TopicInputAccumulator {
+        #[new]
+        fn new(
+            titles: Vec<String>,
+            items: Vec<Option<String>>,
+            redirects: HashMap<String, String>,
+            known: HashSet<String>,
+        ) -> PyResult<Self> {
+            if titles.len() != items.len() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "titles/items size mismatch",
+                ));
+            }
+            let count = titles.len();
+            let index: HashMap<String, usize> = titles
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (t, i))
+                .collect();
+            if index.len() != count {
+                return Err(pyo3::exceptions::PyValueError::new_err("duplicate titles"));
+            }
+            let (unique, _) = item_index(&items);
+            let mut retained = vec![None; count];
+            for (item, position) in unique {
+                retained[position] = Some(item);
+            }
+            Ok(Self {
+                graph: Mutex::new(IncrementalGraph {
+                    index,
+                    redirects,
+                    resolved: HashMap::new(),
+                    incoming: Vec::new(),
+                    outgoing: Vec::new(),
+                    unresolved: 0,
+                    next_source: 0,
+                }),
+                items: retained,
+                known,
+            })
+        }
+
+        fn add_batch(
+            &self,
+            py: Python<'_>,
+            batch: Vec<Vec<String>>,
+        ) -> PyResult<Vec<(String, usize, bool)>> {
+            py.detach(move || {
+                let mut graph = self
+                    .graph
+                    .lock()
+                    .map_err(|_| String::from("Stato dei temi non disponibile"))?;
+                if graph.next_source + batch.len() > self.items.len() {
+                    return Err(String::from("Troppi blocchi di collegamenti"));
+                }
+                let mut output = Vec::with_capacity(batch.len());
+                for targets in batch {
+                    let source = graph.next_source;
+                    graph.next_source += 1;
+                    let mut distinct = HashSet::with_capacity(targets.len());
+                    for target in targets {
+                        if let Some(destination) = graph.resolve(&target) {
+                            if destination != source {
+                                distinct.insert(destination);
+                            }
+                        }
+                    }
+                    let mut tokens = Vec::new();
+                    let mut mapped = false;
+                    for destination in distinct {
+                        if let Some(item) = &self.items[destination] {
+                            mapped = true;
+                            if self.known.contains(item) {
+                                tokens.push(item.clone());
+                            }
+                        }
+                    }
+                    tokens.sort();
+                    tokens.dedup();
+                    output.push((tokens.join(" "), tokens.len(), mapped));
+                }
+                Ok(output)
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+
+        fn finish(&self) -> PyResult<()> {
+            let graph = self.graph.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Stato dei temi non disponibile")
+            })?;
+            if graph.next_source != self.items.len() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Blocchi di collegamenti incompleti",
+                ));
+            }
+            Ok(())
+        }
     }
 
     // Analytical routines use typed bulk inputs. Python handles files/SQL/model I/O;
@@ -239,6 +568,196 @@ mod native {
             .collect()
     }
 
+    struct IncrementalCategories {
+        total: usize,
+        support_sources: usize,
+        frequencies: HashMap<String, u64>,
+        parents: HashMap<String, Vec<String>>,
+        ancestors: HashMap<String, HashSet<String>>,
+        patterns: Vec<regex::Regex>,
+        excluded: HashSet<String>,
+        priority: HashMap<String, f64>,
+        overrides: HashMap<String, String>,
+        min_support: f64,
+    }
+
+    impl IncrementalCategories {
+        fn add_support(&mut self, batch: Vec<Vec<String>>) -> Result<(), String> {
+            if self.support_sources + batch.len() > self.total {
+                return Err(String::from("Troppi blocchi di categorie"));
+            }
+            for categories in batch {
+                self.support_sources += 1;
+                for category in categories.iter().collect::<HashSet<_>>() {
+                    *self.frequencies.entry(category.to_owned()).or_default() += 1;
+                }
+            }
+            Ok(())
+        }
+
+        fn cache_ancestors(&mut self, category: &str) {
+            if self.ancestors.contains_key(category) {
+                return;
+            }
+            let mut seen = HashSet::new();
+            let mut pending = self
+                .parents
+                .get(category)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            while let Some(item) = pending.pop() {
+                if seen.insert(item.as_str()) {
+                    pending.extend(self.parents.get(item).into_iter().flatten());
+                }
+            }
+            self.ancestors.insert(
+                category.to_owned(),
+                seen.into_iter().map(str::to_owned).collect(),
+            );
+        }
+
+        fn classify(
+            &mut self,
+            pages: Vec<(i64, Vec<String>)>,
+        ) -> Result<Vec<CategoryChoice>, String> {
+            if self.support_sources != self.total {
+                return Err(String::from("Frequenze delle categorie incomplete"));
+            }
+            let mut choices = Vec::with_capacity(pages.len());
+            for (id, categories) in pages {
+                let candidates = categories
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|category| {
+                        !self.excluded.contains(*category)
+                            && !self
+                                .patterns
+                                .iter()
+                                .any(|pattern| pattern.is_match(category))
+                    })
+                    .collect::<HashSet<_>>();
+                for category in &candidates {
+                    self.cache_ancestors(category);
+                }
+                let mut ranked = Vec::new();
+                for category in &candidates {
+                    let broader = candidates.iter().any(|other| {
+                        category != other
+                            && self
+                                .ancestors
+                                .get(*other)
+                                .is_some_and(|ancestors| ancestors.contains(*category))
+                            && !self
+                                .ancestors
+                                .get(*category)
+                                .is_some_and(|ancestors| ancestors.contains(*other))
+                    });
+                    if !broader {
+                        let support = self.frequencies.get(*category).copied().unwrap_or_default();
+                        let score = ((self.total as f64 + 1.0) / (support as f64 + 1.0)).ln()
+                            * (support as f64 / self.min_support).min(1.0);
+                        ranked.push((
+                            (*category).to_owned(),
+                            (score * 1e6).round_ties_even() / 1e6,
+                            support,
+                            self.priority.get(*category).copied().unwrap_or_default(),
+                        ));
+                    }
+                }
+                ranked.sort_by(|a, b| {
+                    b.3.total_cmp(&a.3)
+                        .then_with(|| b.1.total_cmp(&a.1))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let manual = self.overrides.get(&id.to_string());
+                if manual.is_some_and(|choice| !categories.contains(choice)) {
+                    return Err(format!(
+                        "Override {id}: categoria non appartenente alla voce"
+                    ));
+                }
+                let choice = manual
+                    .cloned()
+                    .or_else(|| ranked.first().map(|row| row.0.clone()));
+                choices.push((choice, ranked, manual.is_some()));
+            }
+            Ok(choices)
+        }
+    }
+
+    /// Preserve global category supports while classifying bounded page batches.
+    #[pyclass]
+    struct CategoryBatchClassifier {
+        inner: Mutex<IncrementalCategories>,
+    }
+
+    #[pymethods]
+    impl CategoryBatchClassifier {
+        #[new]
+        fn new(
+            total: usize,
+            parents: HashMap<String, Vec<String>>,
+            rules: CategoryRules,
+        ) -> PyResult<Self> {
+            let (patterns, excluded, priority, overrides, min_support) = rules;
+            if !min_support.is_finite()
+                || min_support <= 0.0
+                || priority.values().any(|v| !v.is_finite())
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Regole delle categorie non valide",
+                ));
+            }
+            let patterns = patterns
+                .iter()
+                .map(|pattern| {
+                    regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+            Ok(Self {
+                inner: Mutex::new(IncrementalCategories {
+                    total,
+                    support_sources: 0,
+                    frequencies: HashMap::new(),
+                    parents,
+                    ancestors: HashMap::new(),
+                    patterns,
+                    excluded,
+                    priority,
+                    overrides,
+                    min_support,
+                }),
+            })
+        }
+
+        fn add_support_batch(&self, py: Python<'_>, batch: Vec<Vec<String>>) -> PyResult<()> {
+            py.detach(move || {
+                self.inner
+                    .lock()
+                    .map_err(|_| String::from("Classificatore delle categorie non disponibile"))?
+                    .add_support(batch)
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+
+        fn classify_batch(
+            &self,
+            py: Python<'_>,
+            pages: Vec<(i64, Vec<String>)>,
+        ) -> PyResult<Vec<CategoryChoice>> {
+            py.detach(move || {
+                self.inner
+                    .lock()
+                    .map_err(|_| String::from("Classificatore delle categorie non disponibile"))?
+                    .classify(pages)
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+        }
+    }
+
     fn timestamp(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
         chrono::DateTime::parse_from_rfc3339(value)
             .map_err(|error| format!("Invalid timestamp {value:?}: {error}"))
@@ -270,59 +789,6 @@ mod native {
                         + duration.subsec_nanos() as f64 / 86_400_000_000_000.0;
                     Ok((if days >= 0.0 { Some(days) } else { None }, days < 0.0))
                 }
-            })
-            .collect()
-    }
-
-    type CreatorDates = (Option<String>, Option<String>, bool, Option<String>);
-    #[pyfunction]
-    fn creator_matches(py: Python<'_>, dates: Vec<CreatorDates>) -> PyResult<Vec<(bool, bool)>> {
-        py.detach(move || match_creators(&dates))
-            .map_err(pyo3::exceptions::PyValueError::new_err)
-    }
-
-    fn match_creators(dates: &[CreatorDates]) -> Result<Vec<(bool, bool)>, String> {
-        dates
-            .iter()
-            .map(|(local, first, has_creation, creation)| {
-                let parse = |value: &Option<String>| value.as_deref().map(timestamp).transpose();
-                let local = parse(local)?;
-                let first = parse(first)?;
-                let matches = local.is_some() && local == first;
-                let unconfirmed =
-                    matches && *has_creation && (creation.is_none() || parse(creation)? != first);
-                Ok((matches, unconfirmed))
-            })
-            .collect()
-    }
-
-    type CreatorCount = (Option<u64>, Option<u64>, Option<f64>);
-    #[pyfunction]
-    fn creator_counts(py: Python<'_>, rows: Vec<(Option<String>, bool)>) -> Vec<CreatorCount> {
-        py.detach(move || count_creators(&rows))
-    }
-
-    fn count_creators(rows: &[(Option<String>, bool)]) -> Vec<CreatorCount> {
-        let mut counts = HashMap::<&str, (u64, u64)>::new();
-        for (key, orphan) in rows {
-            if let Some(key) = key.as_deref().filter(|k| !k.is_empty()) {
-                let pair = counts.entry(key).or_default();
-                pair.0 += 1;
-                pair.1 += u64::from(*orphan);
-            }
-        }
-        rows.iter()
-            .map(|(key, _)| {
-                key.as_deref().and_then(|k| counts.get(k)).map_or(
-                    (None, None, None),
-                    |&(total, orphans)| {
-                        (
-                            Some(total),
-                            Some(orphans),
-                            Some(orphans as f64 / total as f64),
-                        )
-                    },
-                )
             })
             .collect()
     }
@@ -552,12 +1018,16 @@ mod native {
 
     #[pymodule]
     fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<DashboardSummaryAccumulator>()?;
+        m.add_class::<GraphAccumulator>()?;
+        m.add_class::<TopicInputAccumulator>()?;
+        m.add_class::<CategoryBatchClassifier>()?;
         m.add_function(wrap_pyfunction!(graph_counts, m)?)?;
+        m.add_function(wrap_pyfunction!(parse_dump_insert, m)?)?;
+        m.add_function(wrap_pyfunction!(history_activity, m)?)?;
         m.add_function(wrap_pyfunction!(graph_details, m)?)?;
         m.add_function(wrap_pyfunction!(classify_categories, m)?)?;
         m.add_function(wrap_pyfunction!(article_ages, m)?)?;
-        m.add_function(wrap_pyfunction!(creator_matches, m)?)?;
-        m.add_function(wrap_pyfunction!(creator_counts, m)?)?;
         m.add_function(wrap_pyfunction!(unique_items, m)?)?;
         m.add_function(wrap_pyfunction!(matchable_edges, m)?)?;
         m.add_function(wrap_pyfunction!(topic_inputs, m)?)?;
@@ -701,44 +1171,6 @@ mod native {
                 &[Some("2026-02-30T00:00:00Z".into())]
             )
             .is_err());
-        }
-
-        #[test]
-        fn creator_matching_requires_initial_revision_and_confirmed_creation() {
-            let first = Some("2026-01-01T00:00:00Z".into());
-            let equivalent = Some("2026-01-01T01:00:00+01:00".into());
-            let matches = match_creators(&[
-                (first.clone(), equivalent.clone(), false, None),
-                (first.clone(), equivalent, true, None),
-                (None, first.clone(), false, None),
-                (first.clone(), first.clone(), true, first),
-            ])
-            .unwrap();
-            assert_eq!(
-                matches,
-                [(true, false), (true, true), (false, false), (true, false)]
-            );
-        }
-
-        #[test]
-        fn creator_counts_keep_unknown_and_local_identities_separate() {
-            let counts = count_creators(&[
-                (Some("vec:1".into()), true),
-                (Some("vec:1".into()), false),
-                (Some("lmo:1".into()), false),
-                (None, true),
-                (Some(String::new()), false),
-            ]);
-            assert_eq!(
-                counts,
-                [
-                    (Some(2), Some(1), Some(0.5)),
-                    (Some(2), Some(1), Some(0.5)),
-                    (Some(1), Some(0), Some(0.0)),
-                    (None, None, None),
-                    (None, None, None)
-                ]
-            );
         }
 
         #[test]

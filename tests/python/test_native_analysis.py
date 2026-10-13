@@ -7,7 +7,7 @@ from orphanwiki import _native
 
 
 class NativeAnalysisTests(unittest.TestCase):
-    def test_age_and_creator_dates_match_instants_and_keep_unknowns(self):
+    def test_age_dates_match_instants_and_keep_unknowns(self):
         ages = _native.article_ages('2026-01-02T00:00:00Z', [
             None, '2026-01-01T01:00:00+01:00',
             '2026-01-01T23:59:59.500Z', '2026-01-03T00:00:00Z'])
@@ -15,18 +15,8 @@ class NativeAnalysisTests(unittest.TestCase):
         self.assertEqual(ages[1], (1.0, False))
         self.assertAlmostEqual(ages[2][0], 0.5 / 86400)
         self.assertEqual(ages[3], (None, True))
-        self.assertEqual(_native.creator_matches([
-            ('2026-01-01T00:00:00Z', '2026-01-01T01:00:00+01:00', False, None),
-            (None, None, True, None),
-            ('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', True, None),
-        ]), [(True, False), (False, False), (True, True)])
         with self.assertRaises(ValueError):
             _native.article_ages('2026-01-02T00:00:00Z', ['invalid'])
-
-    def test_creator_counts_keep_local_identity_and_missing(self):
-        self.assertEqual(_native.creator_counts([
-            ('vec:1', True), ('lmo:1', False), (None, True), ('vec:1', False),
-        ]), [(2, 1, 0.5), (1, 0, 0.0), (None, None, None), (2, 1, 0.5)])
 
     def test_adjacency_bounds_are_python_errors_not_panics(self):
         for incoming, unique in [([[]], {'Q1': 1}), ([[2]], {'Q1': 0}), ([], {})]:
@@ -52,6 +42,24 @@ class NativeAnalysisTests(unittest.TestCase):
         for scores in [probabilities[:-1], [float('nan')] * 64, [1.01] * 64]:
             with self.subTest(scores=scores), self.assertRaises(ValueError):
                 _native.threshold_topics(set(taxonomy), [labels], [scores])
+
+    def test_bounded_topic_inputs_match_full_graph_resolution(self):
+        titles = ['Source', 'Target', 'Duplicate QID', 'Unknown', 'No QID']
+        items = ['Q1', 'Q2', 'Q2', 'Q99', None]
+        redirects = {'Alias': 'Target', 'Loop A': 'Loop B', 'Loop B': 'Loop A'}
+        links = [['Alias', 'Target', 'Source', 'Unknown', 'Loop A'],
+                 ['No QID'], ['Target'], [], ['Unknown']]
+        bounded = _native.TopicInputAccumulator(titles, items, redirects, {'Q1'})
+        actual = bounded.add_batch(links[:2]) + bounded.add_batch(links[2:])
+        bounded.finish()
+        _, _, _, incoming = _native.graph_details(titles, links, redirects)
+        unique, _ = _native.unique_items(items)
+        self.assertEqual(actual, _native.topic_inputs(len(titles), unique, {'Q1'}, incoming))
+        with self.assertRaises(ValueError):
+            bounded.add_batch([[]])
+        incomplete = _native.TopicInputAccumulator(titles, items, redirects, set())
+        with self.assertRaises(ValueError):
+            incomplete.finish()
 
     def test_evidence_union_keeps_every_language_and_rejects_inconsistent_pages(self):
         references = [(1, 'Source', 0, f'wiki{i}', i + 1, 'Reference', 100, 'Target')
