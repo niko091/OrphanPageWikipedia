@@ -13,3 +13,4 @@ web/assets/
 .my.cnf
 .DS_Store
 *.md
+!README.md
