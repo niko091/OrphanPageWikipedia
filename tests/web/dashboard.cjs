@@ -82,6 +82,7 @@ async function checkFreshResources() {
   }
   const articlesHtml=fs.readFileSync('web/index.html','utf8');
   assert(!articlesHtml.includes('id="download"'));
+  assert(!articlesHtml.includes('id="article-load"'));
   assert.match(articlesHtml,/Tassonomia completa: 64 temi[\s\S]*?https:\/\/ojs\.aaai\.org\/index\.php\/ICWSM\/article\/view\/31300/);
   const deorphanizeHtml=fs.readFileSync('web/deorphanize.html','utf8');
   assert.match(deorphanizeHtml,/<div class="toolbar">[\s\S]*?id="llm-provider"[\s\S]*?id="profile-username"[\s\S]*?<\/div>/);
@@ -1239,19 +1240,28 @@ async function checkPreparedSummaries() {
   const files={'fixture-summary.json':summary,'fixture-creators.json':creatorIndex,'fixture.json':raw};
   const articles=await harness('articles',raw,'?dataset=fixture.json',[entry],{},files);
   assert.deepEqual(articles.requests.map(request=>request.url),['data/manifest.json','data/fixture-summary.json']);
-  assert.equal(articles.nodes['article-load'].hidden,false);
+  assert.equal(articles.nodes['article-load'],undefined);
   assert(articles.nodes['topics-full'].children.some(row=>row.className==='bar-row'));
-  assert.match(articles.nodes['article-info'].textContent,/Grafici pronti per 240 voci/);
-  articles.nodes['article-load'].listeners.click();
-  await new Promise(resolve=>setImmediate(resolve));
   assert.equal(articles.nodes['article-rows'].children.length,25);
+  assert.match(articles.nodes['article-info'].textContent,/Anteprima: 25 di/);
+  articles.nodes['article-more'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(articles.nodes['article-rows'].children.length,50);
   assert(articles.requests.some(request=>request.url==='data/fixture.json'));
+  const stale=JSON.parse(JSON.stringify(summary));stale.article_preview.pop();
+  const rejected=await harness('articles',raw,'?dataset=fixture.json',[entry],{}, {...files,'fixture-summary.json':stale});
+  assert.match(rejected.nodes.status.textContent,/Riepilogo non valido/);
+  const legacy=JSON.parse(JSON.stringify(summary));delete legacy.article_preview;
+  const old=await harness('articles',raw,'?dataset=fixture.json',[entry],{}, {...files,'fixture-summary.json':legacy});
+  assert.equal(old.nodes['article-rows'].children.length,0);
+  assert.equal(old.nodes['article-more'].hidden,false);
+  assert.match(old.nodes['article-info'].textContent,/Anteprima non disponibile/);
   const creators=await harness('creators',raw,'?dataset=fixture.json',[entry],{},files);
   assert.deepEqual(creators.requests.map(request=>request.url),
     ['data/manifest.json','data/fixture-summary.json','data/fixture-creators.json']);
   assert.equal(creators.nodes['creator-section'].hidden,false);
   assert.equal(creators.nodes['creator-rows'].children.length,15);
-  console.log('Prepared Rust summaries: charts and creator index load without article transport; full article list loads on request.');
+  console.log('Prepared Rust summaries: the first 25 articles render from the summary without a full transport or load button.');
 }
 async function checkReconstructedCreatorFallback() {
   const raw=fixture();raw.metadata.creators.status='not_collected';

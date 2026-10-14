@@ -96,6 +96,7 @@ interface OverviewReport {
 }
 interface DashboardSummaryData {
   format: 'dashboard_summary_v1'; metadata: DatasetMetadata; census_page_count: number;
+  article_preview?: PageObservation[];
   reports: {
     overview: OverviewReport; categories: CategoryReportRow[]; profiles: ProfilesReport;
     numeric: Record<string, NumericReport>; origins: OriginsReport;
@@ -129,7 +130,6 @@ interface UIElements {
   'article-group': HTMLSelectElement;
   'article-info': HTMLElement;
   'article-more': HTMLButtonElement;
-  'article-load': HTMLButtonElement;
   'article-rows': HTMLElement;
   'article-search': HTMLInputElement;
   'article-sort': HTMLSelectElement;
@@ -318,8 +318,8 @@ const translations: Record<string, string> = {
   "Link entranti": "Incoming links",
   "Collegamenti possibili": "Possible links",
   "Mostra altre 25 voci": "Show 25 more articles",
-  "Carica l’elenco completo delle voci": "Load the complete article list",
-  "Grafici pronti per {n} voci. Carica l’elenco completo solo per cercare o ordinare le singole voci.": "Charts ready for {n} articles. Load the complete list to search or sort individual articles.",
+  "Anteprima: {shown} di {total} voci orfane.": "Preview: {shown} of {total} orphan articles.",
+  "Anteprima non disponibile per questa raccolta. Mostra altre 25 voci per caricare l’elenco.": "Preview unavailable for this collection. Show 25 more articles to load the list.",
   "Caricamento dell’elenco completo delle voci…": "Loading the complete article list…",
   "Studio di riferimento": "Reference study",
   "Analisi descrittiva": "Descriptive analysis",
@@ -1038,18 +1038,10 @@ function articleLabels(page: PageObservation): string[] {
 }
 function articleList() {
   if(!$('article-rows')!)return;
-  if(summaryOnly){
-    $('article-rows')!.replaceChildren();
-    $('article-info')!.textContent=t('Grafici pronti per {n} voci. Carica l’elenco completo solo per cercare o ordinare le singole voci.',
-      {n:number(precomputed!.census_page_count)});
-    $('article-load')!.hidden=false;$('article-more')!.hidden=true;
-    return;
-  }
-  $('article-load')!.hidden=true;
   const search=$('article-search')!.value.toLocaleLowerCase();
   const category=($('article-classification')!.value==='macro'?$('article-macro')!.value:$('article-category')!.value).toLocaleLowerCase();
   const group=$('article-group')!.value||'orphans';
-  const pages=data.pages.filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
+  const pages=(summaryOnly?precomputed!.article_preview??[]:data.pages).filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
   sortArticles(pages,$('article-sort')!.value||'title-asc');
   const box=$('article-rows')!;box.replaceChildren();
   for(const page of pages.slice(0,articleLimit)) {
@@ -1057,8 +1049,11 @@ function articleList() {
     row.append(title,...[articleLabels(page).join(' · '),page.orphan?t('Sì'):t('No'),number(page.length_bytes),page.created_at?new Date(page.created_at).toISOString().slice(0,10):'—',number(page.in_degree),number(data.link_candidates?.[pageKey(page)]?.candidate_count)].map(value=>element('td',value)));
     box.append(row);
   }
-  $('article-info')!.textContent=t('{n} voci · {shown} visualizzate',{n:number(pages.length),shown:number(Math.min(articleLimit,pages.length))});
-  $('article-more')!.hidden=articleLimit>=pages.length;
+  $('article-info')!.textContent=summaryOnly&&!precomputed!.article_preview?t('Anteprima non disponibile per questa raccolta. Mostra altre 25 voci per caricare l’elenco.'):
+    summaryOnly?t('Anteprima: {shown} di {total} voci orfane.',
+    {shown:number(Math.min(articleLimit,pages.length)),total:number(precomputed!.reports.overview.orphans)}):
+    t('{n} voci · {shown} visualizzate',{n:number(pages.length),shown:number(Math.min(articleLimit,pages.length))});
+  $('article-more')!.hidden=summaryOnly?precomputed!.reports.overview.orphans<=(precomputed!.article_preview?.length??0):articleLimit>=pages.length;
 }
 function prepareCreators() {
   if(!creatorsAvailable()) {creatorRows=[];return;}
@@ -1219,6 +1214,14 @@ async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> 
     summary.metadata.finished_at!==entry.date||summary.metadata.complete!==true||
     Boolean(summary.metadata.demo)!==Boolean(entry.demo)||
     !Number.isSafeInteger(summary.census_page_count)||summary.census_page_count<0||
+    !Number.isSafeInteger(summary.reports?.overview?.orphans)||summary.reports.overview.orphans<0||
+    summary.reports.overview.orphans>summary.census_page_count||
+    (summary.article_preview!==undefined&&(!Array.isArray(summary.article_preview)||
+    summary.article_preview.length!==Math.min(25,summary.reports?.overview?.orphans??-1)||
+    summary.article_preview.some(page=>!Number.isSafeInteger(page.page_id)||page.page_id<=0||
+      typeof page.title!=='string'||page.orphan!==true||
+      (entry.kind==='aggregate'&&(!/^[a-z][a-z0-9-]{0,19}$/.test(page.language??'')||
+        !summary.metadata.languages?.includes(page.language!))))))||
     !summary.reports||!summary.reports.overview||!Array.isArray(summary.reports.categories)||
     !summary.reports.profiles||!summary.reports.numeric||!summary.reports.origins||
     !Array.isArray(summary.reports.creator_groups)||
@@ -1299,6 +1302,7 @@ function selectedEntry(): ManifestEntry | undefined {
 async function load(entry: ManifestEntry) {
   if($('llm-prompt')?.open)$('llm-prompt')!.close();
   const version=++loadVersion;
+  articleListLoading=false;
   ++profileRequestVersion;profileScores=null;
   if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
   if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
@@ -1347,7 +1351,7 @@ async function loadFullArticles() {
   if(!summaryOnly||articleListLoading)return;
   const version=loadVersion,entry=datasetEntries.find(item=>item.file===datasetFile);
   if(!entry)return;
-  articleListLoading=true;$('article-load')!.disabled=true;
+  articleListLoading=true;$('article-more')!.disabled=true;
   $('article-info')!.textContent=t('Caricamento dell’elenco completo delle voci…');
   try {
     let full=await readDataset(entry);
@@ -1360,7 +1364,7 @@ async function loadFullArticles() {
   } catch(error) {
     if(version===loadVersion)$('article-info')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',
       {error:t(error instanceof Error?error.message:String(error))});
-  } finally {if(version===loadVersion){articleListLoading=false;$('article-load')!.disabled=false;}}
+  } finally {if(version===loadVersion){articleListLoading=false;$('article-more')!.disabled=false;}}
 }
 function refreshCategoryChoices() {
   for(const prefix of ['candidate','article'])if($(prefix+'-categories')!) {
@@ -1465,8 +1469,7 @@ for(const id of ['article-search','article-category','article-group','article-so
 $('article-macro')?.addEventListener('change',()=>{articleLimit=25;if(data)articleList();});
 for(const id of ['creator-search','creator-sort']) $(id)?.addEventListener('input',()=>{creatorLimit=25;if(data)creatorList();});
 $('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';$('article-macro')!.value='';articleLimit=25;refreshCategoryChoices();articleList();}});
-$('article-more')?.addEventListener('click',()=>{articleLimit+=25;articleList();});
-$('article-load')?.addEventListener('click',()=>{void loadFullArticles();});
+$('article-more')?.addEventListener('click',()=>{articleLimit+=25;if(summaryOnly)void loadFullArticles();else articleList();});
 $('creator-more')?.addEventListener('click',()=>{creatorLimit+=25;creatorList();});
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>{candidateLimit+=25;candidateCards();});

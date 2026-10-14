@@ -40,7 +40,8 @@ def sidecars(directory, filename, sources):
     stem = filename.removesuffix('.json')
     (directory / (stem + '-summary.json')).write_text(json.dumps({
         'format': 'dashboard_summary_v1', 'histogram_rule': 'shared_p2_p98_tails_v1',
-        'metadata': metadata, 'sources': fingerprints, 'census_page_count': 0}))
+        'metadata': metadata, 'sources': fingerprints, 'census_page_count': 0,
+        'reports': {'overview': {'orphans': 0}}, 'article_preview': []}))
     (directory / (stem + '-creators.json')).write_text(json.dumps({
         'format': 'creator_index_v1', 'metadata': metadata,
         'sources': fingerprints, 'census_page_count': 0}))

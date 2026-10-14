@@ -264,6 +264,10 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(creators['census_page_count'], 540)
         self.assertEqual(summary['reports']['overview']['orphans'],
                          sum(page['orphan'] for page in result['pages']))
+        self.assertEqual(len(summary['article_preview']), 25)
+        self.assertTrue(all(page['orphan'] for page in summary['article_preview']))
+        self.assertEqual([page['title'] for page in summary['article_preview']],
+                         sorted(page['title'] for page in summary['article_preview']))
 
     def test_cached_summary_rejects_stale_creator_index(self):
         result = analyze(demo())
@@ -334,6 +338,8 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(summary['census_page_count'], len(result['pages']))
             self.assertEqual(summary['reports']['overview']['orphans'],
                              sum(page['orphan'] for page in result['pages']))
+            self.assertEqual(len(summary['article_preview']), 25)
+            self.assertTrue(all(page['orphan'] for page in summary['article_preview']))
             self.assertEqual(summary['reports']['numeric']['length_bytes']['known'],
                              sum(page.get('length_bytes') is not None for page in result['pages']))
             self.assertEqual(len(summary['reports']['numeric']['length_bytes']['cumulative_ticks']), 5)

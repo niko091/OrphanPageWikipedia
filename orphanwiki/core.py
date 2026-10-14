@@ -1,3 +1,4 @@
+import bisect
 import hashlib
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
+ARTICLE_PREVIEW_LIMIT = 25
 
 
 def prepared_summaries_match(summary_path, creators_path, metadata, sources, page_count=None):
@@ -31,6 +33,15 @@ def prepared_summaries_match(summary_path, creators_path, metadata, sources, pag
     count = summary.get('census_page_count')
     return (summary.get('format') == 'dashboard_summary_v1'
             and summary.get('histogram_rule') == HISTOGRAM_RULE
+            and isinstance(summary.get('reports'), dict)
+            and isinstance(summary['reports'].get('overview'), dict)
+            and type(summary['reports']['overview'].get('orphans')) is int
+            and isinstance(summary.get('article_preview'), list)
+            and len(summary['article_preview']) == min(ARTICLE_PREVIEW_LIMIT,
+                summary['reports']['overview']['orphans'])
+            and all(isinstance(page, dict) and page.get('orphan') is True
+                    and type(page.get('page_id')) is int and isinstance(page.get('title'), str)
+                    for page in summary['article_preview'])
             and creators.get('format') == 'creator_index_v1'
             and metadata_matches and creators.get('metadata') == summary_metadata
             and summary.get('sources') == sources == creators.get('sources')
@@ -683,6 +694,21 @@ OBSERVATION_COLUMNS = (
 )
 
 
+def add_article_preview(preview, page, language=None):
+    """Keep the first 25 orphan titles from a complete page stream."""
+    if not page['orphan']:
+        return
+    key = (page['title'].casefold(), page['title'], language or '', page['page_id'])
+    if len(preview) == ARTICLE_PREVIEW_LIMIT and key >= preview[-1][0]:
+        return
+    projected = {field: page.get(field) for field in OBSERVATION_COLUMNS}
+    if language is not None:
+        projected['language'] = language
+    bisect.insort(preview, (key, projected))
+    if len(preview) > ARTICLE_PREVIEW_LIMIT:
+        preview.pop()
+
+
 def write_observations(path, result):
     """Stream every article's display values, excluding candidate evidence.
 
@@ -740,7 +766,7 @@ def write_dashboard_exports(source, folder, expected=None):
             metadata.get('creators', {}).get('status') not in ('collected', 'partially_collected')
             and metadata.get('history', {}).get('status') in ('collected', 'partially_collected'))
         summary_batch = []
-        orphans, summaries, shortlists, seen = {}, {}, {}, set()
+        orphans, summaries, shortlists, seen, article_preview = {}, {}, {}, set(), []
 
         def detail(identifier, record):
             write_json(folder / directory / (identifier + '.json'),
@@ -755,6 +781,7 @@ def write_dashboard_exports(source, folder, expected=None):
                     if type(pid) is not int or pid <= 0 or pid in seen or type(record.get('orphan')) is not bool:
                         raise ValueError('Osservazione o identificativo duplicato non valido')
                     seen.add(pid)
+                    add_article_preview(article_preview, record)
                     summary_batch.append(record)
                     if len(summary_batch) == 512:
                         summary.add_batch(json.dumps(summary_batch, ensure_ascii=False))
@@ -801,7 +828,8 @@ def write_dashboard_exports(source, folder, expected=None):
                             folder / filenames['creator_index_file'], metadata,
                             summary_count, summary_json,
                             [{'language': metadata['language'], 'file': source.name,
-                              'size': initial.st_size, 'mtime_ns': initial.st_mtime_ns}])
+                              'size': initial.st_size, 'mtime_ns': initial.st_mtime_ns}],
+                            [page for _, page in article_preview])
         for identifier in orphans.keys() - summaries.keys():
             detail(identifier, {})
         write_json(folder / filenames['cards_file'],
@@ -813,7 +841,7 @@ def write_dashboard_exports(source, folder, expected=None):
         events.close()
 
 
-def write_summary_files(summary_path, creators_path, metadata, count, report_json, sources):
+def write_summary_files(summary_path, creators_path, metadata, count, report_json, sources, article_preview):
     reports = json.loads(report_json)
     creators = reports.pop('creators')
     # The category chart renders its first 20 ranked bars. The full category
@@ -821,7 +849,7 @@ def write_summary_files(summary_path, creators_path, metadata, count, report_jso
     reports['categories'] = reports['categories'][:20]
     shared = {'metadata': metadata, 'sources': sources, 'census_page_count': count}
     write_json(summary_path, {'format': 'dashboard_summary_v1', 'histogram_rule': HISTOGRAM_RULE,
-                              **shared, 'reports': reports})
+                              **shared, 'reports': reports, 'article_preview': article_preview})
     write_json(creators_path, {'format': 'creator_index_v1', **shared, 'creators': creators})
 
 
@@ -858,7 +886,7 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
     historical = historical and any(member['metadata'].get('history', {}).get('status') in
                                     ('collected', 'partially_collected') for member in members)
     summary = DashboardSummaryAccumulator(metadata['language'], aggregate, historical)
-    sources = []
+    sources, article_preview = [], []
     for member in members:
         path = Path(member['path'])
         initial = path.stat()
@@ -873,7 +901,9 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
             for section, _, record in events:
                 if section != 'pages':
                     break
-                batch.append({**record, 'language': member['language']} if aggregate else record)
+                page = {**record, 'language': member['language']} if aggregate else record
+                add_article_preview(article_preview, record, member['language'] if aggregate else None)
+                batch.append(page)
                 count += 1
                 if len(batch) == 512:
                     summary.add_batch(json.dumps(batch, ensure_ascii=False))
@@ -892,7 +922,8 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
     creators_output = Path(output).with_name(Path(output).name.replace('-summary.json', '-creators.json'))
     if creators_output == Path(output):
         raise ValueError('Il file del riepilogo deve terminare con -summary.json')
-    write_summary_files(output, creators_output, metadata, total, report_json, sources)
+    write_summary_files(output, creators_output, metadata, total, report_json, sources,
+                        [page for _, page in article_preview])
 
 
 def iter_export_sections(path):
