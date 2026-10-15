@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
+MEASURES_RULE = 'creation_quality_creators_v2'
 ARTICLE_PREVIEW_LIMIT = 25
 
 
@@ -32,6 +33,7 @@ def prepared_summaries_match(summary_path, creators_path, metadata, sources, pag
         metadata_matches = summary_metadata == metadata
     count = summary.get('census_page_count')
     return (summary.get('format') == 'dashboard_summary_v1'
+            and summary.get('measures_rule') == MEASURES_RULE
             and summary.get('histogram_rule') == HISTOGRAM_RULE
             and isinstance(summary.get('reports'), dict)
             and isinstance(summary['reports'].get('overview'), dict)
@@ -276,7 +278,7 @@ def _comparison_schema(connection):
             PRIMARY KEY(language,id)) WITHOUT ROWID;''')
 
 
-def _comparison_analysis(raw, rules, topics, history=None):
+def _comparison_analysis(raw, rules, topics, history=None, quality=None):
     meta = raw['metadata']
     language = meta['language']
     database = wiki_database(language, meta.get('database'))
@@ -284,7 +286,7 @@ def _comparison_analysis(raw, rules, topics, history=None):
         raise ValueError('Usare esclusivamente dump SQL verificati')
     if meta.get('item_mapping') != {'source': 'page_props.wikibase_item', 'complete': True}:
         raise ValueError(f'{language}: identificativi interlingua non raccolti; importare un dump completo')
-    result = analyze(raw, rules, include_sources=True, topics=topics, history=history)
+    result = analyze(raw, rules, include_sources=True, topics=topics, history=history, quality=quality)
     result['metadata']['input_sha256'] = json_sha256(raw)
     return result
 
@@ -435,27 +437,27 @@ def _finish_comparison(connection):
     return results
 
 
-def compare_languages(raws, rules=None, topics=None, histories=None):
+def compare_languages(raws, rules=None, topics=None, histories=None, qualities=None):
     """Materialized comparison for small synthetic parity tests.
 
     Both paths share one matching algorithm. This API deliberately materializes
     its return value; use compare_files for large on-disk collections.
     """
-    topics, histories = topics or {}, histories or {}
+    topics, histories, qualities = topics or {}, histories or {}, qualities or {}
     languages = [r['metadata']['language'] for r in raws]
-    if set(topics) - set(languages) or set(histories) - set(languages):
+    if (set(topics) | set(histories) | set(qualities)) - set(languages):
         raise ValueError('Supplemento senza la corrispondente raccolta')
     with closing(sqlite3.connect(':memory:')) as connection:
         _comparison_schema(connection)
         for raw in raws:
             language = raw['metadata']['language']
             _stage_comparison(connection, _comparison_analysis(raw, rules, topics.get(language),
-                                                                histories.get(language)))
+                                                                histories.get(language), qualities.get(language)))
         return {lang: {**result, 'pages': list(result['pages']), 'link_candidates': dict(result['link_candidates'].items())}
                 for lang, result in _finish_comparison(connection).items()}
 
 
-def _comparison_file_worker(path, staging, rules, topics, histories, sender):
+def _comparison_file_worker(path, staging, rules, topics, histories, qualities, sender):
     """A sequential spawned worker releases all graph/JSON/native allocations."""
     try:
         from .dumps import _read_first_metadata
@@ -469,6 +471,10 @@ def _comparison_file_worker(path, staging, rules, topics, histories, sender):
         checkpoint = Path(path).with_name(Path(path).stem.removesuffix('-raw') + '-history.json')
         if history is None and checkpoint.exists():
             history = checkpoint
+        quality = qualities.get(language)
+        checkpoint = Path(path).with_name(Path(path).stem.removesuffix('-raw') + '-quality.json')
+        if quality is None and checkpoint.exists():
+            quality = checkpoint
         bounded = (Path(path).stat().st_size >= 128 * 1024**2 and
                    graph_metadata.get('source', '').startswith('Wikimedia SQL dumps / '))
         with closing(sqlite3.connect(staging)) as connection:
@@ -491,13 +497,14 @@ def _comparison_file_worker(path, staging, rules, topics, histories, sender):
                                    else None)
                 print(f'Analisi SQL a blocchi {language}', flush=True)
                 analyze_imported_dump(path, history, Path(staging).parent / 'comparison-analysis.json',
-                                      rules, import_work_dir, topic, comparison_connection=connection)
+                                      rules, import_work_dir, topic, comparison_connection=connection, quality_path=quality)
             else:
                 raw = json.loads(Path(path).read_text())
                 print(f'Analisi integrale {language}: {len(raw["pages"])} voci', flush=True)
                 predictions = json.loads(Path(topic).read_text()) if topic is not None else None
                 historical = json.loads(Path(history).read_text()) if history is not None else None
-                result = _comparison_analysis(raw, rules, predictions, historical)
+                quality_data = json.loads(Path(quality).read_text()) if quality is not None else None
+                result = _comparison_analysis(raw, rules, predictions, historical, quality_data)
                 del raw, predictions
                 print(f'Grafo {language} risolto; salvataggio degli indici su disco', flush=True)
                 _stage_comparison(connection, result)
@@ -516,7 +523,7 @@ def _comparison_file_worker(path, staging, rules, topics, histories, sender):
 
 
 @contextmanager
-def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None):
+def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None, qualities=None):
     """Sequential comparisons with verified SQL staging for large imported wikis.
 
     Each worker streams matchable edges, article observations and candidates to
@@ -535,7 +542,7 @@ def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None)
                 raise ValueError('Un solo supplemento per lingua')
             result[language] = str(path)
         return result
-    topics, histories = supplements(topics), supplements(histories)
+    topics, histories, qualities = supplements(topics), supplements(histories), supplements(qualities)
     context = multiprocessing.get_context('spawn')
     with tempfile.TemporaryDirectory(prefix='orphanwiki-compare-', dir=work_dir) as folder:
         staging = str(Path(folder) / 'comparison.sqlite')
@@ -545,7 +552,7 @@ def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None)
             for position, path in enumerate(paths, 1):
                 receiver, sender = context.Pipe(duplex=False)
                 worker = context.Process(target=_comparison_file_worker,
-                    args=(str(path), staging, rules, topics, histories, sender))
+                    args=(str(path), staging, rules, topics, histories, qualities, sender))
                 try:
                     worker.start()
                     sender.close()
@@ -571,12 +578,12 @@ def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None)
                     receiver.close()
                     sender.close()
                     worker.close()
-            if set(topics) - languages or set(histories) - languages:
+            if (set(topics) | set(histories) | set(qualities)) - languages:
                 raise ValueError('Supplemento senza la corrispondente raccolta')
             yield _finish_comparison(connection)
 
 
-def analyze(raw, rules=None, include_sources=False, topics=None, history=None):
+def analyze(raw, rules=None, include_sources=False, topics=None, history=None, quality=None):
     from .categories import classify
     language = raw['metadata']['language']
     wiki_database(language, raw['metadata'].get('database'))
@@ -602,12 +609,14 @@ def analyze(raw, rules=None, include_sources=False, topics=None, history=None):
         rows.append(observation_row(p, choices[p['page_id']], incoming, outgoing, creation_events))
     creator_metadata = initialize_creator_rows(rows)
     history_metadata = attach_history(rows, raw['metadata'], history)
+    quality_metadata = attach_quality(rows, raw['metadata'], quality) if quality is not None else None
+    reconstructed = history_metadata.get('creation_rule') == 'mediawiki_history_page_creation_v2'
     ages = article_ages(raw['metadata']['finished_at'],
-                        [r['page_created_at'] if creation_events else r['created_at'] for r in rows])
+                        [r['page_created_at'] if creation_events or reconstructed else r['created_at'] for r in rows])
     history_ages = article_ages(raw['metadata']['finished_at'],
                                 [r['history_first_revision_at'] for r in rows])
     for row, (age, after_collection), (history_age, _) in zip(rows, ages, history_ages):
-        row['created_at'] = row['page_created_at'] if creation_events else row['created_at']
+        row['created_at'] = row['page_created_at'] if creation_events or reconstructed else row['created_at']
         row['age_days'] = age
         row['history_first_revision_age_days'] = history_age
         if after_collection:
@@ -615,7 +624,9 @@ def analyze(raw, rules=None, include_sources=False, topics=None, history=None):
     result = {'metadata': {**raw['metadata'], 'creators': creator_metadata, 'history': history_metadata,
                          'unresolved_target_occurrences': unresolved,
                          'category_rule': 'structural_specificity_v1', 'category_rules': rules or {}, 'engine': 'rust',
-                         'age_rule': ('page_creation_event' if creation_events else
+                         'measures_rule': MEASURES_RULE,
+                         'age_rule': ('mediawiki_history_page_creation_v2' if reconstructed else
+                                      'page_creation_event' if creation_events else
                                       'unavailable_no_approved_creation_event' if raw['metadata'].get('source', '').startswith('Wikimedia SQL dumps / ')
                                       else 'first_public_revision_legacy'),
                          'historical_age_rule': ('mediawiki_history_first_observed_revision_v1'
@@ -624,9 +635,59 @@ def analyze(raw, rules=None, include_sources=False, topics=None, history=None):
     if topics is not None:
         result['metadata']['topics'] = attach_topics(rows, raw, topics)
         result['metadata']['article_features'] = {**result['metadata'].get('article_features', {}), 'topics': 'local_model_predictions'}
+    if quality_metadata is not None:
+        result['metadata']['quality'] = quality_metadata
+        result['metadata']['article_features'] = {**result['metadata'].get('article_features', {}), 'quality': 'johnson_v2_2022_01'}
+    if reconstructed:
+        result['metadata']['article_features'] = {**result['metadata'].get('article_features', {}),
+                                                 'age': 'MediaWiki History / page_creation_timestamp'}
     if include_sources:
         result['_incoming_sources'] = sources
     return result
+
+
+def quality_metadata(meta, graph, count, file_checksum=None):
+    approved = json.loads((Path(__file__).resolve().parents[1] / 'config/quality.json').read_text())
+    if (meta.get('language') != graph.get('language') or meta.get('database') != graph.get('database')
+            or meta.get('sql_release') != graph.get('sql_release') or meta.get('complete') is not True
+            or meta.get('source') != 'Johnson V2 / mediawiki_content_current' or meta.get('model') != approved
+            or meta.get('dump_manifest_sha256') != graph.get('dump_manifest_sha256')
+            or meta.get('graph_finished_at') != graph.get('finished_at')
+            or meta.get('census_page_count') != count
+            or type(meta.get('scored_pages')) is not int or not 0 <= meta['scored_pages'] <= count
+            or meta.get('missing_pages') != count - meta['scored_pages']
+            or (file_checksum is not None and meta.get('input_file_sha256') != file_checksum)):
+        raise ValueError('Qualità non corrispondente al grafo SQL completo')
+    normalizers = meta.get('normalizers')
+    if (not isinstance(normalizers, list) or len(normalizers) != 6 or
+            any(type(value) not in (int, float) or not 0 < value < float('inf') for value in normalizers)):
+        raise ValueError('Normalizzatori qualità non validi')
+    return {**meta, 'status': 'collected'}
+
+
+def _join_quality_rows(rows, by_id):
+    for row in rows:
+        record = by_id.get(row['page_id'])
+        if record is None or record.get('revision_id') != row.get('revision_id'):
+            raise ValueError('Qualità mancante o revisione diversa')
+        score, status = record.get('quality_score'), record.get('quality_status')
+        if (status not in ('scored', 'missing_current_page', 'revision_mismatch', 'missing_wikitext')
+                or (status == 'scored' and (type(score) not in (float, int) or not 0 <= score <= 0.998001))
+                or (status != 'scored' and score is not None)):
+            raise ValueError('Punteggio qualità non valido')
+        row.update(quality_score=score, quality_status=status)
+
+
+def attach_quality(rows, graph, supplement):
+    meta = quality_metadata(supplement.get('metadata', {}), graph, len(rows))
+    records = supplement.get('pages', [])
+    by_id = {record['page_id']: record for record in records}
+    if len(by_id) != len(records) or set(by_id) != {row['page_id'] for row in rows}:
+        raise ValueError('Censimento qualità incompleto o duplicato')
+    _join_quality_rows(rows, by_id)
+    if sum(row['quality_status'] == 'scored' for row in rows) != meta.get('scored_pages'):
+        raise ValueError('Copertura qualità incoerente')
+    return {**meta, 'input_sha256': json_sha256(supplement)}
 
 
 def observation_row(page, choice, incoming, outgoing, creation_events=False):
@@ -690,7 +751,7 @@ OBSERVATION_COLUMNS = (
     'history_creator_key', 'history_creator_status', 'history_data_status',
     'creator_groups_at_creation_history', 'creator_continuity_months_before_creation',
     'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history',
-    'creator_prior_edits_other_history',
+    'creator_prior_edits_other_history', 'quality_score', 'quality_status',
 )
 
 
@@ -849,6 +910,7 @@ def write_summary_files(summary_path, creators_path, metadata, count, report_jso
     reports['categories'] = reports['categories'][:20]
     shared = {'metadata': metadata, 'sources': sources, 'census_page_count': count}
     write_json(summary_path, {'format': 'dashboard_summary_v1', 'histogram_rule': HISTOGRAM_RULE,
+                             'measures_rule': MEASURES_RULE,
                               **shared, 'reports': reports, 'article_preview': article_preview})
     write_json(creators_path, {'format': 'creator_index_v1', **shared, 'creators': creators})
 
@@ -1129,9 +1191,13 @@ def _join_history_rows(rows, by_id, missing_status='missing_page'):
         record = by_id.get(row['page_id'])
         if record is None:
             continue
+        if 'page_created_at' in record:
+            row.update(page_created_at=record['page_created_at'], created_at=record['page_created_at'],
+                       creation_date_source='MediaWiki History / page_creation_timestamp',
+                       creation_date_status=record.get('creation_date_status', 'missing_history_creation'))
         historical_date = record.get('article_created_at')
         if not historical_date:
-            row['history_data_status'] = 'history_creation_unknown'
+            row['history_data_status'] = 'history_initial_revision_unknown'
             continue
         row['history_first_revision_at'] = historical_date
         row['history_creator_status'] = record.get('creator_attribution')
@@ -1139,6 +1205,13 @@ def _join_history_rows(rows, by_id, missing_status='missing_page'):
             row['history_data_status'] = 'unattributed_history'
             continue
         row.update(history_creator_key=record.get('creator_key'),
+                   creator_registered_at=record.get('creator_registered_at'),
+                   creator_tenure_days=record.get('creator_tenure_days'),
+                   creator_tenure_status=('local_registration_to_reconstructed_creation'
+                                         if record.get('creator_tenure_days') is not None else 'missing_or_inconsistent_registration'),
+                   creator_prior_articles=record.get('creator_prior_articles'),
+                   creator_account_type=record.get('creator_account_type'),
+                   creator_is_bot_now=record.get('creator_is_bot_now'),
                    creator_groups_at_creation_history=record.get('creator_groups_at_creation'),
                    creator_continuity_months_before_creation=record.get('creator_continuity_months_before_creation'),
                    creator_continuity_bucket_before_creation=record.get('creator_continuity_bucket_before_creation'),

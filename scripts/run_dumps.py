@@ -96,24 +96,32 @@ def fetched_files(record):
     return [Path(item['path']) for item in record['files'].values()]
 
 
-def imported_files_match(graph, history, stage, manifest_path, manifest):
+def imported_files_match(graph, history, stage, manifest_path, manifest, history_required=True):
     """Reuse an import only when source identities and staging agree."""
-    if not all(complete_json(path) for path in (graph, history)) or signature(stage) is None:
+    if not all(complete_json(path) for path in ((graph, history) if history_required else (graph,))) or signature(stage) is None:
         return False
     try:
-        from orphanwiki.dumps import SQL_TABLES, _read_first_metadata
+        from orphanwiki.dumps import SQL_TABLES, _read_first_metadata, HISTORY_RULE
         graph_meta = _read_first_metadata(graph)
-        history_meta = _read_first_metadata(history)
+        history_meta = _read_first_metadata(history) if history_required else {}
         if (graph_meta.get('source') != 'Wikimedia SQL dumps / ' + manifest['database']
                 or graph_meta.get('language') != manifest['language']
                 or graph_meta.get('sql_release') != manifest['sql_release']
                 or graph_meta.get('complete') is not True
-                or graph_meta.get('dump_manifest_sha256') != checksum(manifest_path)
-                or history_meta.get('source') != 'MediaWiki History dumps / ' + manifest['database']
+                or graph_meta.get('dump_manifest_sha256') != checksum(manifest_path)):
+            return False
+        with sqlite3.connect(stage.resolve().as_uri() + '?mode=ro', uri=True) as connection:
+            sql = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
+            if any(sql.get(name) != manifest['files'][name]['sha256_local'] for name in SQL_TABLES):
+                return False
+            if not history_required:
+                return True
+        if (history_meta.get('source') != 'MediaWiki History dumps / ' + manifest['database']
                 or history_meta.get('language') != manifest['language']
                 or history_meta.get('sql_release') != manifest['sql_release']
                 or history_meta.get('history_release') != manifest['history_release']
-                or history_meta.get('complete') is not True):
+                or history_meta.get('complete') is not True
+                or history_meta.get('creation_rule') != HISTORY_RULE):
             return False
         history_files = {name: item['sha256_local'] for name, item in manifest['files'].items()
                          if name.endswith('.tsv.bz2')}
@@ -124,9 +132,11 @@ def imported_files_match(graph, history, stage, manifest_path, manifest):
             scanned = {(name, phase): digest for name, phase, digest in
                        connection.execute('SELECT file,phase,sha256 FROM history_imported')}
         return (all(sql.get(name) == manifest['files'][name]['sha256_local'] for name in SQL_TABLES)
-                and all(scanned.get((name, phase)) == digest
+                and all(scanned.get((name, phase)) == digest + ':' + HISTORY_RULE
                         for name, digest in history_files.items()
-                        for phase in ('initial', 'activity')))
+                        for phase in ('initial',))
+                and all(scanned.get((name, 'activity'), '').startswith(digest + ':')
+                        for name, digest in history_files.items()))
     except (OSError, ValueError, KeyError, sqlite3.Error):
         return False
 
@@ -204,19 +214,22 @@ def prepared_summary_matches(output_dir, entry, filenames):
         return False
 
 
-def collected_metadata_matches(meta, language, database, manifest_hash, topic_spec):
+def collected_metadata_matches(meta, language, database, manifest_hash, topic_spec, measures=None):
     """Check the source and complete topic supplement expected by the pipeline."""
     topics = meta.get('topics')
     return (meta.get('language') == language
             and meta.get('database') == database
             and meta.get('source') == 'Wikimedia SQL dumps / ' + database
             and meta.get('dump_manifest_sha256') == manifest_hash
-            and meta.get('historical_age_rule') == 'mediawiki_history_first_observed_revision_v1'
+            and meta.get('age_rule') == 'mediawiki_history_page_creation_v2'
+            and meta.get('measures_rule') == 'creation_quality_creators_v2'
+            and (measures is None or all(all(meta.get(section, {}).get(key) == value for key, value in expected.items())
+                for section, expected in measures.items()))
             and isinstance(topics, dict) and topics.get('status') == 'predicted'
             and topics.get('model') == topic_spec)
 
 
-def comparison_matches(output_dir, selected, manifest_hashes, topic_spec):
+def comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures=None):
     languages = [language for language, _ in selected]
     manifest = output_dir / 'manifest.json'
     if not complete_json(manifest):
@@ -240,7 +253,7 @@ def comparison_matches(output_dir, selected, manifest_hashes, topic_spec):
             for language, database in selected:
                 meta = members[language]['metadata']
                 if (not collected_metadata_matches(meta, language, database,
-                                                   manifest_hashes[language], topic_spec)
+                                                   manifest_hashes[language], topic_spec, measures.get(language) if measures else None)
                         or meta.get('comparison', {}).get('status') != 'compared'
                         or set(meta['comparison'].get('reference_languages', [])) != set(languages) - {language}):
                     break
@@ -255,7 +268,7 @@ def comparison_matches(output_dir, selected, manifest_hashes, topic_spec):
         return None
 
 
-def analysis_matches(output_dir, language, database, manifest_hash, topic_spec):
+def analysis_matches(output_dir, language, database, manifest_hash, topic_spec, measures=None):
     manifest = output_dir / 'manifest.json'
     if not complete_json(manifest):
         return None
@@ -272,7 +285,7 @@ def analysis_matches(output_dir, language, database, manifest_hash, topic_spec):
             if not complete_json(source):
                 continue
             meta = _read_first_metadata(source)
-            if not collected_metadata_matches(meta, language, database, manifest_hash, topic_spec):
+            if not collected_metadata_matches(meta, language, database, manifest_hash, topic_spec, measures):
                 continue
             paths = approved_outputs(output_dir, {language: filename})
             if paths is not None:
@@ -280,6 +293,33 @@ def analysis_matches(output_dir, language, database, manifest_hash, topic_spec):
         return None
     except (OSError, ValueError, KeyError):
         return None
+
+
+def reusable_graph_exports(output_dir, selected, manifest_hashes, topic_spec):
+    """Graph/topic identity allows refreshing measures without repeating edges."""
+    from orphanwiki.dumps import _read_first_metadata
+    try:
+        entries = json.loads((output_dir / 'manifest.json').read_text())
+        languages = {code for code, _ in selected}
+        for language, database in selected:
+            matches = [e for e in entries if e.get('language') == language and e.get('kind', 'wiki') == 'wiki' and not e.get('demo')]
+            if not matches:
+                return False
+            entry = max(matches, key=lambda e: (e.get('date', ''), e.get('published_at', '')))
+            if not isinstance(entry.get('file'), str) or Path(entry['file']).name != entry['file']:
+                return False
+            meta = _read_first_metadata(output_dir / entry['file'])
+            if (meta.get('complete') is not True or meta.get('source') != 'Wikimedia SQL dumps / ' + database
+                    or meta.get('dump_manifest_sha256') != manifest_hashes[language]
+                    or meta.get('topics', {}).get('model') != topic_spec
+                    or meta.get('topics', {}).get('status') != 'predicted'):
+                return False
+            if len(selected) > 1 and (meta.get('comparison', {}).get('status') != 'compared'
+                    or set(meta['comparison'].get('reference_languages', [])) != languages - {language}):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def log_line(log, message):
@@ -329,6 +369,7 @@ def interrupt_for_shutdown(_signum, _frame):
 
 def run_pipeline(args, log):
     from orphanwiki.core import configured_languages
+    from orphanwiki.dumps import HISTORY_RULE, _read_first_metadata
     configured = configured_languages(project_path(args.languages_file))
     if args.languages:
         if len(args.languages) != len(set(args.languages)) or set(args.languages) - {code for code, _ in configured}:
@@ -355,6 +396,8 @@ def run_pipeline(args, log):
              '--history-release', args.history_release, '--root', str(dump_root)]
     if args.plan:
         run_step(log, 'piano dei download', [*fetch, '--plan'])
+        run_step(log, 'piano contenuto corrente', [*base, 'fetch-content', *source, '--languages', *languages,
+                 '--content-release', args.content_release, '--root', str(dump_root), '--plan'])
         return
     manifests = [manifest_for(dump_root, language, database, args.sql_release, args.history_release)
                  for language, database in selected]
@@ -398,11 +441,16 @@ def run_pipeline(args, log):
         history = import_dir / f'{language}-history.json'
         stage = work_dir / f'{database}-{args.sql_release}.sqlite'
         import_inputs = {'manifest_sha256': manifest_hashes[language],
-                         'graph': str(graph), 'history': str(history), 'stage': str(stage)}
+                         'graph': str(graph), 'history': str(history), 'stage': str(stage), 'history_rule': HISTORY_RULE}
         outputs = [graph, history, stage]
         if not args.force and (state.matches(f'import:{language}', import_inputs, outputs) or imported_files_match(
                 graph, history, stage, manifest, metadata)):
             log_line(log, f'SALTA importazione {language}: grafo, cronologia e checkpoint già completi')
+            state.save(f'import:{language}', import_inputs, outputs)
+        elif not args.force and imported_files_match(graph, history, stage, manifest, metadata, history_required=False):
+            run_step(log, f'aggiornamento cronologia {language}',
+                     [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
+                      '--work-dir', str(work_dir)])
             state.save(f'import:{language}', import_inputs, outputs)
         else:
             run_step(log, f'importazione {language}',
@@ -443,9 +491,59 @@ def run_pipeline(args, log):
             if not topics_match(checkpoint, graph, checksum(graph), language, topic_spec,
                                 census_by_language[language]):
                 raise ValueError(f'Inferenza dei temi incompleta per {language}; ripetere lo script')
+    content_source = ['--languages-file', str(project_path(args.languages_file)), '--languages', *languages,
+                      '--content-release', args.content_release, '--root', str(dump_root)]
+    content_outputs = []
+    for language, database in selected:
+        path = dump_root / database / f'content-{args.content_release}.json'
+        if complete_json(path):
+            document = json.loads(path.read_text())
+            content_outputs.extend([path, *fetched_files(document)])
+    content_inputs = {'languages': [list(pair) for pair in selected], 'release': args.content_release}
+    if len(content_outputs) < len(selected) or not state.matches('content-fetch', content_inputs, content_outputs):
+        run_step(log, 'contenuto corrente verificato', [*base, 'fetch-content', *content_source])
+        content_outputs = []
+        for _, database in selected:
+            path = dump_root / database / f'content-{args.content_release}.json'
+            content_outputs.extend([path, *fetched_files(json.loads(path.read_text()))])
+        state.save('content-fetch', content_inputs, content_outputs)
+    for language, database in selected:
+        graph = import_dir / f'{language}-raw.json'
+        manifest = dump_root / database / f'content-{args.content_release}.json'
+        quality = import_dir / f'{language}-quality.json'
+        inputs = {'graph_sha256': checksum(graph), 'manifest_sha256': checksum(manifest),
+                  'model_sha256': checksum(PROJECT_ROOT / 'config/quality.json')}
+        if not state.matches(f'quality:{language}', inputs, [quality]):
+            run_step(log, f'qualità {language}', [*base, 'quality', '--languages-file', str(project_path(args.languages_file)),
+                '--languages', language, '--content-release', args.content_release, '--root', str(dump_root),
+                '--input-dir', str(import_dir), '--output-dir', str(import_dir), '--work-dir', str(work_dir)])
+            state.save(f'quality:{language}', inputs, [quality])
+    measures = {}
+    for language in languages:
+        measures[language] = {'history': _read_first_metadata(import_dir / f'{language}-history.json')}
+        quality = import_dir / f'{language}-quality.json'
+        if quality.is_file():
+            measures[language]['quality'] = _read_first_metadata(quality)
+    if not args.force and reusable_graph_exports(output_dir, selected, manifest_hashes, topic_spec):
+        if len(selected) > 1:
+            current = comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures)
+        else:
+            current = analysis_matches(output_dir, languages[0], databases[languages[0]], manifest_hashes[languages[0]], topic_spec, measures[languages[0]])
+        if current:
+            log_line(log, 'SALTA confronto interlingua: osservazioni e misure già aggiornate' if len(selected) > 1
+                     else 'SALTA analisi: osservazioni e misure già aggiornate')
+            return
+        run_step(log, 'aggiornamento misure senza ricalcolo del grafo', [*base, 'refresh-measures',
+                 '--languages-file', str(project_path(args.languages_file)), '--languages', *languages,
+                 '--input-dir', str(import_dir), '--data-dir', str(output_dir)])
+        current = (comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures) if len(selected) > 1
+                   else analysis_matches(output_dir, languages[0], databases[languages[0]], manifest_hashes[languages[0]], topic_spec, measures[languages[0]]))
+        if not current:
+            raise ValueError('Aggiornamento misure senza pubblicazione completa')
+        return
     if len(selected) > 1:
         existing = None if args.force else comparison_matches(
-            output_dir, selected, manifest_hashes, topic_spec)
+            output_dir, selected, manifest_hashes, topic_spec, measures)
         if existing:
             log_line(log, 'SALTA confronto interlingua: aggregato e candidate già pubblicati')
             return
@@ -453,19 +551,19 @@ def run_pipeline(args, log):
                  [*base, 'compare', *(str(path) for path in graph_paths),
                   '--histories', *(str(import_dir / f'{language}-history.json') for language in languages),
                   '--output-dir', str(output_dir), '--work-dir', str(work_dir)])
-        if not comparison_matches(output_dir, selected, manifest_hashes, topic_spec):
+        if not comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures):
             raise ValueError('Confronto terminato senza pubblicazione completa di tutte le lingue')
         return
     language = languages[0]
     output = output_dir / f'{language}-{args.sql_release}-{args.history_release}.json'
     if not args.force and analysis_matches(
-            output_dir, language, databases[language], manifest_hashes[language], topic_spec):
+            output_dir, language, databases[language], manifest_hashes[language], topic_spec, measures.get(language) if measures else None):
         log_line(log, f'SALTA analisi {language}: export già pubblicato')
         return
     run_step(log, f'analisi {language}',
              [*base, 'analyze', str(graph_paths[0]), '--history', str(import_dir / f'{language}-history.json'),
               '--output', str(output), '--work-dir', str(work_dir)])
-    if not analysis_matches(output_dir, language, databases[language], manifest_hashes[language], topic_spec):
+    if not analysis_matches(output_dir, language, databases[language], manifest_hashes[language], topic_spec, measures.get(language) if measures else None):
         raise ValueError(f'Analisi {language} terminata senza pubblicazione completa')
 
 
@@ -476,6 +574,8 @@ def main(argv=None):
     parser.add_argument('--languages', nargs='+', help='Sottoinsieme della configurazione, senza cambiare gli algoritmi')
     parser.add_argument('--sql-release', required=True, help='Release SQL: YYYYMMDD')
     parser.add_argument('--history-release', required=True, help='Release History: YYYY-MM')
+    parser.add_argument('--content-release',
+                        help='Release del contenuto corrente per Johnson V2: YYYY-MM-DD; predefinita: data della release SQL')
     parser.add_argument('--dump-root', default='data/dumps')
     parser.add_argument('--import-dir', default='data/imported')
     parser.add_argument('--output-dir', default='web/data')
@@ -490,12 +590,24 @@ def main(argv=None):
     parser.add_argument('--force', action='store_true', help='Ricalcola tutte le fasi, mantenendo i download verificati')
     parser.add_argument('--plan', action='store_true', help='Solo piano dei download, senza importare')
     args = parser.parse_args(argv)
+    try:
+        sql_date = datetime.strptime(args.sql_release, '%Y%m%d')
+        if sql_date.strftime('%Y%m%d') != args.sql_release:
+            raise ValueError('Release SQL: usare YYYYMMDD')
+        if args.content_release is None:
+            args.content_release = sql_date.strftime('%Y-%m-%d')
+        content_date = datetime.strptime(args.content_release, '%Y-%m-%d')
+        if content_date.strftime('%Y-%m-%d') != args.content_release:
+            raise ValueError('Release del contenuto: usare YYYY-MM-DD')
+    except ValueError as error:
+        parser.error(str(error))
     log_dir = project_path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     name = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     log_path = log_dir / f'dumps-{name}-{os.getpid()}.log'
     with log_path.open('x', encoding='utf-8', buffering=1) as log:
         log_line(log, f'LOG {log_path}')
+        log_line(log, f'RELEASE SQL {args.sql_release}; History {args.history_release}; contenuto {args.content_release}')
         previous_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, interrupt_for_shutdown)
         try:

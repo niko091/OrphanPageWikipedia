@@ -1,10 +1,10 @@
 'use strict';
 // Static interface and transport contracts; analytical work belongs to Rust.
 // PyO3 prepares observations; WebAssembly computes displayed statistics.
-type MetricField = 'age_days' | 'history_first_revision_age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'creator_prior_edits_other' |
+type MetricField = 'age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'creator_prior_edits_other' |
   'creator_prior_articles' | 'creator_tenure_days' | 'creator_articles_created_total' | 'creator_orphans_current' |
   'creator_continuity_months_before_creation' | 'creator_prior_edits_main_history' |
-  'creator_prior_edits_other_history';
+  'creator_prior_edits_other_history' | 'quality_score';
 type PageObservation = Partial<Record<MetricField, number | null>> & {
   page_id: number; title: string; orphan: boolean; language?: string;
   category?: string | null; category_status?: string; revision_id?: number | null;
@@ -14,6 +14,7 @@ type PageObservation = Partial<Record<MetricField, number | null>> & {
   history_creator_key?: string | null;
   creator_is_bot_now?: boolean | null; creator_languages_created?: string[] | null;
   creator_groups_at_creation_history?: string[] | null;
+  quality_status?: string | null;
   topic_status?: string | null; topic_labels?: string[] | null; origin?: string | null;
 };
 interface CreatorMetadata {
@@ -23,7 +24,6 @@ interface CreatorMetadata {
 interface HistoryMetadata { status: string; language?: string; matched_pages?: number; }
 interface DatasetMetadata {
   language: string; complete?: boolean; demo?: boolean; kind?: string; age_rule?: string;
-  historical_age_rule?: string;
   started_at: string; finished_at: string; languages?: string[]; creators?: CreatorMetadata;
   history?: HistoryMetadata; comparison_coverage?: 'complete' | 'partial';
   topics?: {status?: string};
@@ -82,7 +82,7 @@ function metricValue(value: unknown): number | null { return typeof value==='num
 interface CategoryReportRow { label: string; total: number; orphans: number; percent: number | null; }
 interface ProfilesReport {
   topics: FeatureSummary; macrothemes: FeatureSummary; features: FeatureSummary;
-  thresholds: Record<string, [number | null, number | null]>;
+  thresholds: Record<string, [number | null, number | null, number | null]>;
 }
 interface NumericGroup {
   total: number; known: number; missing: number; median: number | null;
@@ -95,7 +95,7 @@ interface OverviewReport {
   attributed_orphans: number; missing_creators: number; distinct_creators: number;
 }
 interface DashboardSummaryData {
-  format: 'dashboard_summary_v1'; metadata: DatasetMetadata; census_page_count: number;
+  format: 'dashboard_summary_v1'; measures_rule: string; metadata: DatasetMetadata; census_page_count: number;
   article_preview?: PageObservation[];
   reports: {
     overview: OverviewReport; categories: CategoryReportRow[]; profiles: ProfilesReport;
@@ -230,6 +230,21 @@ const translations: Record<string, string> = {
   "Caratteristiche delle voci: confronto per requisito": "Article characteristics: comparison by feature",
   "Nuove e vecchie rispetto alla mediana di ogni lingua; lunghezza come confronto aggiuntivo.": "New and old relative to each language’s median; length as an additional comparison.",
   "Voci nuove (< mediana)": "New articles (< median)",
+  "Qualità strutturale alta (Johnson V2, ≥ mediana)": "High structural quality (Johnson V2, ≥ median)",
+  "Qualità strutturale bassa (Johnson V2, < mediana)": "Low structural quality (Johnson V2, < median)",
+  "Qualità strutturale stimata con Johnson V2 dal wikitesto. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura esclude revisioni diverse dal grafo e contenuti mancanti.": "Structural quality estimated with Johnson V2 from wikitext. Split at each edition’s median; scores are not an absolute scale across languages. Coverage excludes revisions different from the graph and missing content.",
+  "Anzianità locale alla creazione ricostruita": "Local account age at reconstructed page creation",
+  "Bot (data del dump)": "Bot (dump date)",
+  "Senza flag bot (data del dump)": "No bot flag (dump date)",
+  "Flag bot locale alla data del dump SQL; senza flag non significa umano. Disponibile per {n}/{total} voci. Ogni barra mostra orfane/tutte le voci del gruppo.": "Local bot flag at SQL dump date; no flag does not mean human. Available for {n}/{total} articles. Each bar shows orphans/all articles in the group.",
+  "Gruppi del creatore alla prima revisione": "Creator groups at the first revision",
+  "Età dalla creazione ricostruita": "Age since reconstructed page creation",
+  "Età dalla creazione ricostruita con page_creation_timestamp di MediaWiki History alla raccolta del grafo. È la stessa età usata per distinguere le voci nuove e vecchie rispetto alla mediana di ogni lingua; date mancanti escluse.": "Age from reconstructed creation using MediaWiki History page_creation_timestamp to graph collection. The same age defines new and old articles relative to each language’s median; missing dates are excluded.",
+  "Tipo account alla data del dump": "Account type at dump date",
+  "Senza flag bot": "No bot flag",
+  "Voci del censimento attribuite prima di questa voce": "Census articles attributed before this article",
+  "Altre voci del censimento attribuite allo stesso autore locale con creazione ricostruita strettamente precedente; copertura limitata alle date note. Disponibile per {n}/{total} voci.": "Other census articles attributed to the same local author with strictly earlier reconstructed creation; coverage restricted to known dates. Available for {n}/{total} articles.",
+  "Registrazione locale fino alla creazione ricostruita; date mancanti o incoerenti restano indisponibili. Disponibile per {n}/{total} voci.": "Local registration to reconstructed creation; missing or inconsistent dates remain unavailable. Available for {n}/{total} articles.",
   "Voci vecchie (≥ mediana)": "Old articles (≥ median)",
   "Lunghezza minore (< mediana)": "Shorter articles (< median)",
   "Lunghezza maggiore (≥ mediana)": "Longer articles (≥ median)",
@@ -251,7 +266,6 @@ const translations: Record<string, string> = {
   "Nessuna pagina candidata disponibile per preparare il prompt.": "No candidate pages are available to prepare the prompt.",
   "Tutte le lingue": "All languages",
   "Scarica l’indice delle raccolte JSON": "Download the dataset index as JSON",
-  "Date con criteri diversi tra lingue: creazione osservata oppure prima revisione pubblica.": "Different date criteria across languages: observed creation or earliest public revision.",
   "Indice aggregato non valido": "Invalid aggregate index",
   "Interfaccia italiana: passa all’inglese": "Italian interface: switch to English",
   "Interfaccia inglese: passa all’italiano": "English interface: switch to Italian",
@@ -289,10 +303,6 @@ const translations: Record<string, string> = {
   "Mostra": "Show",
   "Percentuale di orfane": "Orphan percentage",
   "Numero di orfane": "Orphan count",
-  "Età delle voci": "Article age",
-  "Età dalla prima revisione osservata": "Age since first observed revision",
-  "Anni dalla creazione della pagina": "Years since page creation",
-  "Anni dalla prima revisione registrata in MediaWiki History alla raccolta del grafo; non è una data di creazione verificata.": "Years since the first revision recorded in MediaWiki History at graph collection; this is not a verified creation date.",
   "Lunghezza delle voci": "Article length",
   "Byte del wikitesto, asse logaritmico": "Wikitext bytes, logarithmic axis",
   "Esplora le voci": "Explore articles",
@@ -334,7 +344,7 @@ const translations: Record<string, string> = {
   "Voci attribuite al creatore storico nel censimento": "Articles attributed to the historical creator in the census",
   "Orfane attuali attribuite al creatore storico": "Current orphans attributed to the historical creator",
   "Attribuzione ricostruita dalla prima revisione in MediaWiki History; conteggio delle voci ancora nel censimento, non totale delle creazioni dell’account. Disponibile per {n}/{total} voci.": "Attribution reconstructed from the first revision in MediaWiki History; count of articles still in this census, not the account’s total creations. Available for {n}/{total} articles.",
-  "Modifiche strettamente precedenti alla prima revisione osservata in MediaWiki History; non equivalgono alla creazione verificata tramite log. Disponibile per {n}/{total} voci.": "Edits strictly before the first revision observed in MediaWiki History; this is not equivalent to creation verified by logs. Available for {n}/{total} articles.",
+  "Modifiche pubbliche strettamente precedenti alla creazione ricostruita in MediaWiki History; copertura limitata alla cronologia disponibile. Disponibile per {n}/{total} voci.": "Public edits strictly before reconstructed page creation in MediaWiki History; coverage restricted to available history. Available for {n}/{total} articles.",
   "Questa misura non è ricostruibile dai dump attuali; il grafico resta visibile senza valori. Disponibile per {n}/{total} voci.": "This measure cannot be reconstructed from the current dumps; the chart remains visible without values. Available for {n}/{total} articles.",
   "Continuità prima della creazione": "Continuity before article creation",
   "Gruppi del creatore alla creazione": "Creator groups at article creation",
@@ -431,15 +441,13 @@ const translations: Record<string, string> = {
   "Dataset non disponibile": "Dataset unavailable",
   "Codice lingua non valido": "Invalid language code",
   "Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali": "Dataset contains external enrichment: regenerate results from the official dumps",
-  "Anni dalla creazione della pagina; date non determinabili escluse.": "Years since page creation; unknown dates excluded.",
-  "Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.": "Legacy dataset: years since the earliest available public revision; creation date is undetermined.",
   "DEMO · Dati sintetici per verificare il sistema. Questi non sono risultati di Wikipedia.": "DEMO · Synthetic data for testing. These are not Wikipedia results.",
   "Pagine orfane": "Orphan pages",
   "Orfane con creatore attribuito": "Orphans with attributed creator",
   "Creatori distinti delle orfane attribuite": "Distinct creators of attributed orphans",
   "Orfane con creatore storico ricostruito": "Orphans with reconstructed historical creator",
   "Creatori storici distinti delle orfane": "Distinct historical creators of orphan articles",
-  "{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo di account e totale delle creazioni non disponibili.": "{n} reconstructed creators · {shown} shown. Local historical IDs; attribution from the first observed revision. Account type and lifetime creations are unavailable.",
+  "{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo account alla data del dump; conteggi limitati alle voci attribuite nel censimento.": "{n} reconstructed creators · {shown} shown. Local historical IDs; attribution from the first observed revision. Account type and lifetime creations are unavailable.",
   "Orfane senza creatore attribuito": "Orphans without attributed creator",
   "Voci analizzate": "Analyzed articles",
   "Percentuale orfane": "Orphan percentage",
@@ -466,8 +474,6 @@ const translations: Record<string, string> = {
   "{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.": "{n} candidate pages · {shown} displayed. Review the content before adding a link.",
   "Collegamento da valutare in {language}": "Proposed link in {language}",
   "Collegamento esistente in {language}": "Existing link in {language}",
-  "Data di creazione non disponibile nei dump SQL; la cronologia storica non prova automaticamente la creazione della pagina.": "Creation date is unavailable in the SQL dumps; reconstructed history does not automatically prove page creation.",
-  "Date con criteri diversi tra lingue: creazione osservata, prima revisione pubblica o dato non disponibile.": "Date definitions differ between languages: observed creation, first public revision, or unavailable data.",
   "Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.": "Unable to load: {error}. Run the dump pipeline and serve the web folder over HTTP.",
   "Voci attribuite ad account bot": "Articles attributed to bot accounts",
   "Bot (stato attuale)": "Bot (current status)",
@@ -718,7 +724,8 @@ function paperProfiles() {
     pageLanguage(page), page.orphan,
     page.topic_status==='predicted'&&Array.isArray(page.topic_labels)?page.topic_labels:null,
     page.page_created_at?metricValue(page.age_days):null,
-    metricValue(page.length_bytes)
+    metricValue(page.length_bytes),
+    page.quality_status==='scored'?metricValue(page.quality_score):null
   ]));
   for(const row of report.topics.rows)row.label=topicDisplayNames.get(row.label)??row.label;
   featureBars('topics-full',report.topics,$('topics-full-metric')!.value==='count');
@@ -728,12 +735,12 @@ function paperProfiles() {
     'I temi del modello non sono presenti nella raccolta. Nessun tema viene dedotto dalle categorie o dal genere della voce.')));
   const featureLabels: Record<string,string> = {
     new:'Voci nuove (< mediana)',old:'Voci vecchie (≥ mediana)',
-    quality_high:'Qualità alta (Johnson 2021)',quality_low:'Qualità bassa (Johnson 2021)',
+    quality_high:'Qualità strutturale alta (Johnson V2, ≥ mediana)',quality_low:'Qualità strutturale bassa (Johnson V2, < mediana)',
     short:'Lunghezza minore (< mediana)',long:'Lunghezza maggiore (≥ mediana)'
   };
   for(const row of report.features.rows)row.label=t(featureLabels[row.label]);
   featureBars('features-paper',report.features);
-  $('features-paper')!.append(element('p',t('La qualità richiede conteggi di riferimenti, sezioni e immagini non presenti nella raccolta attuale.')));
+  $('features-paper')!.append(element('p',t('Qualità strutturale stimata con Johnson V2 dal wikitesto. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura esclude revisioni diverse dal grafo e contenuti mancanti.')));
 }
 function categories() {
   const ordered=precomputed?.reports.categories??calculateReport<CategoryReportRow[]>('categories',data.pages.map(page=>[label(page),page.orphan]));
@@ -756,7 +763,7 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   const report=precomputed?.reports.numeric[summaryKey]??calculateReport<NumericReport>('numeric',{
     rows:data.pages.map(page=>[page.orphan,valueFor?valueFor(page):metricValue(page[field])]),
     logarithmic:field==='length_bytes'||logarithmic,
-    age:field==='age_days'||field==='history_first_revision_age_days'
+    age:field==='age_days'
   });
   const groups=report.groups,totals=groups.map(group=>group.total);
   if(!report.available) {
@@ -809,7 +816,7 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
     const x=histogram&&groupedTails?(1+index*18/4)/20:index/4;
     svg.append(svgNode('text',{x:left+x*plotWidth,y:bottom+30,'text-anchor':index===0?'start':index===4?'end':'middle',fill:'var(--muted)','font-size':16},tick));
   }
-  svg.append(svgNode('text',{x:left+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel || (field==='age_days'||field==='history_first_revision_age_days'?t('Età (anni)'):t('Lunghezza (byte, scala logaritmica)'))));
+  svg.append(svgNode('text',{x:left+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel || (field==='age_days'?t('Età (anni)'):t('Lunghezza (byte, scala logaritmica)'))));
   box.append(svg);
   const orphanMedian=groups[0].median,otherMedian=groups[1].median;
   box.append(element('p',t('Mediana orfane: {a} {unit} (n={n}) · Non orfane: {b} {unit} (n={m})',{a:number(orphanMedian),b:number(otherMedian),unit,n:groups[0].known,m:groups[1].known})));
@@ -844,18 +851,19 @@ function creatorCharts() {
     const valueFor=censusCount?(page: PageObservation)=>{
       const creator=attributedCreatorKey(page),row=creator?byCreator.get(creator):undefined;
       return row?(field==='creator_articles_created_total'?row.total:row.orphans):null;
-    }:history&&(field==='creator_prior_articles'||field==='creator_tenure_days')?
-      (_page: PageObservation)=>null:undefined;
+    }:undefined;
     const report=distribution(field+'-chart',sourceField,unit,t('{unit} (scala logaritmica)',{unit:t(unit)}),true,valueFor);
     const heading=$(field+'-heading');
     if(heading)heading.textContent=t(history&&censusCount?
-      field==='creator_articles_created_total'?'Voci attribuite al creatore storico nel censimento':'Orfane attuali attribuite al creatore storico':title);
+      field==='creator_articles_created_total'?'Voci attribuite al creatore storico nel censimento':'Orfane attuali attribuite al creatore storico':history&&field==='creator_prior_articles'?'Voci del censimento attribuite prima di questa voce':history&&field==='creator_tenure_days'?'Anzianità locale alla creazione ricostruita':title);
     if(history) {
       $(field+'-note')!.textContent=t(censusCount?
         'Attribuzione ricostruita dalla prima revisione in MediaWiki History; conteggio delle voci ancora nel censimento, non totale delle creazioni dell’account. Disponibile per {n}/{total} voci.':
         field==='creator_prior_edits_main'||field==='creator_prior_edits_other'?
-          'Modifiche strettamente precedenti alla prima revisione osservata in MediaWiki History; non equivalgono alla creazione verificata tramite log. Disponibile per {n}/{total} voci.':
-          'Questa misura non è ricostruibile dai dump attuali; il grafico resta visibile senza valori. Disponibile per {n}/{total} voci.',
+          'Modifiche pubbliche strettamente precedenti alla creazione ricostruita in MediaWiki History; copertura limitata alla cronologia disponibile. Disponibile per {n}/{total} voci.':
+          field==='creator_prior_articles'?
+          'Altre voci del censimento attribuite allo stesso autore locale con creazione ricostruita strettamente precedente; copertura limitata alle date note. Disponibile per {n}/{total} voci.':
+          'Registrazione locale fino alla creazione ricostruita; date mancanti o incoerenti restano indisponibili. Disponibile per {n}/{total} voci.',
         {n:number(report.known),total:number(precomputed?.census_page_count??data.pages.length)});
     } else {
       const coverage=(data.metadata.creators!.languages_scanned||[]).join(', ').toUpperCase();
@@ -867,14 +875,17 @@ function creatorCharts() {
   }
   const box=$('origins')!;box.replaceChildren();
   const report=precomputed?.reports.origins??calculateReport<OriginsReport>('origins',data.pages.map(page=>[
-    page.origin||'unknown',page.creator_key&&typeof page.creator_is_bot_now==='boolean'?page.creator_is_bot_now:null,page.orphan
+    page.origin||'unknown',attributedCreator(page)&&typeof page.creator_is_bot_now==='boolean'?page.creator_is_bot_now:null,page.orphan
   ]));
   for(const group of report.origins) {
     appendBarRow(box,t(originLabels[group.label]||group.label),group.percent,100,
       `${number(group.percent)}% (${group.orphans}/${group.total})`);
   }
-  const botNames=['Bot (stato attuale)','Non bot (stato attuale)','Creatore o stato bot non disponibile'];
-  $('creator-bots-note')!.textContent=t('Stato bot attuale del creatore, non stato storico alla creazione. Disponibile per {n}/{total} voci. Ogni barra mostra la percentuale di orfane nel gruppo (orfane/tutte le voci del gruppo); i dati mancanti sono separati.',{n:number(report.known_bots),total:number(precomputed?.census_page_count??data.pages.length)});
+  const botNames=history?['Bot (data del dump)','Senza flag bot (data del dump)','Creatore o stato bot non disponibile']:
+    ['Bot (stato attuale)','Non bot (stato attuale)','Creatore o stato bot non disponibile'];
+  $('creator-bots-note')!.textContent=t(history?
+    'Flag bot locale alla data del dump SQL; senza flag non significa umano. Disponibile per {n}/{total} voci. Ogni barra mostra orfane/tutte le voci del gruppo.':
+    'Stato bot attuale del creatore, non stato storico alla creazione. Disponibile per {n}/{total} voci. Ogni barra mostra la percentuale di orfane nel gruppo (orfane/tutte le voci del gruppo); i dati mancanti sono separati.',{n:number(report.known_bots),total:number(precomputed?.census_page_count??data.pages.length)});
   const botBox=$('creator-bots')!;botBox.replaceChildren();
   for(const group of report.bots) {
     const value=group.percent;
@@ -1060,7 +1071,7 @@ function prepareCreators() {
   if(precomputedCreators){creatorRows=precomputedCreators;return;}
   const historical=creatorMode()==='history';
   creatorRows=calculateReport<CreatorRow[]>('creators',data.pages.filter(page=>attributedCreator(page)).map(page=>[
-    attributedCreatorKey(page),historical?null:page.creator_account_type??null,
+    attributedCreatorKey(page),page.creator_account_type??null,
     historical?null:page.creator_articles_created_total??null,page.orphan,
     historical?[pageLanguage(page)]:page.creator_languages_created??[]
   ]));
@@ -1071,15 +1082,17 @@ function creatorList() {
   const rows=creatorRows.filter(row=>row.key.toLocaleLowerCase().includes(search));
   const field=order.startsWith('articles')?(creatorMode()==='history'?'total':'articles'):'orphans';
   rows.sort((a,b)=>numericOrder(a[field],b[field],order.endsWith('asc')?1:-1)||a.key.localeCompare(b.key));
+  const articlesHeading=document.getElementById('creator-articles-heading');
+  if(articlesHeading)articlesHeading.hidden=creatorMode()==='history';
   const box=$('creator-rows')!;box.replaceChildren();
-  const types: Record<string, string> = {registered:'Registrato',bot:'Bot',temporary:'Temporaneo'};
+  const types: Record<string, string> = {registered:'Registrato',bot:'Bot',temporary:'Temporaneo',no_bot_flag:'Senza flag bot'};
   for(const creator of rows.slice(0,creatorLimit)) {
     const row=element('tr');
-    row.append(...[creator.key,t(types[creator.type ?? '']||'—'),number(creator.articles),number(creator.total),number(creator.orphans),number(creator.percent)+'%',[...creator.languages].sort().join(', ').toUpperCase()||'—'].map(value=>element('td',value)));
+    row.append(...[creator.key,t(types[creator.type ?? '']||'—'),...(creatorMode()==='history'?[]:[number(creator.articles)]),number(creator.total),number(creator.orphans),number(creator.percent)+'%',[...creator.languages].sort().join(', ').toUpperCase()||'—'].map(value=>element('td',value)));
     box.append(row);
   }
   $('creator-info')!.textContent=creatorsAvailable()?t(creatorMode()==='history'?
-    '{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo di account e totale delle creazioni non disponibili.':
+    '{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo account alla data del dump; conteggi limitati alle voci attribuite nel censimento.':
     '{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.',
     {n:number(rows.length),shown:number(Math.min(creatorLimit,rows.length))}):t('Dati sui creatori non disponibili per questa raccolta.');
   $('creator-more')!.hidden=creatorLimit>=rows.length;
@@ -1210,7 +1223,7 @@ async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> 
   const response=await fetch('data/'+filename,{cache:'no-store'});
   if(!response.ok)throw new Error('Riepilogo non disponibile');
   const summary=await response.json() as DashboardSummaryData;
-  if(summary?.format!=='dashboard_summary_v1'||summary.metadata?.language!==entry.language||
+  if(summary?.format!=='dashboard_summary_v1'||summary.measures_rule!=='creation_quality_creators_v2'||summary.metadata?.language!==entry.language||
     summary.metadata.finished_at!==entry.date||summary.metadata.complete!==true||
     Boolean(summary.metadata.demo)!==Boolean(entry.demo)||
     !Number.isSafeInteger(summary.census_page_count)||summary.census_page_count<0||
@@ -1387,10 +1400,6 @@ function refreshCategoryChoices() {
 }
 function renderDataset() {
   if(document.body.dataset.loading==='true')return;
-  const creationEvents=data.metadata.age_rule==='page_creation_event';
-  if($('age-note')!) $('age-note')!.textContent=data.metadata.age_rule==='mixed_per_language'?t('Date con criteri diversi tra lingue: creazione osservata, prima revisione pubblica o dato non disponibile.'):
-    data.metadata.age_rule==='unavailable_no_approved_creation_event'?t('Data di creazione non disponibile nei dump SQL; la cronologia storica non prova automaticamente la creazione della pagina.'):
-    creationEvents?t('Anni dalla creazione della pagina; date non determinabili escluse.'):t('Anni dalla prima revisione pubblica disponibile; data di creazione non determinata.');
   if($('download'))$('download')!.textContent=t(data.metadata.kind==='aggregate'?'Scarica l’indice delle raccolte JSON':'Scarica tutti i dati CSV');
   if($('dataset')) for(const option of $('dataset')!.children)if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
   if($('dataset-date'))$('dataset-date')!.children[0].textContent=t('Ultima disponibile');
@@ -1425,12 +1434,7 @@ function renderCharts() {
   else {
     categories();
     paperProfiles();
-    const historyAge=data.metadata.historical_age_rule==='mediawiki_history_first_observed_revision_v1'&&
-      data.metadata.age_rule!=='page_creation_event';
-    $('age-heading')!.textContent=t(historyAge?'Età dalla prima revisione osservata':'Età delle voci');
-    if(historyAge)$('age-note')!.textContent=t(
-      'Anni dalla prima revisione registrata in MediaWiki History alla raccolta del grafo; non è una data di creazione verificata.');
-    distribution('age',historyAge?'history_first_revision_age_days':'age_days','anni');
+    distribution('age','age_days','anni',null,false,page=>page.page_created_at?metricValue(page.age_days):null);
     distribution('length','length_bytes','byte');
   }
 }

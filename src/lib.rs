@@ -63,6 +63,21 @@ mod native {
     }
     type GraphDetails = (Vec<u64>, Vec<u64>, usize, Vec<Vec<usize>>);
 
+    #[pyfunction]
+    fn quality_transforms(py: Python<'_>, rows: Vec<[u64; 6]>) -> Vec<[f64; 6]> {
+        py.detach(move || {
+            rows.into_iter()
+                .map(crate::dashboard::quality_transform)
+                .collect()
+        })
+    }
+
+    #[pyfunction]
+    fn quality_scores(py: Python<'_>, rows: Vec<[u64; 6]>, maxima: [f64; 6]) -> PyResult<Vec<f64>> {
+        py.detach(move || crate::dashboard::quality_scores(&rows, maxima))
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
     // Expected O(V + E + R) hash-table work, plus string hashing/copying.
     // One bulk call releases the GIL; memoization resolves redirect paths once.
     // Input strings are copied by PyO3. Adjacency and redirect caches stay in memory.
@@ -1025,6 +1040,8 @@ mod native {
         m.add_function(wrap_pyfunction!(graph_counts, m)?)?;
         m.add_function(wrap_pyfunction!(parse_dump_insert, m)?)?;
         m.add_function(wrap_pyfunction!(history_activity, m)?)?;
+        m.add_function(wrap_pyfunction!(quality_transforms, m)?)?;
+        m.add_function(wrap_pyfunction!(quality_scores, m)?)?;
         m.add_function(wrap_pyfunction!(graph_details, m)?)?;
         m.add_function(wrap_pyfunction!(classify_categories, m)?)?;
         m.add_function(wrap_pyfunction!(article_ages, m)?)?;

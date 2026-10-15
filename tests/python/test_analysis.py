@@ -77,6 +77,27 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(rows[1]['length_bytes'], 0)
         self.assertTrue(all(r['orphan'] for r in rows))
 
+    def test_reconstructed_creation_age_is_independent_of_attribution_and_first_revision(self):
+        raw = demo()
+        raw['metadata'].update(source='Wikimedia SQL dumps / vecwiki', database='vecwiki', sql_release='20261001')
+        raw['pages'] = [{'page_id': i, 'title': f'P{i}'} for i in range(1, 4)]
+        history = {'metadata': {'language': 'vec', 'database': 'vecwiki', 'source': 'MediaWiki History dumps / vecwiki',
+            'sql_release': '20261001', 'history_release': '2026-09', 'complete': True,
+            'creation_rule': 'mediawiki_history_page_creation_v2'}, 'pages': [
+                {'page_id': i, 'page_created_at': date, 'article_created_at': '2019-01-01T00:00:00Z',
+                 'creator_history_status': 'unavailable'} for i, date in enumerate(
+                     ['2020-01-01T00:00:00Z', None, '2040-01-01T00:00:00Z'], 1)]}
+        result = analyze(raw, history=history)
+        first, missing, future = result['pages']
+        self.assertEqual(result['metadata']['age_rule'], 'mediawiki_history_page_creation_v2')
+        self.assertGreater(first['age_days'], 0)
+        self.assertGreater(first['history_first_revision_age_days'], first['age_days'])
+        self.assertIsNone(first['history_creator_key'])
+        self.assertIsNone(missing['age_days'])
+        self.assertGreater(missing['history_first_revision_age_days'], 0)
+        self.assertIsNone(future['age_days'])
+        self.assertEqual(future['creation_date_status'], 'after_graph_collection')
+
     def test_creation_event_age_and_legacy_data(self):
         raw = demo()
         page = raw['pages'][0]

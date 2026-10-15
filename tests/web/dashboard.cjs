@@ -221,7 +221,7 @@ async function checkPage(creatorsPage) {
   assert.equal(nodes[chart].children[0].textContent,'Dati non disponibili.');
   raw.metadata.age_rule='first_public_revision';
   await vm.runInContext("load({file:'fixture.json'})",context);
-  if(!creatorsPage)assert.match(nodes['age-note'].textContent,/prima revisione pubblica disponibile/);
+  if(!creatorsPage)assert.match(nodes['age-note'].textContent,/page_creation_timestamp/);
   console.log(`${creatorsPage?'Creators':'Articles'} page: cards, charts, filters and missing data passed.`);
 }
 async function checkPaperProfiles() {
@@ -264,7 +264,7 @@ async function checkPaperProfiles() {
   assert(!row('features-paper','Creata da bot'));
   assert(!row('features-paper','Creata da non bot'));
   assert.match(row('features-paper','Voci nuove (< mediana)').title,/copertura 6\/7/);
-  assert.equal(value(row('features-paper','Qualità alta (Johnson 2021)')),'— (0/0)');
+  assert.equal(value(row('features-paper','Qualità strutturale alta (Johnson V2, ≥ mediana)')),'— (0/0)');
   assert(!row('features-paper','Biografie di donne'));
   assert(!html.includes('id="features-thresholds"'));
   assert(!descendants(nodes['features-paper']).some(node=>/mediana età/.test(node.textContent)));
@@ -913,7 +913,7 @@ async function checkAggregation() {
     assert.equal(vm.runInContext('new Set(data.pages.map(attributedCreatorKey)).size',context),2);
     assert.equal(vm.runInContext("label(data.pages[0])",context),'VEC · Shared category');
     if(page==='articles') {
-      assert.match(nodes['age-note'].textContent,/criteri diversi/);
+      assert.match(nodes['age-note'].textContent,/page_creation_timestamp/);
       assert.equal(nodes['article-rows'].children.length,3);
       assert.match(nodes['article-rows'].children[0].children[0].children[0].href,/vec\.wikipedia/);
       assert(!nodes.download);
@@ -1268,6 +1268,7 @@ async function checkReconstructedCreatorFallback() {
   raw.metadata.history={status:'collected',matched_pages:raw.pages.length};
   for(const [index,page] of raw.pages.entries()) {
     page.creator_key=null;page.history_creator_key=`vec:history:${index%7}`;
+    page.creator_prior_articles=null;page.creator_tenure_days=null;
     page.creator_prior_edits_main_history=index%9;
     page.creator_prior_edits_other_history=index%4;
   }
@@ -1280,22 +1281,63 @@ async function checkReconstructedCreatorFallback() {
   assert(!nodes.source);
   console.log('Reconstructed creators: all six panels remain visible, observed history is labeled and unsupported measures stay missing.');
 }
-async function checkHistoricalArticleAge() {
+async function checkMissingCreationAge() {
   const raw=fixture();
   raw.metadata.age_rule='unavailable_no_approved_creation_event';
   raw.metadata.historical_age_rule='mediawiki_history_first_observed_revision_v1';
   raw.pages.forEach((page,index)=>{
-    page.age_days=null;page.page_created_at=null;
+    page.age_days=9000;page.page_created_at=null;
     page.history_first_revision_age_days=index%5===0?null:index*30;
   });
   const {nodes}=await harness('articles',raw);
-  assert.equal(nodes['age-heading'].textContent,'Età dalla prima revisione osservata');
-  assert.match(nodes['age-note'].textContent,/non è una data di creazione verificata/);
-  assert(nodes.age.children[0].children.some(node=>node.tag==='rect'));
+  assert.equal(nodes['age-heading'].textContent,'Età dalla creazione ricostruita');
+  assert.match(nodes['age-note'].textContent,/page_creation_timestamp/);
+  assert.equal(nodes.age.children[0].textContent,'Dati non disponibili.');
   const newArticles=nodes['features-paper'].children.find(node=>
     node.className==='bar-row'&&node.children[0].textContent==='Voci nuove (< mediana)');
   assert.equal(newArticles.children[2].textContent,'— (0/0)');
-  console.log('Historical article age: dated History revisions render a separate, clearly labeled distribution without filling creation-age features.');
+  console.log('Missing creation age: neither the chart nor New/Old features fall back to first-revision ages.');
+}
+async function checkReconstructedCreationQualityAndCreators() {
+  const raw=fixture();
+  raw.metadata.age_rule='mediawiki_history_page_creation_v2';
+  raw.metadata.creators.status='not_collected';
+  raw.metadata.history={status:'collected',matched_pages:4};
+  raw.metadata.historical_age_rule='mediawiki_history_first_observed_revision_v1';
+  raw.pages=raw.pages.slice(0,4).map((page,index)=>({...page,
+    orphan:index%2===0,page_created_at:'2020-01-01T00:00:00Z',age_days:index===3?null:(index+1)*365.25,
+    history_first_revision_age_days:9000,creator_key:null,history_creator_key:'vec:history-user:42',
+    creator_account_type:'no_bot_flag',creator_is_bot_now:false,creator_tenure_days:100+index,
+    creator_prior_articles:index,creator_prior_edits_main_history:index,creator_prior_edits_other_history:0,
+    quality_score:[.1,.3,0,null][index],quality_status:index===3?'revision_mismatch':'scored'}));
+  const original=JSON.stringify(raw);
+  const articles=await harness('articles',raw);
+  const bar=name=>articles.nodes['features-paper'].children.find(node=>node.className==='bar-row'&&node.children[0].textContent===name);
+  assert.equal(articles.nodes['age-heading'].textContent,'Età dalla creazione ricostruita');
+  assert.match(articles.nodes['age-note'].textContent,/page_creation_timestamp/);
+  assert.match(articles.nodes.age.children[0]['aria-label'],/age_days/);
+  assert.match(articles.nodes.age.children[1].textContent,/2 anni \(n=2\).*2 anni \(n=1\)/);
+  assert.match(articles.nodes.age.children[3].textContent,/0 orfane, 1 non orfane/);
+  assert.equal(bar('Voci nuove (< mediana)').children[2].textContent,'100% (1/1)');
+  assert.equal(bar('Voci vecchie (≥ mediana)').children[2].textContent,'50% (1/2)');
+  assert.equal(bar('Qualità strutturale alta (Johnson V2, ≥ mediana)').children[2].textContent,'50% (1/2)');
+  assert.equal(bar('Qualità strutturale bassa (Johnson V2, < mediana)').children[2].textContent,'100% (1/1)');
+  assert.match(bar('Qualità strutturale alta (Johnson V2, ≥ mediana)').title,/copertura 3\/4/);
+  articles.nodes['ui-language-toggle'].listeners.click();
+  assert.equal(articles.nodes['age-heading'].textContent,'Age since reconstructed page creation');
+  assert.match(articles.nodes['age-note'].textContent,/page_creation_timestamp/);
+  const creators=await harness('creators',raw);
+  for(const field of ['creator_prior_articles','creator_tenure_days']) {
+    assert(creators.nodes[field+'-chart'].children[0].children.some(node=>node.tag==='rect'));
+  }
+  const row=creators.nodes['creator-rows'].children[0];
+  assert.equal(row.children.length,6);
+  assert.equal(row.children[1].textContent,'Senza flag bot');
+  assert.equal(row.children[2].textContent,'4');
+  assert.equal(creators.nodes['creator-articles-heading'].hidden,true);
+  assert.match(creators.nodes['creator_prior_articles-heading'].textContent,/censimento/);
+  assert.equal(JSON.stringify(raw),original);
+  console.log('Reconstructed creation, structural quality and creators: measured bars, coverage, populated tenure/prior panels, snapshot bot flag, one census column and translations passed.');
 }
 function checkThemeContrast() {
   const css=fs.readFileSync('web/assets/style.css','utf8');
@@ -1314,4 +1356,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkHistoricalArticleAge();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -39,7 +39,7 @@ def sidecars(directory, filename, sources):
                      'mtime_ns': (directory / source).stat().st_mtime_ns} for source in sources]
     stem = filename.removesuffix('.json')
     (directory / (stem + '-summary.json')).write_text(json.dumps({
-        'format': 'dashboard_summary_v1', 'histogram_rule': 'shared_p2_p98_tails_v1',
+        'format': 'dashboard_summary_v1', 'histogram_rule': 'shared_p2_p98_tails_v1', 'measures_rule': 'creation_quality_creators_v2',
         'metadata': metadata, 'sources': fingerprints, 'census_page_count': 0,
         'reports': {'overview': {'orphans': 0}}, 'article_preview': []}))
     (directory / (stem + '-creators.json')).write_text(json.dumps({
@@ -80,12 +80,45 @@ elif command == 'import-dumps':
     history.write_text(json.dumps({'metadata': {'language': manifest['language'],
         'database': manifest['database'], 'source': 'MediaWiki History dumps / ' + manifest['database'],
         'sql_release': manifest['sql_release'], 'history_release': manifest['history_release'],
-        'complete': True, 'history_files': {}}, 'pages': []}))
+        'complete': True, 'creation_rule': 'mediawiki_history_page_creation_v2', 'history_files': {}}, 'pages': []}))
     stage = Path(option('--work-dir')) / (manifest['database'] + '-' + manifest['sql_release'] + '.sqlite')
     stage.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(stage) as database:
         database.execute('CREATE TABLE IF NOT EXISTS pages(id INTEGER PRIMARY KEY)')
         database.execute('INSERT OR IGNORE INTO pages VALUES(1)')
+elif command == 'import-history':
+    manifest = json.loads(Path(option('--manifest')).read_text())
+    Path(option('--output')).write_text(json.dumps({'metadata': {'language': manifest['language'],
+        'database': manifest['database'], 'source': 'MediaWiki History dumps / ' + manifest['database'],
+        'sql_release': manifest['sql_release'], 'history_release': manifest['history_release'],
+        'creation_rule': 'mediawiki_history_page_creation_v2', 'complete': True,
+        'history_files': {name:item['sha256_local'] for name,item in manifest['files'].items() if name.endswith('.tsv.bz2')}}, 'pages': []}))
+elif command == 'fetch-content' and '--plan' not in options:
+    config = json.loads(Path(option('--languages-file')).read_text())
+    languages = options[options.index('--languages') + 1:options.index('--content-release')]
+    release = option('--content-release')
+    for language in languages:
+        database = config.get('databases', {}).get(language, language.replace('-', '_') + 'wiki')
+        root = Path(option('--root')) / database
+        root.mkdir(parents=True, exist_ok=True)
+        payload = root / ('content-' + release + '.xml.bz2')
+        payload.write_bytes(b'verified synthetic XML')
+        (root / ('content-' + release + '.json')).write_text(json.dumps({'language':language,
+            'database':database,'source':'mediawiki_content_current','content_release':release,'complete':True,
+            'files':{payload.name:{'path':str(payload),'bytes':payload.stat().st_size,
+                                  'sha256_local':hashlib.sha256(payload.read_bytes()).hexdigest()}}}))
+elif command == 'quality':
+    language = options[options.index('--languages') + 1]
+    graph = Path(option('--input-dir')) / (language + '-raw.json')
+    graph_meta = json.loads(graph.read_text())['metadata']
+    release = option('--content-release')
+    manifest = Path(option('--root')) / graph_meta['database'] / ('content-' + release + '.json')
+    meta = {'language':language,'database':graph_meta['database'],'sql_release':graph_meta['sql_release'],
+            'source':'Johnson V2 / mediawiki_content_current','complete':True,'content_release':release,
+            'input_file_sha256':hashlib.sha256(graph.read_bytes()).hexdigest(),
+            'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            'model':json.loads(Path('config/quality.json').read_text())}
+    (Path(option('--output-dir')) / (language + '-quality.json')).write_text(json.dumps({'metadata':meta,'pages':[]}))
 elif command == 'topics':
     codes = options[options.index('--languages') + 1:options.index('--model')]
     spec = json.loads(Path(option('--model-config')).read_text())
@@ -105,9 +138,14 @@ elif command == 'analyze':
     language = graph_meta['language']
     meta = dict(graph_meta)
     meta['historical_age_rule'] = 'mediawiki_history_first_observed_revision_v1'
+    meta['age_rule'] = 'mediawiki_history_page_creation_v2'
+    meta['measures_rule'] = 'creation_quality_creators_v2'
+    meta['history'] = json.loads(Path(options[0]).with_name(language + '-history.json').read_text())['metadata']
     if (Path(options[0]).with_name(language + '-topics.json')).exists():
         meta['topics'] = {'status': 'predicted', 'model': json.loads(
             Path(options[0]).with_name(language + '-topics.json').read_text())['metadata']['model']}
+    if Path(options[0]).with_name(language + '-quality.json').exists():
+        meta['quality'] = json.loads(Path(options[0]).with_name(language + '-quality.json').read_text())['metadata']
     output.write_text(json.dumps({'metadata': meta, 'pages': []}))
     sidecars(output.parent, output.name, [output.name])
     manifest = output.parent / 'manifest.json'
@@ -136,11 +174,16 @@ elif command == 'compare':
     for graph, language in zip(graphs, languages):
         meta = json.loads(graph.read_text())['metadata']
         meta['historical_age_rule'] = 'mediawiki_history_first_observed_revision_v1'
+        meta['age_rule'] = 'mediawiki_history_page_creation_v2'
+        meta['measures_rule'] = 'creation_quality_creators_v2'
+        meta['history'] = json.loads(graph.with_name(language + '-history.json').read_text())['metadata']
         meta['comparison'] = {'status': 'compared',
                               'reference_languages': [code for code in languages if code != language]}
         if graph.with_name(language + '-topics.json').exists():
             meta['topics'] = {'status': 'predicted', 'model': json.loads(
                 graph.with_name(language + '-topics.json').read_text())['metadata']['model']}
+        if graph.with_name(language + '-quality.json').exists():
+            meta['quality'] = json.loads(graph.with_name(language + '-quality.json').read_text())['metadata']
         (output / (language + '.json')).write_text(json.dumps({'metadata': meta, 'pages': []}))
         sidecars(output, language + '.json', [language + '.json'])
         observations = language + '-observations.json'
@@ -161,6 +204,28 @@ elif command == 'compare':
     entries.append({'language': 'all', 'file': 'all.json', 'kind': 'aggregate',
                     'summary_file': 'all-summary.json', 'creator_index_file': 'all-creators.json'})
     (output / 'manifest.json').write_text(json.dumps(entries))
+elif command == 'refresh-measures':
+    output = Path(option('--data-dir'))
+    entries = json.loads((output / 'manifest.json').read_text())
+    for entry in entries:
+        filename = entry['file']
+        document = json.loads((output / filename).read_text())
+        if entry.get('kind') == 'aggregate':
+            for member in document['members']:
+                member['metadata'] = json.loads((output / member['file']).read_text())['metadata']
+            (output / filename).write_text(json.dumps(document))
+            sidecars(output, filename, [member['file'] for member in sorted(document['members'], key=lambda member: member['language'])])
+        else:
+            language = entry['language']
+            document['metadata']['history'] = json.loads((Path(option('--input-dir')) / (language + '-history.json')).read_text())['metadata']
+            quality = Path(option('--input-dir')) / (language + '-quality.json')
+            if quality.exists():
+                document['metadata']['quality'] = json.loads(quality.read_text())['metadata']
+            document['metadata']['age_rule'] = 'mediawiki_history_page_creation_v2'
+            document['metadata']['measures_rule'] = 'creation_quality_creators_v2'
+            (output / filename).write_text(json.dumps(document))
+            sidecars(output, filename, [filename])
+            (output / entry['connections_dir']).mkdir(exist_ok=True)
 '''
 
 
@@ -206,9 +271,14 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = self.calls.read_text().splitlines()
         self.assertEqual([line.split(':', 1)[0] for line in calls],
-                         ['fetch-dumps', 'import-dumps', 'import-dumps', 'topics', 'compare'])
+                         ['fetch-dumps', 'import-dumps', 'import-dumps', 'topics',
+                          'fetch-content', 'quality', 'quality', 'compare'])
         self.assertIn('vecwiki', calls[1])
         self.assertIn('lmowiki', calls[2])
+        self.assertIn('contenuto 2026-10-01', result.stdout)
+        for language in ('vec', 'lmo'):
+            quality = json.loads((self.root / 'imported' / f'{language}-quality.json').read_text())
+            self.assertEqual(quality['metadata']['content_release'], '2026-10-01')
         self.assertTrue((self.root / 'web-data' / 'vec.json').is_file())
         self.assertTrue((self.root / 'web-data' / 'lmo.json').is_file())
         log = self.one_log()
@@ -263,34 +333,56 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertIn('SALTA download it', second.stdout)
         self.assertIn('download verificato: vec', second.stdout)
 
-    def test_missing_detail_directory_rebuilds_comparison(self):
+    def test_missing_detail_directory_refreshes_without_repeating_comparison(self):
         first = self.invoke('vec', 'lmo')
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         (self.root / 'web-data' / 'vec-connections-test').rmdir()
         second = self.invoke('vec', 'lmo')
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         calls = [line.split(':', 1)[0] for line in self.calls.read_text().splitlines()]
-        self.assertEqual(calls.count('compare'), 2)
+        self.assertEqual(calls.count('compare'), 1)
+        self.assertEqual(calls.count('refresh-measures'), 1)
         self.assertEqual(calls.count('import-dumps'), 2)
 
-    def test_missing_or_stale_chart_sidecar_rebuilds_comparison(self):
+    def test_quality_release_change_reuses_sql_topics_and_matching(self):
+        first = self.invoke('vec', 'lmo')
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        before = self.calls.read_text()
+        second = self.invoke('vec', 'lmo', extra=('--content-release', '2026-10-01'))
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.calls.read_text(), before)
+        third = self.invoke('vec', 'lmo', extra=('--content-release', '2026-09-01'))
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        calls = [line.split(':', 1)[0] for line in self.calls.read_text().splitlines()]
+        self.assertEqual(calls.count('fetch-dumps'), 1)
+        self.assertEqual(calls.count('import-dumps'), 2)
+        self.assertEqual(calls.count('topics'), 1)
+        self.assertEqual(calls.count('compare'), 1)
+        self.assertEqual(calls.count('fetch-content'), 2)
+        self.assertEqual(calls.count('quality'), 4)
+        self.assertEqual(calls.count('refresh-measures'), 1)
+
+    def test_missing_or_stale_chart_sidecar_refreshes_without_repeating_comparison(self):
         first = self.invoke('vec', 'lmo')
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         summary = self.root / 'web-data' / 'vec-summary.json'
         summary.unlink()
         second = self.invoke('vec', 'lmo')
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(self.calls.read_text().count('compare:'), 2)
+        self.assertEqual(self.calls.read_text().count('compare:'), 1)
+        self.assertEqual(self.calls.read_text().count('refresh-measures:'), 1)
         data = json.loads(summary.read_text())
         data['sources'][0]['size'] += 1
         summary.write_text(json.dumps(data))
         third = self.invoke('vec', 'lmo')
         self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
-        self.assertEqual(self.calls.read_text().count('compare:'), 3)
+        self.assertEqual(self.calls.read_text().count('compare:'), 1)
+        self.assertEqual(self.calls.read_text().count('refresh-measures:'), 2)
         (self.root / 'web-data' / 'all-summary.json').unlink()
         fourth = self.invoke('vec', 'lmo')
         self.assertEqual(fourth.returncode, 0, fourth.stdout + fourth.stderr)
-        self.assertEqual(self.calls.read_text().count('compare:'), 4)
+        self.assertEqual(self.calls.read_text().count('compare:'), 1)
+        self.assertEqual(self.calls.read_text().count('refresh-measures:'), 3)
 
     def test_configured_pool_builds_one_aggregate_for_every_language(self):
         config = json.loads((ROOT / 'config' / 'languages.json').read_text())
@@ -300,6 +392,8 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(aggregate['metadata']['languages'], sorted(config['languages']))
         calls = [line.split(':', 1)[0] for line in self.calls.read_text().splitlines()]
         self.assertEqual(calls.count('import-dumps'), len(config['languages']))
+        self.assertEqual(calls.count('fetch-content'), 1)
+        self.assertEqual(calls.count('quality'), len(config['languages']))
         self.assertEqual(calls.count('topics'), 1)
         self.assertEqual(calls.count('compare'), 1)
 
@@ -339,7 +433,7 @@ class DumpPipelineTests(unittest.TestCase):
             database.execute('CREATE TABLE history_imported(file TEXT, phase TEXT, sha256 TEXT)')
             database.executemany('INSERT INTO history_imported VALUES(?,?,?)',
                                  [('2026-09.itwiki.all-time.tsv.bz2', phase,
-                                   files['2026-09.itwiki.all-time.tsv.bz2']['sha256_local'])
+                                   files['2026-09.itwiki.all-time.tsv.bz2']['sha256_local'] + (':mediawiki_history_page_creation_v2' if phase == 'initial' else ':users'))
                                   for phase in ('initial', 'activity')])
         imported = self.root / 'imported'
         imported.mkdir()
@@ -367,8 +461,8 @@ class DumpPipelineTests(unittest.TestCase):
         result = self.invoke('it')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line.split(':', 1)[0] for line in self.calls.read_text().splitlines()],
-                         ['fetch-dumps', 'topics', 'analyze'])
-        self.assertIn('SALTA importazione it', result.stdout)
+                         ['fetch-dumps', 'import-history', 'topics', 'fetch-content', 'quality', 'analyze'])
+        self.assertIn('aggiornamento cronologia it', result.stdout)
         self.assertTrue((self.root / 'imported' / 'it-topics.json').exists())
 
     def test_failure_stops_before_next_language_and_records_stderr(self):
@@ -385,9 +479,28 @@ class DumpPipelineTests(unittest.TestCase):
     def test_plan_only_runs_fetch_and_preserves_import_directory(self):
         result = self.invoke('vec', extra=('--plan',))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(), ['fetch-dumps:'])
+        self.assertEqual(self.calls.read_text().splitlines(), ['fetch-dumps:', 'fetch-content:'])
+        self.assertFalse((self.root / 'dumps').exists())
         self.assertFalse((self.root / 'imported').exists())
         self.assertIn('PIPELINE COMPLETATA', self.one_log())
+
+    def test_rejects_invalid_release_dates_before_any_download(self):
+        for extra in (('--sql-release', '20260230'), ('--sql-release', '2026101'),
+                      ('--content-release', '2026-02-30'), ('--content-release', '2026-10-1')):
+            with self.subTest(extra=extra):
+                result = self.invoke('vec', extra=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse((self.root / 'dumps').exists())
+                self.assertFalse((self.root / 'logs').exists())
+
+    def test_quality_failure_stops_before_publishing_analysis(self):
+        result = self.invoke('vec', fail='quality')
+        self.assertNotEqual(result.returncode, 0)
+        calls = [line.split(':', 1)[0] for line in self.calls.read_text().splitlines()]
+        self.assertEqual(calls, ['fetch-dumps', 'import-dumps', 'topics', 'fetch-content', 'quality'])
+        self.assertFalse((self.root / 'web-data').exists())
+        self.assertIn('PIPELINE FALLITA', self.one_log())
 
     def test_languages_file_supports_explicit_database_mapping(self):
         config = self.root / 'languages.json'
@@ -419,7 +532,7 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line.split(':', 1)[0] for line in self.calls.read_text().splitlines()],
                          ['fetch-dumps', 'import-dumps', 'import-dumps', 'import-dumps',
-                          'topics', 'compare'])
+                          'topics', 'fetch-content', 'quality', 'quality', 'quality', 'compare'])
         aggregate = json.loads((self.root / 'web-data' / 'all.json').read_text())
         self.assertEqual(aggregate['metadata']['languages'], ['it', 'lmo', 'vec'])
         self.assertTrue((self.root / 'imported' / 'vec-topics.json').exists())
@@ -429,7 +542,7 @@ class DumpPipelineTests(unittest.TestCase):
         result = self.invoke('it')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line.split(':', 1)[0] for line in self.calls.read_text().splitlines()],
-                         ['fetch-dumps', 'import-dumps', 'topics', 'analyze'])
+                         ['fetch-dumps', 'import-dumps', 'topics', 'fetch-content', 'quality', 'analyze'])
         meta = json.loads((self.root / 'web-data' / 'it-20261001-2026-09.json').read_text())['metadata']
         self.assertEqual(meta['topics']['status'], 'predicted')
 

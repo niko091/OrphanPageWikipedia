@@ -8,6 +8,9 @@ target/
 *.pyc
 node_modules/
 web/assets/
+/web/orphanwiki-refresh-*/
+/benchmarks/
+/AGENTS.md
 .env
 .env.*
 .my.cnf

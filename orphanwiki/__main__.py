@@ -25,8 +25,8 @@ from .core import (
 )
 
 
-def export(raw, output, rules, topics=None, history=None):
-    result = analyze(raw, rules, topics=topics, history=history)
+def export(raw, output, rules, topics=None, history=None, quality=None):
+    result = analyze(raw, rules, topics=topics, history=history, quality=quality)
     result['metadata']['input_sha256'] = json_sha256(raw)
     export_result(result, output)
 
@@ -43,7 +43,7 @@ def export_result(result, output, update_manifest=True, announce=True):
                    'page_created_at', 'first_public_revision_at', 'creation_date_source', 'creation_date_status',
                    'creator_account_type_at_creation', 'creator_is_bot_now',
                    'creator_languages_created', 'creator_languages_before', 'creation_tags',
-                   'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status']
+                   'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status', 'quality_score', 'quality_status']
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         for page in result['pages']:
@@ -93,7 +93,8 @@ def comparison_filename(language, result, languages):
         return f"{language}{'-demo' if meta.get('demo') else ''}.json"
     identity = {'language': language, 'release': release,
                 'input': meta.get('input_sha256'), 'history': meta.get('history'),
-                'topics': meta.get('topics'), 'references': sorted(languages)}
+                'topics': meta.get('topics'), 'quality': meta.get('quality'),
+                'age_rule': meta.get('age_rule'), 'measures_rule': meta.get('measures_rule'), 'references': sorted(languages)}
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
                                        default=str).encode()).hexdigest()[:12]
     return f'{language}-{release}-{digest}.json'
@@ -295,6 +296,25 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     dashboard = sub.add_parser('dashboard', help='Prepara grafici, schede e dettagli dagli export esistenti; nessuna nuova query')
     dashboard.add_argument('--data-dir', default='web/data')
+    content = sub.add_parser('fetch-content', help='Scarica i dump ufficiali del solo contenuto corrente')
+    content.add_argument('--languages-file', default='config/languages.json')
+    content.add_argument('--languages', nargs='+')
+    content.add_argument('--content-release', required=True)
+    content.add_argument('--root', default='data/dumps')
+    content.add_argument('--plan', action='store_true')
+    quality = sub.add_parser('quality', help='Calcola Johnson V2 dai dump XML correnti verificati')
+    quality.add_argument('--languages-file', default='config/languages.json')
+    quality.add_argument('--languages', nargs='+')
+    quality.add_argument('--content-release', required=True)
+    quality.add_argument('--root', default='data/dumps')
+    quality.add_argument('--input-dir', default='data/imported')
+    quality.add_argument('--output-dir', default='data/imported')
+    quality.add_argument('--work-dir', default='data/dumps/staging')
+    refresh = sub.add_parser('refresh-measures', help='Aggiorna età, autori e qualità riutilizzando grafo, temi e candidate pubblicati')
+    refresh.add_argument('--languages-file', default='config/languages.json')
+    refresh.add_argument('--languages', nargs='+')
+    refresh.add_argument('--input-dir', default='data/imported')
+    refresh.add_argument('--data-dir', default='web/data')
     downloads = sub.add_parser('fetch-dumps', help='Scarica e verifica dump Wikimedia completi per le lingue richieste')
     downloads.add_argument('--languages-file', default='config/languages.json')
     downloads.add_argument('--languages', nargs='+', help=argparse.SUPPRESS)
@@ -308,7 +328,13 @@ def main():
     imported.add_argument('--history-output', help='Predefinito: data/imported/<lingua>-history.json')
     imported.add_argument('--work-dir', default='data/dumps/staging')
     history_import = sub.add_parser('import-history', help='Riprende la cronologia da uno staging SQL già importato')
-    history_import.add_argument('--manifest', required=True)
+    history_import.add_argument('--manifest')
+    history_import.add_argument('--languages-file', default='config/languages.json')
+    history_import.add_argument('--languages', nargs='+')
+    history_import.add_argument('--root', default='data/dumps')
+    history_import.add_argument('--sql-release')
+    history_import.add_argument('--history-release')
+    history_import.add_argument('--output-dir', default='data/imported')
     history_import.add_argument('--output', help='Predefinito: data/imported/<lingua>-history.json')
     history_import.add_argument('--work-dir', default='data/dumps/staging')
     compare = sub.add_parser('compare', help='Confronto interlingua in tutte le direzioni')
@@ -317,6 +343,7 @@ def main():
     compare.add_argument('--output-dir', default='web/data')
     compare.add_argument('--work-dir', help='Directory dello staging SQLite temporaneo; predefinita: directory di output')
     compare.add_argument('--topics', nargs='*', default=[], help='Predizioni locali opzionali; altrimenti usa i file fratelli *-topics.json')
+    compare.add_argument('--qualities', nargs='*', default=[], help='Qualità V2 verificata per lingua')
     compare.add_argument('--histories', nargs='*', default=[], help='Cronologie dei dump verificate, una per lingua')
     compare.add_argument('--rules', default='config/categories.json')
     topics = sub.add_parser('topics', help='Modello locale sui collegamenti dei dump importati')
@@ -332,6 +359,7 @@ def main():
     command = sub.add_parser('analyze', help='Analisi nativa di un censimento completo')
     command.add_argument('input')
     command.add_argument('--topics', help='Predizioni locali; altrimenti usa il file fratello *-topics.json')
+    command.add_argument('--quality', help='Supplemento qualità V2; altrimenti usa il file fratello *-quality.json')
     command.add_argument('--history', help='Supplemento storico verificato da MediaWiki History')
     command.add_argument('--work-dir', help='Staging SQLite dell’importazione SQL, se non usa il percorso predefinito')
     command.add_argument('--output')
@@ -339,7 +367,28 @@ def main():
     args = parser.parse_args()
     if hasattr(args, 'batch_size') and not 1 <= args.batch_size <= 10000:
         parser.error('--batch-size deve essere compreso tra 1 e 10000; non limita il numero di voci')
-    if args.command == 'dashboard':
+    if args.command in ('fetch-content', 'quality', 'refresh-measures'):
+        from .dumps import fetch_content, infer_quality, refresh_measures
+        selected = configured_languages(args.languages_file)
+        languages = args.languages or [language for language, _ in selected]
+        databases = dict(selected)
+        if not languages or len(languages) != len(set(languages)) or set(languages) - set(databases):
+            parser.error('Lingue richieste fuori dalla configurazione unica')
+        if args.command == 'fetch-content':
+            fetch_content(languages, args.content_release, args.root, databases, args.plan)
+        elif args.command == 'quality':
+            for language in languages:
+                infer_quality(Path(args.input_dir) / f'{language}-raw.json',
+                              Path(args.root) / databases[language] / f'content-{args.content_release}.json',
+                              Path(args.output_dir) / f'{language}-quality.json', args.work_dir)
+        else:
+            for language in languages:
+                quality_path = Path(args.input_dir) / f'{language}-quality.json'
+                refresh_measures(Path(args.input_dir) / f'{language}-raw.json',
+                                 Path(args.input_dir) / f'{language}-history.json', args.data_dir,
+                                 quality_path if quality_path.is_file() else None)
+            publish_available_aggregate(args.data_dir)
+    elif args.command == 'dashboard':
         rebuild_dashboard(args.data_dir)
     elif args.command == 'fetch-dumps':
         from .dumps import fetch_dumps
@@ -362,11 +411,25 @@ def main():
         import_history(args.manifest, history_output, args.work_dir)
     elif args.command == 'import-history':
         from .dumps import import_history
-        manifest = json.loads(Path(args.manifest).read_text())
-        language = manifest['language']
-        wiki_database(language, manifest.get('database'))
-        output = args.output or f'data/imported/{language}-history.json'
-        import_history(args.manifest, output, args.work_dir)
+        if args.manifest:
+            if args.languages or args.sql_release or args.history_release:
+                parser.error('--manifest non può essere combinato con una selezione di release/lingue')
+            manifest = json.loads(Path(args.manifest).read_text())
+            language = manifest['language']
+            wiki_database(language, manifest.get('database'))
+            output = args.output or f'data/imported/{language}-history.json'
+            import_history(args.manifest, output, args.work_dir)
+        else:
+            if not args.sql_release or not args.history_release or args.output:
+                parser.error('Senza --manifest indicare --sql-release e --history-release; usare --output-dir')
+            selected = configured_languages(args.languages_file)
+            languages = args.languages or [code for code, _ in selected]
+            if not languages or len(languages) != len(set(languages)) or set(languages) - set(dict(selected)):
+                parser.error('Lingue richieste fuori dalla configurazione unica')
+            for language, database in selected:
+                if language in languages:
+                    import_history(Path(args.root) / database / f'manifest-{args.sql_release}-{args.history_release}.json',
+                                   Path(args.output_dir) / f'{language}-history.json', args.work_dir)
     elif args.command == 'topics':
         if not math.isfinite(args.time_budget_seconds) or args.time_budget_seconds <= 0:
             parser.error('Il budget deve essere un numero positivo finito')
@@ -424,8 +487,8 @@ def main():
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         with compare_files(paths, json.loads(Path(args.rules).read_text()),
-                           args.topics, args.work_dir or output_dir, args.histories) as results:
-            protected = {Path(path).resolve() for path in [*paths, *args.topics, *args.histories]}
+                           args.topics, args.work_dir or output_dir, args.histories, args.qualities) as results:
+            protected = {Path(path).resolve() for path in [*paths, *args.topics, *args.histories, *args.qualities]}
             filenames = ['manifest.json', 'all.json', 'all-demo.json']
             for language, result in results.items():
                 name = language + ('-demo' if result['metadata'].get('demo') else '')
@@ -438,6 +501,9 @@ def main():
         topic_path = Path(args.topics) if args.topics else Path(args.input).with_name(Path(args.input).stem.removesuffix('-raw') + '-topics.json')
         if args.topics and not topic_path.is_file():
             raise ValueError('File dei temi esplicitamente richiesto non trovato')
+        quality_path = Path(args.quality) if args.quality else Path(args.input).with_name(Path(args.input).stem.removesuffix('-raw') + '-quality.json')
+        if args.quality and not quality_path.is_file():
+            raise ValueError('File qualità esplicitamente richiesto non trovato')
         source = Path(args.input)
         if source.stat().st_size >= 128 * 1024**2:
             from .dumps import _read_first_metadata, analyze_imported_dump
@@ -447,13 +513,14 @@ def main():
         if metadata.get('source', '').startswith('Wikimedia SQL dumps / '):
             analyze_imported_dump(source, args.history,
                                   args.output or f"web/data/{metadata['language']}.json",
-                                  rules, args.work_dir, topic_path if topic_path.is_file() else None)
+                                  rules, args.work_dir, topic_path if topic_path.is_file() else None,
+                                  quality_path=quality_path if quality_path.is_file() else None)
         else:
             raw = json.loads(source.read_text())
             topics = json.loads(topic_path.read_text()) if topic_path.exists() else None
             history = json.loads(Path(args.history).read_text()) if args.history else None
             export(raw, args.output or f"web/data/{raw['metadata']['language']}.json",
-                   rules, topics, history)
+                   rules, topics, history, json.loads(quality_path.read_text()) if quality_path.exists() else None)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,43 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+/// Johnson V2 transformations in documented feature order. Empty wikitext is
+/// a measured zero; ratios with a zero denominator contribute zero.
+pub fn quality_transform(features: [u64; 6]) -> [f64; 6] {
+    let [bytes, references, headings, links, media, categories] = features;
+    let root = (bytes as f64).sqrt();
+    let ratio = |value| if root > 0.0 { value / root } else { 0.0 };
+    [
+        root,
+        ratio(references as f64),
+        ratio(headings as f64),
+        ratio((links as f64).sqrt()),
+        media as f64,
+        categories as f64,
+    ]
+}
+
+pub fn quality_scores(rows: &[[u64; 6]], maxima: [f64; 6]) -> Result<Vec<f64>, String> {
+    if maxima
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("invalid quality normalizers".into());
+    }
+    let weights = [0.395, 0.181, 0.123, 0.115, 0.114, 0.070];
+    Ok(rows
+        .iter()
+        .map(|row| {
+            quality_transform(*row)
+                .iter()
+                .zip(maxima)
+                .zip(weights)
+                .map(|((value, maximum), weight)| weight * value.min(maximum) / maximum)
+                .sum()
+        })
+        .collect())
+}
+
 #[derive(Serialize)]
 struct Group {
     count: usize,
@@ -85,13 +122,20 @@ fn rank(summary: &mut Summary) {
     });
 }
 
-type ProfileObservation = (String, bool, Option<Vec<String>>, Option<f64>, Option<f64>);
+type ProfileObservation = (
+    String,
+    bool,
+    Option<Vec<String>>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+);
 #[derive(Serialize)]
 struct Profiles {
     topics: Summary,
     macrothemes: Summary,
     features: Summary,
-    thresholds: BTreeMap<String, [Option<f64>; 2]>,
+    thresholds: BTreeMap<String, [Option<f64>; 3]>,
 }
 #[derive(Deserialize)]
 struct Taxonomy {
@@ -102,8 +146,8 @@ fn profiles(pages: Vec<ProfileObservation>) -> Result<Profiles, String> {
         serde_json::from_str(include_str!("../config/topics.json")).map_err(|e| e.to_string())?;
     let macrothemes = ["Culture", "Geography", "History and Society", "STEM"];
     let mut totals = [0, 0];
-    let mut samples = BTreeMap::<String, [Vec<f64>; 2]>::new();
-    for (language, orphan, _, age, length) in &pages {
+    let mut samples = BTreeMap::<String, [Vec<f64>; 3]>::new();
+    for (language, orphan, _, age, length, quality) in &pages {
         totals[usize::from(!orphan)] += 1;
         let samples = samples.entry(language.clone()).or_default();
         if let Some(age) = measured(*age) {
@@ -111,6 +155,9 @@ fn profiles(pages: Vec<ProfileObservation>) -> Result<Profiles, String> {
         }
         if let Some(length) = measured(*length) {
             samples[1].push(length);
+        }
+        if let Some(quality) = measured(*quality).filter(|v| *v <= 0.998001) {
+            samples[2].push(quality);
         }
     }
     let thresholds: BTreeMap<_, _> = samples
@@ -162,19 +209,29 @@ fn profiles(pages: Vec<ProfileObservation>) -> Result<Profiles, String> {
     let features = summary(
         labels.map(str::to_owned).to_vec(),
         totals,
-        pages.iter().map(|(language, orphan, _, age, length)| {
-            let split = |value: Option<f64>, index: usize| {
-                measured(value)
-                    .zip(thresholds.get(language).and_then(|v| v[index]))
-                    .map(|(v, m)| v < m)
-            };
-            let age = split(*age, 0);
-            let length = split(*length, 1);
-            (
-                usize::from(!orphan),
-                vec![age, age.map(|v| !v), None, None, length, length.map(|v| !v)],
-            )
-        }),
+        pages
+            .iter()
+            .map(|(language, orphan, _, age, length, quality)| {
+                let split = |value: Option<f64>, index: usize| {
+                    measured(value)
+                        .zip(thresholds.get(language).and_then(|v| v[index]))
+                        .map(|(v, m)| v < m)
+                };
+                let age = split(*age, 0);
+                let length = split(*length, 1);
+                let quality = split(*quality, 2);
+                (
+                    usize::from(!orphan),
+                    vec![
+                        age,
+                        age.map(|v| !v),
+                        quality.map(|v| !v),
+                        quality,
+                        length,
+                        length.map(|v| !v),
+                    ],
+                )
+            }),
     );
     rank(&mut topics);
     rank(&mut broad_topics);
@@ -613,8 +670,9 @@ struct SummaryPage {
     topic_labels: Option<Vec<String>>,
     page_created_at: Option<String>,
     age_days: Option<f64>,
-    history_first_revision_age_days: Option<f64>,
     length_bytes: Option<f64>,
+    quality_score: Option<f64>,
+    quality_status: Option<String>,
     out_degree: Option<u64>,
     origin: Option<String>,
     creator_key: Option<String>,
@@ -718,9 +776,7 @@ impl SummaryAccumulator {
                     creator_id(page).map(|key| {
                         (
                             key,
-                            (!self.historical_creators)
-                                .then(|| page.creator_account_type.clone())
-                                .flatten(),
+                            page.creator_account_type.clone(),
                             (!self.historical_creators)
                                 .then_some(page.creator_articles_created_total)
                                 .flatten(),
@@ -742,7 +798,6 @@ impl SummaryAccumulator {
         let mut numeric_reports = BTreeMap::new();
         for field in [
             "age_days",
-            "history_first_revision_age_days",
             "length_bytes",
             "creator_prior_edits_main",
             "creator_prior_edits_other",
@@ -757,8 +812,7 @@ impl SummaryAccumulator {
                 .iter()
                 .map(|page| {
                     let value = match field {
-                        "age_days" => page.age_days,
-                        "history_first_revision_age_days" => page.history_first_revision_age_days,
+                        "age_days" => page.page_created_at.as_ref().and(page.age_days),
                         "length_bytes" => page.length_bytes,
                         "creator_prior_edits_main" if self.historical_creators => {
                             page.creator_prior_edits_main_history
@@ -768,9 +822,7 @@ impl SummaryAccumulator {
                             page.creator_prior_edits_other_history
                         }
                         "creator_prior_edits_other" => page.creator_prior_edits_other,
-                        "creator_prior_articles" if self.historical_creators => None,
                         "creator_prior_articles" => page.creator_prior_articles,
-                        "creator_tenure_days" if self.historical_creators => None,
                         "creator_tenure_days" => page.creator_tenure_days,
                         "creator_articles_created_total" if self.historical_creators => {
                             creator_id(page)
@@ -794,7 +846,7 @@ impl SummaryAccumulator {
                     logarithmic: field == "length_bytes"
                         || (field.starts_with("creator_")
                             && field != "creator_continuity_months_before_creation"),
-                    age: field == "age_days" || field == "history_first_revision_age_days",
+                    age: field == "age_days",
                 }),
             );
         }
@@ -831,6 +883,9 @@ impl SummaryAccumulator {
                                 .flatten(),
                             page.page_created_at.as_ref().and(page.age_days),
                             page.length_bytes,
+                            (page.quality_status.as_deref() == Some("scored"))
+                                .then_some(page.quality_score)
+                                .flatten(),
                         )
                     })
                     .collect(),
@@ -842,7 +897,7 @@ impl SummaryAccumulator {
                     .map(|page| {
                         (
                             page.origin.clone().unwrap_or_else(|| "unknown".into()),
-                            page.creator_key.as_ref().and(page.creator_is_bot_now),
+                            self.page_creator(page).and(page.creator_is_bot_now),
                             page.orphan,
                         )
                     })
@@ -976,9 +1031,17 @@ mod tests {
                 ]),
                 Some(1.0),
                 Some(4.0),
+                None,
             ),
-            ("vec".into(), false, Some(vec![]), Some(3.0), Some(8.0)),
-            ("lmo".into(), true, None, Some(100.0), None),
+            (
+                "vec".into(),
+                false,
+                Some(vec![]),
+                Some(3.0),
+                Some(8.0),
+                None,
+            ),
+            ("lmo".into(), true, None, Some(100.0), None, None),
         ])
         .unwrap();
         assert_eq!(report.topics.rows.len(), 64);
@@ -992,13 +1055,38 @@ mod tests {
         assert_eq!(culture.orphans, 1);
         assert_eq!(culture.known, 2);
         assert_eq!(culture.percent, Some(100.0));
-        assert_eq!(report.thresholds["vec"], [Some(2.0), Some(6.0)]);
+        assert_eq!(report.thresholds["vec"], [Some(2.0), Some(6.0), None]);
         assert_eq!(report.features.rows[0].orphans, 1);
         assert_eq!(report.features.rows[1].orphans, 1);
         assert_eq!(report.features.rows[2].known, 0);
         assert_eq!(report.features.rows.len(), 6);
         assert_eq!(report.features.rows[4].known, 2);
         assert_eq!(report.features.rows[5].percent, Some(0.0));
+    }
+
+    #[test]
+    fn quality_features_split_at_local_medians_and_missing_is_unknown() {
+        let report = profiles(vec![
+            ("vec".into(), true, None, None, None, Some(0.1)),
+            ("vec".into(), false, None, None, None, Some(0.3)),
+            ("lmo".into(), true, None, None, None, Some(0.8)),
+            ("lmo".into(), false, None, None, None, None),
+        ])
+        .unwrap();
+        assert_eq!(report.thresholds["vec"][2], Some(0.2));
+        assert_eq!(report.thresholds["lmo"][2], Some(0.8));
+        assert_eq!(report.features.rows[2].known, 3);
+        assert_eq!(report.features.rows[2].total, 2);
+        assert_eq!(report.features.rows[2].orphans, 1);
+        assert_eq!(report.features.rows[3].total, 1);
+        let scores = quality_scores(
+            &[[10000, 15, 10, 100, 2, 5], [0; 6]],
+            [100.0, 0.15, 0.1, 0.1, 2.0, 5.0],
+        )
+        .unwrap();
+        assert!((scores[0] - 0.998).abs() < 1e-12);
+        assert_eq!(scores[1], 0.0);
+        assert!(quality_scores(&[], [0.0; 6]).is_err());
     }
     #[test]
     fn aggregate_creators_remain_scoped_and_empty_bot_groups_undefined() {
@@ -1021,6 +1109,43 @@ mod tests {
             serde_json::from_str(&calculate("overview", "[[true,0,null]]").unwrap()).unwrap();
         assert_eq!(report["orphans"], 1);
         assert_eq!(report["distinct_creators"], 0);
+    }
+
+    #[test]
+    fn prepared_age_distribution_and_features_require_reconstructed_creation() {
+        let mut prepared = SummaryAccumulator::new("vec".into(), false, false);
+        prepared
+            .add_json(
+                r#"[{"page_id":1,"title":"New","orphan":true,
+                      "page_created_at":"2020-01-01T00:00:00Z","age_days":365.25,
+                      "history_first_revision_age_days":9000},
+                     {"page_id":2,"title":"Old","orphan":false,
+                      "page_created_at":"2019-01-01T00:00:00Z","age_days":730.5,
+                      "history_first_revision_age_days":9000},
+                     {"page_id":3,"title":"Missing creation","orphan":true,
+                      "age_days":9000,"history_first_revision_age_days":9000},
+                     {"page_id":4,"title":"Missing age","orphan":false,
+                      "page_created_at":"2020-01-01T00:00:00Z",
+                      "history_first_revision_age_days":9000}]"#,
+            )
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&prepared.finish().unwrap()).unwrap();
+        let ages = &report["numeric"]["age_days"];
+        assert_eq!(ages["known"], 2);
+        assert_eq!(ages["groups"][0]["median"], 1.0);
+        assert_eq!(ages["groups"][1]["median"], 2.0);
+        assert_eq!(ages["groups"][0]["missing"], 1);
+        assert_eq!(ages["groups"][1]["missing"], 1);
+        assert!(report["numeric"]
+            .get("history_first_revision_age_days")
+            .is_none());
+        let features = report["profiles"]["features"]["rows"].as_array().unwrap();
+        for label in ["new", "old"] {
+            let row = features.iter().find(|row| row["label"] == label).unwrap();
+            assert_eq!(row["known"], 2);
+            assert_eq!(row["total"], 1);
+            assert_eq!(row["orphans"], usize::from(label == "new"));
+        }
     }
 
     #[test]

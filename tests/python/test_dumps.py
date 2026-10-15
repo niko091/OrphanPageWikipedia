@@ -397,8 +397,233 @@ class DumpTests(unittest.TestCase):
             self.assertEqual(record['creator_groups_at_creation'], ['sysop'])
             self.assertEqual(record['creator_continuity_months_before_creation'], 2)
             self.assertEqual(record['creator_prior_edits_main_history'], 10)
-            self.assertNotIn('page_created_at', record)
+            self.assertEqual(record['page_created_at'], '2026-03-01T12:00:00+00:00')
             self.assertEqual(import_history(manifest, output, stage), 1)
+
+    def test_creation_from_all_events_without_visible_initial_creator(self):
+        from orphanwiki.dumps import _history_schema, _history_scan, _history_records, HISTORY_RULE
+        def event(pid, created, initial=False, hidden=False):
+            row = [''] * 78
+            row[0], row[2], row[3], row[4] = 'vecwiki', 'revision', 'create', '2020-01-01 00:00:00.0'
+            row[6], row[28], row[37] = '42', str(pid), created
+            row[60], row[61] = str(pid), '0' if initial else '1'
+            row[63] = 'user' if hidden else ''
+            return '\t'.join(row)
+        with tempfile.TemporaryDirectory() as folder, closing(sqlite3.connect(':memory:')) as db:
+            _history_schema(db)
+            path = Path(folder) / 'history.bz2'
+            path.write_bytes(bz2.compress(('\n'.join([
+                event(1, '2020-01-01 00:00:00.0', True, True),
+                event(2, '2019-01-01 00:00:00.0'),
+                event(3, '2019-01-01 00:00:00.0'), event(3, '2020-01-01 00:00:00.0'),
+                event(4, 'invalid'), event(5, '')]) + '\n').encode()))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            # Legacy checkpoint must not conceal new evidence columns.
+            db.execute('INSERT INTO history_imported VALUES(?,?,?)', ('history', 'initial', digest))
+            db.commit()
+            _history_scan(db, 'history', path, digest, 'initial', 'vecwiki', set(range(1, 6)))
+            records = _history_records(db, set(range(1, 6)), 'vecwiki')
+            self.assertEqual(records[0]['page_created_at'], '2020-01-01T00:00:00+00:00')
+            self.assertIsNone(records[0]['creator_key'])
+            self.assertEqual(records[1]['page_created_at'], '2019-01-01T00:00:00+00:00')
+            self.assertIsNone(records[1]['article_created_at'])
+            self.assertEqual(records[2]['creation_date_status'], 'ambiguous_history_creation')
+            self.assertIsNone(records[3]['page_created_at'])
+            self.assertIsNone(records[4]['page_created_at'])
+            self.assertEqual(db.execute('SELECT sha256 FROM history_imported').fetchone()[0], digest + ':' + HISTORY_RULE)
+            with patch('orphanwiki.dumps._history_rows', side_effect=AssertionError('already scanned')):
+                _history_scan(db, 'history', path, digest, 'initial', 'vecwiki', set(range(1, 6)))
+
+    def test_quality_regex_reference_and_native_formula(self):
+        from orphanwiki.dumps import quality_features
+        from orphanwiki._native import quality_transforms, quality_scores
+        spec = json.loads(Path('config/quality.json').read_text())
+        text = 'è<ref>a</ref><ref name="a"/>\n==A==\n===B===\n====C====\n[[Foo]][[Category:C]][[Imàjine:X]]'
+        self.assertEqual(quality_features(text, 'vec', spec), [len(text.encode()), 2, 2, 1, 1, 1])
+        self.assertEqual(quality_features('[[PictureLocal:X]][[TopicLocal:Y]]', 'vec', spec,
+                                         {6: 'PictureLocal', 14: 'TopicLocal'})[3:], [0, 1, 1])
+        # Preserve the published regex extractor's comment/nowiki limitation.
+        self.assertEqual(quality_features('<!--<ref>x</ref>--><nowiki>[[Foo]]</nowiki>', 'vec', spec)[1:4], [1, 0, 1])
+        self.assertEqual(quality_transforms([[10000, 15, 10, 100, 2, 5]])[0], [100, .15, .1, .1, 2, 5])
+        self.assertAlmostEqual(quality_scores([[10000, 15, 10, 100, 2, 5]], spec['minimums'])[0], .998)
+        self.assertEqual(quality_scores([[0, 0, 0, 0, 0, 0]], spec['minimums']), [0.0])
+        with self.assertRaises(ValueError):
+            quality_scores([[1] * 6], [0] * 6)
+
+    def test_creator_registration_bot_snapshot_and_strict_prior_census(self):
+        from orphanwiki.dumps import _stage_schema, HISTORY_RULE
+        def revision(pid, at, registered, user=42):
+            row = [''] * 78
+            row[0], row[2:5] = 'vecwiki', ['revision', 'create', at]
+            row[6], row[12], row[23], row[28] = str(user), 'sysop', registered, str(pid)
+            row[37], row[38], row[60], row[61] = at, at, str(pid), '0'
+            return '\t'.join(row)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / 'stage'
+            stage.mkdir()
+            with closing(sqlite3.connect(stage / 'vecwiki-20261001.sqlite')) as db:
+                _stage_schema(db)
+                db.executemany('INSERT INTO dump_page VALUES(?,?,?,?,?,?)', ((i, 0, str(i), 0, 0, i) for i in range(1, 5)))
+                db.execute("INSERT INTO imported VALUES('user_groups','verified')")
+                db.executemany('INSERT INTO dump_group VALUES(?,?,?)', [(42, 'bot', '20250101000000'), (43, 'bot', None)])
+                db.commit()
+            at = '2020-01-01 00:00:00.0'
+            lines = [revision(1, at, '2019-01-01 00:00:00.0'), revision(2, at, '2019-01-01 00:00:00.0'),
+                     revision(3, '2021-01-01 00:00:00.0', '2019-01-01 00:00:00.0'),
+                     revision(4, at, '2021-01-01 00:00:00.0', 43)]
+            path = root / 'history.tsv.bz2'
+            path.write_bytes(bz2.compress(('\n'.join(lines)+'\n').encode()))
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki', 'sql_release': '20261001',
+                'history_release': '2026-09', 'files': {path.name: {'path': str(path), 'bytes': path.stat().st_size,
+                        'sha256_local': hashlib.sha256(path.read_bytes()).hexdigest()}}}))
+            output = root / 'history.json'
+            import_history(manifest, output, stage)
+            history = json.loads(output.read_text())
+            records = history['pages']
+            self.assertEqual(history['metadata']['creation_rule'], HISTORY_RULE)
+            self.assertEqual([r['creator_prior_articles'] for r in records], [0, 0, 2, 0])
+            self.assertEqual(records[0]['creator_tenure_days'], 365)
+            self.assertIsNone(records[3]['creator_tenure_days'])
+            self.assertEqual([r['creator_account_type'] for r in records], ['no_bot_flag'] * 3 + ['bot'])
+            rows = [{'page_id': i, 'page_created_at': None} for i in range(1, 5)]
+            attach_history(rows, {'language': 'vec', 'database': 'vecwiki', 'source': 'Wikimedia SQL dumps / vecwiki', 'sql_release': '20261001'}, history)
+            self.assertEqual(rows[2]['creator_prior_articles'], 2)
+            self.assertEqual(rows[0]['creator_registered_at'], '2019-01-01T00:00:00+00:00')
+            self.assertEqual(rows[3]['creator_account_type'], 'bot')
+
+    def test_content_plan_uses_publisher_names_and_never_writes(self):
+        from orphanwiki.dumps import fetch_content
+        from io import BytesIO
+        class Response(BytesIO):
+            headers = {'Content-Length': '123'}
+        filename = 'vecwiki-2026-10-01-p1p5.xml.bz2'
+        def opened(url, **kwargs):
+            return Response(('a' * 64 + '  ' + filename + '\n').encode() if url.endswith('SHA256SUMS') else b'')
+        with tempfile.TemporaryDirectory() as folder, patch('orphanwiki.dumps._open', side_effect=opened), patch('orphanwiki.dumps._fetch') as fetch:
+            result = fetch_content(['vec'], '2026-10-01', folder, {'vec': 'vecwiki'}, True)
+            self.assertEqual(result[0]['files'][filename]['bytes'], 123)
+            self.assertFalse(list(Path(folder).iterdir()))
+            fetch.assert_not_called()
+
+    def test_quality_partition_resume_revision_coverage_and_bounded_parity(self):
+        from orphanwiki.dumps import _stage_schema, infer_quality, _content_pages, SQL_TABLES
+        from orphanwiki.core import attach_quality
+        from xml.sax.saxutils import escape
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / 'staging'
+            stage.mkdir()
+            files = {name: {'sha256_local': name} for name in SQL_TABLES}
+            sql_manifest = root / 'sql.json'
+            sql_manifest.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki', 'sql_release': '20261001', 'files': files}))
+            pages = [{'page_id': pid, 'title': f'P{pid}', 'revision_id': pid, 'length_bytes': 0,
+                      'links': [], 'categories': []} for pid in range(1, 6)]
+            pages[-1]['links'] = ['P2']
+            raw = {'metadata': {'language': 'vec', 'database': 'vecwiki', 'sql_release': '20261001',
+                'complete': True, 'source': 'Wikimedia SQL dumps / vecwiki',
+                'dump_manifest': str(sql_manifest),
+                'dump_manifest_sha256': hashlib.sha256(sql_manifest.read_bytes()).hexdigest(),
+                'started_at': '2026-10-01T00:00:00+00:00', 'finished_at': '2026-10-02T00:00:00+00:00'}, 'pages': pages}
+            raw_path = root / 'vec-raw.json'
+            raw_path.write_text(json.dumps(raw))
+            with closing(sqlite3.connect(stage / 'vecwiki-20261001.sqlite')) as db:
+                _stage_schema(db)
+                db.executemany('INSERT INTO imported VALUES(?,?)', ((name, name) for name in SQL_TABLES))
+                db.executemany('INSERT INTO dump_page VALUES(?,?,?,?,?,?)',
+                               ((pid, 0, f'P{pid}', 0, 0, pid) for pid in range(1, 6)))
+                db.executescript('CREATE TABLE pages(id INTEGER PRIMARY KEY,data TEXT); CREATE TABLE links(id INTEGER,target TEXT); CREATE TABLE categories(id INTEGER,target TEXT);')
+                db.executemany('INSERT INTO pages VALUES(?,?)', ((p['page_id'], json.dumps(p)) for p in pages))
+                db.execute("INSERT INTO links VALUES(5,'P2')")
+                db.commit()
+            def page(pid, rid, text):
+                tag = '<text deleted="deleted"/>' if text is None else '<text>' + escape(text) + '</text>'
+                return f'<page><title>P{pid}</title><ns>0</ns><id>{pid}</id><revision><id>{rid}</id><model>wikitext</model>{tag}</revision></page>'
+            content_files = {}
+            for number, body in enumerate([page(1, 1, 'è<ref>x</ref>\n==A==') + page(2, 2, ''),
+                                           page(3, 33, 'x') + page(4, 4, None)]):
+                path = root / f'vecwiki-2026-10-01-p{number}.xml.bz2'
+                path.write_bytes(bz2.compress(('<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/"><siteinfo><dbname>vecwiki</dbname></siteinfo>' + body + '</mediawiki>').encode()))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                content_files[path.name] = {'path': str(path), 'bytes': path.stat().st_size,
+                                           'sha256_local': digest, 'sha256_publisher': digest}
+            content = root / 'content.json'
+            content.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki', 'source': 'mediawiki_content_current',
+                'content_release': '2026-10-01', 'complete': True, 'files': content_files}))
+            output = root / 'vec-quality.json'
+            original_reader = _content_pages
+            def interrupted(path, database):
+                if path.name.endswith('p1.xml.bz2'):
+                    raise RuntimeError('interrupted')
+                yield from original_reader(path, database)
+            with patch('orphanwiki.dumps._content_pages', side_effect=interrupted), self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                infer_quality(raw_path, content, output, stage)
+            self.assertFalse(output.exists())
+            with patch('orphanwiki.dumps._content_pages', wraps=original_reader) as reader:
+                infer_quality(raw_path, content, output, stage)
+                self.assertEqual(reader.call_count, 1)  # completed partition reused
+            quality = json.loads(output.read_text())
+            self.assertEqual([p['quality_status'] for p in quality['pages']],
+                             ['scored', 'scored', 'revision_mismatch', 'missing_wikitext', 'missing_current_page'])
+            self.assertEqual(quality['pages'][1]['quality_score'], 0)
+            self.assertEqual(quality['metadata']['scored_pages'], 2)
+            memory = analyze(raw, quality=quality)
+            bounded_path = root / 'analysis' / 'vec.json'
+            analyze_imported_dump(raw_path, None, bounded_path, {}, stage, quality_path=output)
+            bounded = json.loads(bounded_path.read_text())
+            self.assertEqual(memory['pages'], bounded['pages'])
+            self.assertEqual(memory['metadata']['quality'], bounded['metadata']['quality'])
+            from orphanwiki.dumps import refresh_measures, HISTORY_RULE
+            from orphanwiki.core import write_json
+            historical = {'metadata': {'language': 'vec', 'database': 'vecwiki',
+                'source': 'MediaWiki History dumps / vecwiki', 'sql_release': '20261001',
+                'history_release': '2026-09', 'complete': True, 'creation_rule': HISTORY_RULE},
+                'pages': [{'page_id': pid, 'page_created_at': f'2020-01-0{pid}T00:00:00+00:00',
+                          'article_created_at': '2019-01-01T00:00:00+00:00', 'creator_key': 'vecwiki:history-user:42',
+                          'creator_history_status': 'observed_surviving_history', 'creator_account_type': 'no_bot_flag',
+                          'creator_tenure_days': 100, 'creator_prior_articles': pid - 1} for pid in range(1, 6)]}
+            history_path = root / 'vec-history.json'
+            write_json(history_path, historical)
+            bounded['metadata']['comparison'] = {'status': 'compared', 'reference_languages': ['lmo']}
+            bounded['link_candidates'] = {'1': {'status': 'compared', 'candidate_count': 1,
+                'counterparts': [{'language': 'lmo', 'status': 'non_orphan', 'page_id': 101}],
+                'candidates': [{'page_id': 2, 'title': 'P2', 'out_degree': 0, 'dead_end': True,
+                    'evidence': [{'language': 'lmo', 'source_page_id': 102, 'source_title': 'P2_lmo',
+                                  'target_page_id': 101, 'target_title': 'P1_lmo'}]}]}}
+            write_json(bounded_path, bounded)
+            original_bytes = bounded_path.read_bytes()
+            with patch('orphanwiki._native.graph_counts', side_effect=AssertionError('graph recomputed')):
+                name = refresh_measures(raw_path, history_path, bounded_path.parent, output)
+            updated = json.loads((bounded_path.parent / name).read_text())
+            self.assertEqual(bounded_path.read_bytes(), original_bytes)
+            self.assertEqual(updated['link_candidates'], bounded['link_candidates'])
+            self.assertEqual([(p['in_degree'], p['out_degree'], p['orphan']) for p in updated['pages']],
+                             [(p['in_degree'], p['out_degree'], p['orphan']) for p in bounded['pages']])
+            self.assertTrue(all(p['age_days'] > 0 for p in updated['pages']))
+            self.assertTrue(all(p['history_first_revision_at'].startswith('2019') for p in updated['pages']))
+            summary_path = bounded_path.parent / name.replace('.json', '-summary.json')
+            summary = json.loads(summary_path.read_text())
+            self.assertEqual(summary['reports']['numeric']['age_days']['known'], 5)
+            self.assertEqual(summary['reports']['numeric']['creator_tenure_days']['known'], 5)
+            self.assertEqual(summary['reports']['profiles']['features']['rows'][2]['known'], 2)
+            summary_path.unlink()  # rebuild transports without replacing canonical observations
+            self.assertEqual(refresh_measures(raw_path, history_path, bounded_path.parent, output), name)
+            self.assertTrue(summary_path.exists())
+            with patch('orphanwiki.dumps._content_pages', side_effect=AssertionError('reparsed')):
+                infer_quality(raw_path, content, output, stage)
+            # A stale checksum never replaces the completed supplement.
+            previous = output.read_bytes()
+            record = next(iter(content_files.values()))
+            record['sha256_publisher'] = '0' * 64
+            content.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki', 'source': 'mediawiki_content_current',
+                'content_release': '2026-10-01', 'complete': True, 'files': content_files}))
+            with self.assertRaisesRegex(ValueError, 'Checksum'):
+                infer_quality(raw_path, content, output, stage)
+            self.assertEqual(output.read_bytes(), previous)
+            quality['pages'][0]['revision_id'] = 99
+            with self.assertRaisesRegex(ValueError, 'revisione'):
+                attach_quality(memory['pages'], raw['metadata'], quality)
 
 
 if __name__ == '__main__':
