@@ -1,6 +1,6 @@
 # Orphan Articles in Wikipedia
 
-Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wikipedia. I dati di ricerca provengono esclusivamente dai dump ufficiali Wikimedia: SQL per pagine, collegamenti e categorie; MediaWiki History per creazione ricostruita e cronologia degli autori; XML `mediawiki_content_current` per la qualità strutturale stimata con Johnson V2. L’età usa `page_creation_timestamp`; i conteggi degli autori si riferiscono alla cronologia pubblica e alle voci attribuite nel censimento. Le soglie di qualità sono relative alla singola edizione. Il modello locale dei 64 temi usa i collegamenti del grafo e pesi preaddestrati verificati. Le proposte di collegamento sono suggerimenti da controllare manualmente, non modifiche automatiche.
+Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wikipedia. I dati di ricerca provengono esclusivamente dai dump ufficiali Wikimedia: SQL per pagine, collegamenti e categorie; MediaWiki History per creazione ricostruita e cronologia degli autori; XML `mediawiki_content_current` per la qualità strutturale stimata con Johnson V2. L’età usa `page_creation_timestamp`; i conteggi degli autori si riferiscono alla cronologia pubblica e alle voci attribuite nel censimento. Le soglie di qualità sono relative alla singola edizione. Il modello locale dei 64 temi usa i collegamenti del grafo e pesi preaddestrati verificati. Le proposte di collegamento sono suggerimenti da controllare manualmente, non modifiche automatiche. Con **Fix this**, la webapp legge su richiesta il wikitesto corrente delle pagine coinvolte dalle API ufficiali di Wikipedia e prepara prompt e fonti da copiare in una chat nuova; l’invio al modello è manuale. I testi restano in memoria fino alla chiusura della finestra e non aggiornano i dati del censimento. Revisioni, dimensioni e checksum accompagnano le fonti; quelle non verificabili sono segnalate.
 
 ## Struttura
 
@@ -10,7 +10,7 @@ Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wik
 - `orphanwiki/core.py`: orchestrazione dell'analisi nativa, temi, confronto interlingua ed esportazioni.
 - `src/`: calcoli Rust per grafo, cronologia e statistiche della dashboard; PyO3 e WebAssembly condividono il nucleo pertinente.
 - `scripts/run_dumps.py`: esegue in sequenza l'intera raccolta, con log e ripresa dei passi verificati.
-- `web/src/`: interfaccia TypeScript e CSS; `web/assets/` è prodotto dal build.
+- `web/src/`: interfaccia TypeScript e CSS; `web/assets/` è prodotto dal build. Nel dialogo di Fix this, l’opzione DEBUG aggiunge al prompt domande diagnostiche separate dalla risposta normale; è disattivata di default.
 - `tests/`: test Rust, Python e browser DOM. Le fixture sintetiche non sono dati di ricerca.
 - `.github/workflows/test.yml`: stessi controlli automatici su Ubuntu 24.04 per push e pull request.
 

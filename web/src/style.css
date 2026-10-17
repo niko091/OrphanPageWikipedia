@@ -350,6 +350,17 @@ dialog textarea {
   resize: vertical;
 }
 
+.prompt-debug {
+  flex-direction: row;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.prompt-debug input {
+  margin: 0;
+  padding: 0;
+}
+
 .prompt-actions {
   display: flex;
   gap: 12px;

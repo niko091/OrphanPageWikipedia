@@ -6,6 +6,7 @@ const {pathToFileURL}=require('node:url');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
+const {createHash,webcrypto}=require('node:crypto');
 const appCode=fs.readFileSync('web/assets/app.js','utf8');
 const nativePath=appCode.match(/const nativeModuleUrl='([^']+)';/)[1];
 const nativeReady=import(new URL(nativePath,pathToFileURL(path.resolve('web/assets/app.js'))).href).then(async bindings=>{
@@ -31,6 +32,43 @@ class Element {
 const descendants=node=>[node,...node.children.flatMap(descendants)];
 const findClass=(node,name)=>descendants(node).find(n=>n.className===name);
 const titleLink=card=>findClass(card,'candidate-title').children[0];
+function revisionFixture(url,roots) {
+  const language=url.hostname.split('.')[0],pageId=Number(url.searchParams.get('pageids'))||null;
+  let title=url.searchParams.get('titles'),id=pageId;
+  const identities=[];
+  for(const root of roots) {
+    if(!root?.metadata)continue;
+    for(const page of root.pages||[])identities.push({language:page.language||root.metadata.language,id:page.page_id,title:page.title});
+    for(const [key,record] of Object.entries(root.link_candidates||{})) {
+      const code=key.includes(':')?key.split(':')[0]:root.metadata.language;
+      for(const candidate of record.candidates||[]) {
+        identities.push({language:code,id:candidate.page_id,title:candidate.title});
+        for(const edge of candidate.evidence||[]) {
+          identities.push({language:edge.language,id:edge.source_page_id,title:edge.source_title});
+          identities.push({language:edge.language,id:edge.target_page_id,title:edge.target_title});
+        }
+      }
+    }
+  }
+  if(pageId)title=identities.find(row=>row.language===language&&row.id===pageId)?.title;
+  else id=identities.find(row=>row.language===language&&row.title===title&&Number.isSafeInteger(row.id)&&row.id>0)?.id||100000;
+  assert.equal(typeof title,'string',`No synthetic identity for ${url}`);
+  const content=`'''${title}''' (${language})\n== Filmografia ==\nTesto integrale à ł.\n`;
+  return revisionContent(id,title,content);
+}
+function revisionContent(id,title,content) {
+  return {query:{pages:[{pageid:id,ns:0,title,revisions:[{revid:id+1000,timestamp:'2026-10-15T12:00:00Z',size:Buffer.byteLength(content),
+    sha1:createHash('sha1').update(content).digest('hex'),slots:{main:{contentmodel:'wikitext',content}}}]}]}};
+}
+async function preparePrompt(result,control) {
+  assert.equal(typeof control.listeners.click,'function');
+  await control.listeners.click();
+  assert.equal(result.nodes['llm-prompt'].open,true);
+  return result.nodes['llm-prompt-text'].value;
+}
+function sourceMetadata(prompt) {
+  return [...prompt.matchAll(/^DOCUMENT D\d+\n(\{[\s\S]*?^\})/gm)].map(match=>JSON.parse(match[1]));
+}
 async function harness(page,raw,search='?dataset=fixture.json',entries=null,preferences={},files=null) {
   const file=page==='articles'?'index.html':page+'.html';
   const html=fs.readFileSync('web/'+file,'utf8');
@@ -53,7 +91,7 @@ async function harness(page,raw,search='?dataset=fixture.json',entries=null,pref
   const copied=[];
   const navigator=preferences.clipboardUnavailable?{}:{clipboard:{writeText:async text=>{if(preferences.clipboardFailure)throw new Error('clipboard denied');copied.push(text);}}};
   let fetchCount=0;const requests=[];
-  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,cache:options?.cache});fetchCount++;return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?preferences.apiResponse?.(new URL(url)):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
+  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,TextEncoder,AbortController,crypto:webcrypto,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?(preferences.apiResponse?preferences.apiResponse(new URL(url),options):revisionFixture(new URL(url),[raw,...Object.values(files||{})])):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
   await nativeReady;
   vm.runInContext(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
   await vm.runInContext('dashboardReady',context);
@@ -432,7 +470,7 @@ async function checkConnections() {
     {page_id:3,title:'Z normale',dead_end:false,evidence:[{language:'lmo',source_title:'Fonte Z',target_title:'Bersaglio'}]},
     {page_id:2,title:'A & B',dead_end:true,evidence:[{language:'lmo',source_title:'Fonte',target_title:'Bersaglio'},{language:'it',source_title:'Fonte italiana',target_title:'Destinazione italiana'}]}
   ]}};
-  const {nodes,context}=await harness('connections',raw,'?dataset=fixture.json&page=1');
+  const result=await harness('connections',raw,'?dataset=fixture.json&page=1'),{nodes,context}=result;
   assert.equal(nodes['connection-title'].textContent,raw.pages[0].title);
   assert.equal(nodes['connection-candidates'].children.length,2);
   const card=nodes['connection-candidates'].children[0];
@@ -447,16 +485,17 @@ async function checkConnections() {
   assert.equal(evidence[0].children[1].children[0].href,'https://lmo.wikipedia.org/wiki/Fonte');
   assert.equal(evidence[0].children[1].children[2].href,'https://lmo.wikipedia.org/wiki/Bersaglio');
   assert.equal(findClass(card,'candidate-footer').children[0].textContent,'Fix this');
-  const prompt=new URL(findClass(card,'fix-link').href).searchParams.get('text');
-  assert(prompt.includes(`Y = ${JSON.stringify(raw.pages[0].title)}`));
-  assert(prompt.includes('X = "A & B" [local census dead_end=true; Dead-end page]'));
+  const prompt=await preparePrompt(result,findClass(card,'fix-link'));
+  assert(prompt.includes(`LOCAL_Y = ${JSON.stringify(raw.pages[0].title)}`));
+  assert(prompt.includes('local census dead_end=true; Dead-end page'));
   assert.match(prompt,/Evaluate only this single proposed link X → Y/);
   assert(!prompt.includes('Z normale'));assert(!prompt.includes('Fonte Z'));
-  assert(prompt.includes('https://lmo.wikipedia.org/wiki/Fonte → Y_B https://lmo.wikipedia.org/wiki/Bersaglio'));
-  assert(prompt.includes('https://it.wikipedia.org/wiki/Fonte_italiana → Y_B https://it.wikipedia.org/wiki/Destinazione_italiana'));
+  assert(prompt.includes('https://lmo.wikipedia.org/wiki/Fonte → REFERENCE_Y'));
+  assert(prompt.includes('https://it.wikipedia.org/wiki/Fonte_italiana → REFERENCE_Y'));
   assert.match(prompt,/at most one edit \(one table row\)/);
   assert(!prompt.includes('up to 5'));
-  const otherPrompt=new URL(findClass(nodes['connection-candidates'].children[1],'fix-link').href).searchParams.get('text');
+  assertAccessInstructions(prompt);
+  const otherPrompt=await preparePrompt(result,findClass(nodes['connection-candidates'].children[1],'fix-link'));
   assert(otherPrompt.includes('Z normale'));assert(!otherPrompt.includes('A & B'));
   assert(!otherPrompt.includes('Fonte_italiana'));
   assert(!findClass(nodes['connection-candidates'].children[1],'dead-end-badge'));
@@ -476,18 +515,59 @@ async function checkConnections() {
   console.log('Connections page: proposed/existing links, dead-end priority, pagination, safety and invalid routes passed.');
 }
 function assertAnchorInstructions(prompt) {
-  assert.match(prompt,/Anchor-first: fix Y as destination/);
-  assert.match(prompt,/Check disambiguation/);
-  assert.match(prompt,/title \(with\/without disambiguation parentheses\)/);
-  assert.match(prompt,/aliases attested in supplied pages; hints, not identity proof/);
-  assert.match(prompt,/existing unlinked mention with the reference anchor's sense/);
-  assert.match(prompt,/Choose by context, not just position\/spelling; link once/);
-  assert.match(prompt,/No invented probabilities\/keyphraseness\/confidence/);
-  assert.match(prompt,/Use ADD LINK for a verified unlinked mention; keep wording/);
-  assert.match(prompt,/minimal reference-supported content only if locally relevant; else skip/);
-  assert.match(prompt,/No See also solely to remove orphan status/);
-  assert.match(prompt,/existing mention\/new content\/already linked\/no relevant anchor or context\/unreadable/);
-  assert.match(prompt,/citation markup\/full named-reference definitions/);
+  assert.match(prompt,/Draft proposed incoming links X → Y as text only/);
+  assert.match(prompt,/No execution, authentication or live verification is requested/);
+  assert.match(prompt,/existing unlinked local mention identifying Y: use ADD LINK and keep its wording/);
+  assert.match(prompt,/A film title is not a mention of an actor/);
+  assert.match(prompt,/If no such mention exists, separately assess minimal NEW CONTENT supported by the references/);
+  assert.match(prompt,/an attested relationship is not an invented fact merely because it is absent locally/);
+  assert.match(prompt,/Do not create new sections or subsections/);
+  assert.match(prompt,/New content must fit an existing local passage, table, list or template invocation; if it requires a new section, skip/);
+  assert.match(prompt,/Entries in existing lists and missing template fields are allowed when the specific addition improves X/);
+  assert.match(prompt,/Their presence in another language alone is insufficient/);
+  assert.match(prompt,/evidence of both the value and the supported local parameter\/syntax in the supplied documents/);
+  assert.match(prompt,/never invent parameters or copy foreign-language parameter names/);
+  assert.match(prompt,/Edit only the invocation in X, not shared template definitions/);
+  assert.match(prompt,/Missing local template support means skip that field proposal/);
+  assert.match(prompt,/Judge usefulness in the local context, not just whether an insertion point exists/);
+  assert.match(prompt,/No content or See also solely to remove orphan status/);
+  assert.match(prompt,/“with” does not establish a leading role/);
+  assert.match(prompt,/Interpret editorial comments within their actual section\/field scope/);
+  const ending=prompt.split('\n\nEND OF SUPPLIED DOCUMENTS — RESPONSE INSTRUCTIONS\n')[1];
+  assert(ending);assert.match(ending,/Start directly with a Markdown table with exactly these four columns/);
+  assert.match(ending,/use clickable Markdown links to the supplied local\/reference URLs/);
+  assert.match(ending,/unique verbatim single-line Ctrl\+F string within the local passage anchoring the insertion or replacement/);
+  assert.match(ending,/For ADD LINK it must be the actual existing unlinked mention of Y/);
+  assert.match(ending,/only the shortest complete name or term to link, excluding surrounding articles, verbs, punctuation and sentence context unless integral to the name/);
+  assert.match(ending,/Preserve its exact spelling and capitalization; use a piped link label if the destination title differs/);
+  assert.match(ending,/ADD LINK rows have no replacement text, rewritten sentence or associated code block/);
+  assert.match(ending,/Every non-ADD LINK block must add \[\[.+\]\] and change the supplied local text/);
+  assert.match(ending,/an unchanged block or one without the target link is invalid/);
+  assert.match(ending,/For REPLACE identify the scope and supply the complete new block, not the old one/);
+  assert.match(ending,/preserve the whole affected row and its columns\/roles/);
+  assert.match(ending,/Silently check anchors, target links and agreement between rows, blocks and reasons/);
+  assert.match(ending,/correct or omit contradictions/);
+  assert.match(ending,/A skipped candidate has no table row/);
+  assert.match(ending,/Never add section\/subsection headings; skip additions requiring a new section/);
+  assert.match(ending,/Missing template fields remain eligible only when locally justified and supported as above/);
+  assert.match(ending,/Output only the table, necessary wikitext blocks and optional reasons/);
+  assert.match(ending,/at most one short sentence per candidate \(25 words\)/);
+  assert.match(ending,/Keep document IDs, revisions, checksums and verification analysis internal/);
+  assert.match(ending,/No preamble, headings, capability disclaimers/);
+  assert.match(ending,/Zero rows are valid: headers only, no dummy rows/);
+  assert(!prompt.includes('New sections, list entries and missing template fields are allowed'));
+  assert(!prompt.includes('New sections/fields remain eligible'));
+}
+function assertAccessInstructions(prompt) {
+  assert.match(prompt,/complete Wikipedia main-slot wikitext/);
+  assert.match(prompt,/do not browse, search, call APIs or open external citations/);
+  assert.match(prompt,/A mention\/link in REFERENCE_X is not a mention\/link in LOCAL_X/);
+  assert.match(prompt,/Missing documents, unprovided template expansions and unresolved redirects remain unknown/);
+  assert.match(prompt,/Claim absence only from complete relevant source text/);
+  assert.match(prompt,/An access failure is not an editorial rejection/);
+  assert.match(prompt,/Census interval \(not source retrieval dates\)/);
+  assert.match(prompt,/timestamp is its revision date; retrieved_at is its acquisition date/);
+  assert(!prompt.includes('source view/API fallback'));
 }
 async function checkFixPrompts() {
   const raw=fixture();raw.metadata.demo=false;
@@ -495,295 +575,248 @@ async function checkFixPrompts() {
   raw.pages=[page];
   const candidates=Array.from({length:40},(_,i)=>({page_id:i+2,title:`Fonte ${String(i).padStart(2,'0')}`,dead_end:i>=35,evidence:[{language:'lmo',source_title:`Reference ${i}`,target_title:'Target B'}]}));
   raw.link_candidates={1:{status:'compared',candidate_count:40,candidates}};
-  const originalData=JSON.stringify(raw);
-  const result=await harness('deorphanize',raw),{nodes,context,getFetchCount}=result;
-  const card=()=>nodes['candidate-cards'].children[0];
-  const fix=()=>findClass(card(),'fix-link');
-  const prompt=()=>new URL(fix().href).searchParams.get('text');
+  const original=JSON.stringify(raw),result=await harness('deorphanize',raw),{nodes,context}=result;
+  const card=()=>nodes['candidate-cards'].children[0],fix=()=>findClass(card(),'fix-link');
   assert.equal(titleLink(card()).href,'https://vec.wikipedia.org/wiki/Y_%C3%A0_%26_%23_%3Cimg%3E');
-  assert.equal(titleLink(card()).textContent,page.title);
-  assert.equal(fix().textContent,'Fix this');
-  const url=new URL(fix().href);
-  assert.equal(url.origin,'https://chat.qwen.ai');assert.equal(url.pathname,'/');
-  assert.equal(url.searchParams.get('inputFeature'),'search');
-  assert.deepEqual([...url.searchParams.keys()],['inputFeature','text']); // prefill, never automatic submission
-  assert.equal(fix().target,'_blank');assert.equal(fix().rel,'noopener noreferrer');
-  assert(fix().href.length<=7500);
-  let text=prompt();
-  assert.match(text,/X → Y/);assert.match(text,/Read Y, each local X and all X_B\/Y_B once/);
-  assert.match(text,/Reply in Italian/);assert.match(text,/propose up to 5 distinct relevant edits/);
-  assert.match(text,/always preferring suitable Dead-end pages/);
-  assert.match(text,/unique verbatim source Ctrl\+F anchor/);assert.match(text,/copyable Wikipedia wikitext/);
-  assert.match(text,/exactly ADD LINK/);assert.match(text,/Markdown table with exactly these four columns/);
-  assert.match(text,/Link pagina lingua da cambiare \| Link pagina lingua di provenienza \| Stringa da cercare con Ctrl\+F \| Stringa da inserire \/ ADD LINK/);
-  assert.match(text,/neutrality, verifiability, no original research/);
-  // Editorial evidence must stay on Wikipedia, with verified source anchors,
-  // explicit census flags, relevant relationships and copyable edit instructions.
-  assert.match(text,/Use ONLY the supplied Wikipedia pages/);
-  assert.match(text,/Do not search the web, open external citation links/);
-  assert.match(text,/Use only facts stated in supplied references/);
-  assert.match(text,/never invent sources/);assert(!text.includes("checking the reference article's original citations"));
-  assert.match(text,/Use exact local source wikitext\/anchors\/syntax/);
-  assert.match(text,/on raw failure try one same-wiki source view\/API fallback/);
-  assert.match(text,/never guess text from rendered output/);
-  assert.match(text,/Truncated\/error\/login pages are unreadable/);
-  assert.match(text,/Orphan tags\/name absence\/bold\/navbox labels prove nothing/);
-  assert.match(text,/including piped\/redirect links/);
-  assert.match(text,/Verify href\/resolved targets/);
-  assert.match(text,/unverified stays unknown/);
-  assert.match(text,/Skip existing X → Y links/);
-  assert.match(text,/Use ONLY supplied local census dead_end flags/);
-  assert.match(text,/unknown stays unknown/);assert.match(text,/Never infer them from rendered text/);
-  assert.match(text,/shared navbox\/category, profession or team alone does not justify new prose/);
-  assert.match(text,/inclusion criteria, date, place and ordering/);
-  assert.match(text,/birthplace, residence and place of death are not interchangeable/);
-  assert.match(text,/BEFORE\/AFTER\/REPLACE outside code/);
-  assert.match(text,/complete replacement text/);
-  assert.match(text,/numbered fenced wikitext block below the table with real newlines/);
-  assert.match(text,/exact unlinked words referring to Y/);
-  assert.match(text,/local X Markdown link/);
-  assert.match(text,/row-numbered evidence notes/);assert.match(text,/No deliberation/);
-  assert.match(text,/Zero rows are valid/);
-  assertAnchorInstructions(text);
-  assert(text.includes('Target source view: https://vec.wikipedia.org/w/index.php?curid=1&action=raw'));
-  const referenceViews=text.split('Reference source views:\n')[1].split('\n');
-  assert.equal(referenceViews.length,6); // shared Y_B raw URL appears once, not once per candidate
-  assert.equal(new Set(referenceViews).size,6);
-  assert(referenceViews.includes('https://lmo.wikipedia.org/w/index.php?title=Target_B&action=raw'));
-  assert.match(text,/Do not edit Wikipedia or submit anything/);assert(!text.includes('private-actor'));
-  let entries=text.split('Candidate source pages X:\n')[1].split('\n').filter(line=>/^\d+\. Local X/.test(line));
-  assert.equal(entries.length,5);assert.match(entries[0],/Fonte 35.*Dead-end page/);
-  assert(entries.every(line=>line.includes('Dead-end page')));
-  assert.match(text,/5 candidate source pages \(selected from 40\)/);
-  for(let i=35;i<40;i++) {
-    assert(text.includes(`https://vec.wikipedia.org/wiki/Fonte_${i}`));
-    assert(text.includes(`https://vec.wikipedia.org/w/index.php?curid=${i+2}&action=raw`));
-    assert(text.includes(`https://lmo.wikipedia.org/wiki/Reference_${i} → Y_B https://lmo.wikipedia.org/wiki/Target_B`));
-    assert(referenceViews.includes(`https://lmo.wikipedia.org/w/index.php?title=Reference_${i}&action=raw`));
+  assert.equal(fix().tag,'button');assert.equal(fix().type,'button');assert(!fix().href);
+  assert.equal(result.requests.filter(row=>row.url.startsWith('https://')).length,0);
+  let prompt=await preparePrompt(result,fix());
+  assertAnchorInstructions(prompt);assertAccessInstructions(prompt);
+  assert.match(prompt,/Reply in Italian/);assert.match(prompt,/Evaluate only these 5 candidates \(selected from 40\)/);
+  assert.match(prompt,/Selection is dead-end then alphabetical, not editorial relevance/);
+  assert.match(prompt,/suitable Dead-end pages first/);
+  assert.match(prompt,/Link pagina lingua da cambiare \| Link pagina lingua di provenienza/);
+  assert(!prompt.includes('private-actor'));assert(!prompt.includes('Fonte 00'));
+  assert.equal((prompt.match(/^\d+\. LOCAL_X/gm)||[]).length,5);
+  assert.equal(sourceMetadata(prompt).length,12); // Y, five local X, five reference X, shared reference Y.
+  assert(sourceMetadata(prompt).every(row=>row.status==='READABLE'));
+  for(let i=35;i<40;i++)assert(prompt.includes(`Fonte ${i}`)&&prompt.includes(`Reference_${i}`));
+  const requests=result.requests.filter(row=>row.url.startsWith('https://'));
+  assert.equal(requests.length,12);assert.equal(result.copied.length,0);
+  for(const row of requests) {
+    const url=new URL(row.url);
+    assert.equal(url.pathname,'/w/api.php');assert.equal(url.searchParams.get('action'),'query');
+    assert.equal(url.searchParams.get('prop'),'revisions');assert.equal(url.searchParams.get('origin'),'*');
+    assert.equal(url.searchParams.get('rvslots'),'main');assert.equal(row.credentials,'omit');assert.equal(row.cache,'no-store');
   }
-  for(const [provider,parameter] of [['kimi','prefill_prompt'],['mistral','q'],['deepseek','q'],['qwen','text']]) {
+  assert.equal(requests.filter(row=>new URL(row.url).searchParams.get('titles')==='Target B').length,1);
+  assert.match(nodes['llm-prompt-status'].textContent,/12\/12/);
+  assert.equal(nodes['llm-prompt-copy'].disabled,false);
+  await nodes['llm-prompt-copy'].listeners.click();assert.equal(result.copied[0],prompt);
+  assert.equal(JSON.stringify(raw),original);
+  const fetches=result.getFetchCount();
+  for(const [provider,url] of [['kimi','https://www.kimi.ai/'],['mistral','https://chat.mistral.ai/chat'],['glm','https://chat.z.ai/'],['qwen','https://chat.qwen.ai/']]) {
     nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
-    assert.equal(new URL(fix().href).searchParams.get(parameter),text); // Unicode, &, #, full five candidates and every supplied reference URL survive encoding
-    assert(!fix().listeners.click);assert.equal(result.copied.length,0);
+    assert.equal(result.getFetchCount(),fetches);
+    assert.equal(nodes['llm-prompt'].open,false);assert.equal(nodes['llm-prompt-text'].value,'');
+    assert(fix().title.includes(({qwen:'Qwen',kimi:'Kimi',mistral:'Mistral',glm:'GLM'})[provider]));
+    assert.equal(new URL(url).search,'');
   }
-  const fetches=getFetchCount();
-  nodes['ui-language-toggle'].listeners.click();
-  text=prompt();assert.match(text,/Reply in English/);
-  assert.match(text,/Page link \(language to edit\) \| Page link \(reference language\)/);
-  assert.match(text,/article language \(vec\)/);assert(text.includes(page.title));
-  assert.equal(titleLink(card()).textContent,page.title);assert.equal(getFetchCount(),fetches);
-  assert.equal(JSON.stringify(raw),originalData); // all source URLs are derived, never stored in the graph
+  nodes['ui-language-toggle'].listeners.click();assert.equal(result.getFetchCount(),fetches);
+  prompt=await preparePrompt(result,fix());assert.match(prompt,/Reply in English/);
+  assert.match(prompt,/Page link \(language to edit\) \| Page link \(reference language\)/);
+  assert.equal(nodes['llm-prompt-open'].href,'https://chat.qwen.ai/');
   nodes['ui-language-toggle'].listeners.click();
   raw.link_candidates[1]={candidate_count:2,candidates:[candidates[0],candidates[35],candidates[35],{page_id:1,title:page.title},{page_id:0,title:'Invalid'},{page_id:99,title:null}]};
   vm.runInContext('candidateCards()',context);
-  text=prompt();entries=text.split('Candidate source pages X:\n')[1].split('\n').filter(line=>/^\d+\. Local X/.test(line));
-  assert.equal(entries.length,2);assert.match(entries[0],/Dead-end page/);
-  assert(!entries[1].includes('Dead-end page'));
-  assert.match(entries[1],/dead_end=false/);
-  assert.match(text,/Do not add other candidates or force links/);assert.match(text,/2 candidate source pages \(selected from 2\)/);
-  const unknown={page_id:90,title:'Unknown à & #',evidence:[{language:'lmo',source_title:'Reference unknown',target_title:'Target B'}]};
-  const before=JSON.stringify(unknown);
-  raw.link_candidates[1]={candidate_count:3,candidates:[unknown,candidates[0],candidates[35]]};
-  vm.runInContext('candidateCards()',context);
-  text=prompt();entries=text.split('Candidate source pages X:\n')[1].split('\n').filter(line=>/^\d+\. Local X/.test(line));
-  assert.equal(entries.length,3);assert.match(entries[0],/dead_end=true/);
-  assert.match(entries[1],/dead_end=false/);assert.match(entries[2],/dead_end=unknown/);
-  assert(text.includes('https://vec.wikipedia.org/w/index.php?curid=90&action=raw'));
-  assert(text.includes('https://vec.wikipedia.org/wiki/Unknown_%C3%A0_%26_%23'));
-  assert.equal(JSON.stringify(unknown),before); // unknown remains missing in the research data
-  // Reference page IDs belong to their own wiki, never the local source/target.
-  unknown.evidence[0].source_page_id=501;unknown.evidence[0].target_page_id=601;
-  const withReferenceIds=JSON.stringify(raw);
-  vm.runInContext('candidateCards()',context);
-  text=prompt();
-  assert(text.includes('https://lmo.wikipedia.org/w/index.php?curid=501&action=raw'));
-  assert(text.includes('https://lmo.wikipedia.org/w/index.php?curid=601&action=raw'));
-  assert(!text.includes('https://lmo.wikipedia.org/w/index.php?curid=90&action=raw'));
-  assert.equal(JSON.stringify(raw),withReferenceIds);
-  // Invalid IDs cannot inject query parameters; derive a title URL instead.
+  prompt=await preparePrompt(result,fix());
+  const entries=prompt.split('Candidate source pages X:\n')[1].split('\n').filter(line=>/^\d+\. LOCAL_X/.test(line));
+  assert.equal(entries.length,2);assert.match(entries[0],/Dead-end page/);assert.match(entries[1],/dead_end=false/);
+  const unknown={page_id:90,title:'Unknown à & #',evidence:[{language:'lmo',source_title:'Reference unknown',source_page_id:501,target_title:'Target B',target_page_id:601}]};
+  raw.link_candidates[1]={candidate_count:1,candidates:[unknown]};vm.runInContext('candidateCards()',context);
+  prompt=await preparePrompt(result,fix());assert.match(prompt,/dead_end=unknown/);
+  assert(sourceMetadata(prompt).some(row=>row.language==='lmo'&&row.page_id===501));
+  assert(sourceMetadata(prompt).some(row=>row.language==='lmo'&&row.page_id===601));
   unknown.evidence[0].source_page_id='501&action=submit';unknown.evidence[0].target_page_id=-1;
-  unknown.evidence[0].source_title='Reference à & # <img>';
-  vm.runInContext('candidateCards()',context);
-  const sources=prompt().split('Reference source views:\n')[1].split('\n').map(value=>new URL(value));
-  const fallback=sources.find(value=>value.searchParams.get('title')==='Reference_à_&_#_<img>');
-  assert(fallback);assert.equal(fallback.searchParams.get('action'),'raw');
-  assert(!fallback.searchParams.has('curid'));
-  assert(sources.every(value=>value.protocol==='https:'&&value.hostname==='lmo.wikipedia.org'&&value.searchParams.get('action')==='raw'));
-  raw.metadata.language='roa-tara';vm.runInContext('candidateCards()',context);
-  assert.match(titleLink(card()).href,/roa-tara\.wikipedia/);
-  assert.match(prompt(),/article language \(roa-tara\)/);
-  assert(prompt().includes('https://roa-tara.wikipedia.org/wiki/Fonte_35'));
-  assert(prompt().includes('https://roa-tara.wikipedia.org/w/index.php?curid=37&action=raw'));
-  // Realistic title lengths exercise provider URL limits; IDs/flags are synthetic.
-  for(const [language,title,names,referenceNames] of [
-    ['vec','Graham Hill',['Ayrton Senna','Fernando Alonso','Jackie Stewart','Lewis Hamilton','Mario Andretti']],
-    ['vec','Hebe Camargo',['1929','2012','29 de setenbre','8 de marso','San Poło del Braxil'],['1929','2012','29 09','08 03','São Paulo']],
-    ['roa-tara','Tapogliano',['Aiello del Friuli','Amaro','Ampezzo (UD)','Aquileia','Arta Terme'],['Aiello del Friuli','Amaro','Ampezzo','Aquileia','Arta Terme']]
-  ]) {
-    raw.metadata.language=language;page.title=title;
-    raw.link_candidates[1]={candidate_count:5,candidates:names.map((name,i)=>({page_id:i+2,title:name,dead_end:true,evidence:[{language:'lmo',source_title:(referenceNames||names)[i],source_page_id:100+i,target_title:title,target_page_id:200}]}))};
-    const unchanged=JSON.stringify(raw);
-    for(const [provider,parameter] of [['qwen','text'],['kimi','prefill_prompt'],['mistral','q'],['deepseek','q']]) {
-      nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
-      const url=new URL(fix().href),request=url.searchParams.get(parameter);
-      assert(request);assert(fix().href.length<=7500);assert(!fix().listeners.click);
-      assert(request.includes('Reference source views:\n'));
-      assert.equal(request.split('Reference source views:\n')[1].split('\n').length,6);
-      assert.match(request,/5 candidate source pages \(selected from 5\)/);
-    }
-    assert.equal(JSON.stringify(raw),unchanged);
-  }
-  nodes['llm-provider'].value='qwen';nodes['llm-provider'].listeners.change();
+  const before=result.requests.length;
+  vm.runInContext('candidateCards()',context);await preparePrompt(result,fix());
+  assert(result.requests.slice(before).some(row=>new URL(row.url).searchParams.get('titles')==='Reference unknown'));
+  assert(result.requests.slice(before).every(row=>new URL(row.url).searchParams.get('action')==='query'));
   for(const record of [undefined,{candidate_count:null,candidates},{candidate_count:0,candidates:[]},{candidate_count:1,candidates:[{page_id:2,title:'No evidence',evidence:[{language:'lmo.evil',source_title:'X',target_title:'Y'}]}]}]) {
-    raw.link_candidates[1]=record;vm.runInContext('candidateCards()',context);
-    assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');assert(!fix().href);
+    raw.link_candidates[1]=record;vm.runInContext('candidateCards()',context);assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');
   }
-  raw.link_candidates[1]={candidate_count:40,candidates};raw.metadata.demo=true;
-  vm.runInContext('candidateCards()',context);
-  assert.equal(fix().textContent,'Fix this · DEMO');assert(!fix().href);assert(!titleLink(card()).href);
-  raw.metadata.demo=false;page.title='à'.repeat(1000);vm.runInContext('candidateCards()',context);
-  assert.equal(fix().href,'https://chat.qwen.ai/'); // long prompts use the complete copy fallback, never drop candidates
-  fix().listeners.click();await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(nodes['llm-prompt'].open,true);assert.equal(result.copied.length,1);
-  assert.equal(result.copied[0],nodes['llm-prompt-text'].value);
-  assert.match(nodes['llm-prompt-text'].value,/5 candidate source pages/);
-  assert(nodes['llm-prompt-text'].value.includes(page.title));
-  nodes['llm-prompt-close'].listeners.click();assert.equal(nodes['llm-prompt'].open,false);
-  assert.equal(getFetchCount(),fetches); // external services are contacted only when the user follows the link
-  console.log('Fix this: Wikipedia-only instructions, clean edits, exact source anchors, derived/deduplicated raw URLs, unchanged graphs, explicit dead-end flags, five candidates, provider prefilling, generic wiki codes and full-copy fallback passed.');
+  raw.link_candidates[1]={candidate_count:40,candidates};raw.metadata.demo=true;vm.runInContext('candidateCards()',context);
+  assert.equal(fix().textContent,'Fix this · DEMO');assert(!fix().listeners.click);assert(!titleLink(card()).href);
+  console.log('Fix this: click-only revisions, twelve deduplicated complete sources, scope/role instructions, explicit clipboard, safe provider URLs, dead-end ranking and unchanged data passed.');
 }
 async function checkSingleConnectionPrompts() {
   const raw=fixture();raw.metadata.demo=false;raw.metadata.language='roa-tara';
-  const page={page_id:1,title:'Orphan à & #',orphan:true,category:'Tema'};
+  raw.pages=[{page_id:1,title:'Orphan à & #',orphan:true,category:'Tema'}];
   const chosen={page_id:90,title:'Chosen à & #',dead_end:false,evidence:['lmo','it','fur'].map((language,i)=>({language,source_title:`Ref ${language}`,source_page_id:100+i,target_title:`Target ${language}`,target_page_id:200+i}))};
   const others=Array.from({length:6},(_,i)=>({page_id:i+2,title:`Other ${i}`,dead_end:true,evidence:[{language:'lmo',source_title:`Unrelated ${i}`,target_title:'Other target'}]}));
-  raw.pages=[page];raw.link_candidates={1:{candidate_count:7,candidates:[...others,chosen]}};
-  const unchanged=JSON.stringify(raw);
-  const result=await harness('connections',raw,'?dataset=fixture.json&page=1'),{nodes,context,getFetchCount}=result;
-  const card=()=>nodes['connection-candidates'].children.find(row=>titleLink(row).textContent===chosen.title);
-  const fix=()=>findClass(card(),'fix-link');
-  const fetches=getFetchCount();
-  for(const [provider,parameter] of [['qwen','text'],['kimi','prefill_prompt'],['mistral','q'],['deepseek','q']]) {
-    nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
-    const prompt=new URL(fix().href).searchParams.get(parameter);
-    assert(prompt);assert(fix().href.length<=7500);assert(!fix().listeners.click);
+  raw.link_candidates={1:{candidate_count:7,candidates:[...others,chosen]}};
+  const before=JSON.stringify(raw),result=await harness('connections',raw,'?dataset=fixture.json&page=1'),{nodes,context}=result;
+  const card=()=>nodes['connection-candidates'].children.find(row=>titleLink(row).textContent===chosen.title),fix=()=>findClass(card(),'fix-link');
+  for(const [provider,url] of [['qwen','https://chat.qwen.ai/'],['kimi','https://www.kimi.ai/'],['mistral','https://chat.mistral.ai/chat'],['glm','https://chat.z.ai/']]) {
+    const fetches=result.getFetchCount();nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
+    assert.equal(result.getFetchCount(),fetches);
+    const prompt=await preparePrompt(result,fix());
+    assert.equal(nodes['llm-prompt-open'].href,url);assert.equal(new URL(url).search,'');
     assert.match(prompt,/Evaluate only this single proposed link X → Y/);
-    assert.match(prompt,/Do not evaluate, suggest or edit other local source pages/);
-    assert.match(prompt,/at most one edit \(one table row\)/);
-    assertAnchorInstructions(prompt);
-    assert.match(prompt,/include every supplied reference source URL in that same row/);
-    assert.match(prompt,/local census dead_end=false/);
-    assert(!prompt.includes('up to 5'));assert(!prompt.includes('/wiki/Other_'));assert(!prompt.includes('/wiki/Unrelated_'));
-    assert.equal((prompt.match(/^\d+\. Local X/gm)||[]).length,1);
+    assert.match(prompt,/at most one edit \(one table row\)/);assert.match(prompt,/include every supplied reference source URL/);
+    assertAnchorInstructions(prompt);assertAccessInstructions(prompt);
+    assert(!prompt.includes('up to 5'));assert(!prompt.includes('Other_'));assert(!prompt.includes('Unrelated_'));
+    assert.equal((prompt.match(/^\d+\. LOCAL_X/gm)||[]).length,1);
     assert.equal((prompt.match(/Observed reference edge/g)||[]).length,3);
-    assert(prompt.includes('https://roa-tara.wikipedia.org/wiki/Chosen_%C3%A0_%26_%23'));
-    for(const edge of chosen.evidence) {
-      assert(prompt.includes(`https://${edge.language}.wikipedia.org/wiki/Ref_${edge.language} → Y_B https://${edge.language}.wikipedia.org/wiki/Target_${edge.language}`));
-      assert(prompt.includes(`https://${edge.language}.wikipedia.org/w/index.php?curid=${edge.source_page_id}&action=raw`));
-      assert(prompt.includes(`https://${edge.language}.wikipedia.org/w/index.php?curid=${edge.target_page_id}&action=raw`));
-    }
+    assert.equal(sourceMetadata(prompt).length,8);assert(sourceMetadata(prompt).every(row=>row.status==='READABLE'));
   }
-  nodes['ui-language-toggle'].listeners.click();
-  let prompt=new URL(fix().href).searchParams.get('q');
-  assert.match(prompt,/Reply in English/);assert.match(prompt,/Page link \(language to edit\)/);
-  assert.match(prompt,/article language \(roa-tara\)/);assert.equal(JSON.stringify(raw),unchanged);
-  assert.equal(getFetchCount(),fetches);assert.equal(result.copied.length,0);
-  // More than five reference languages are evidence for ONE local candidate, never a shortlist.
+  assert.equal(JSON.stringify(raw),before);assert.equal(result.copied.length,0);
   chosen.evidence.push(...['nap','sc','en','fr'].map((language,i)=>({language,source_title:`Ref ${language}`,source_page_id:300+i,target_title:`Target ${language}`,target_page_id:400+i})));
-  const fullData=JSON.stringify(raw);
-  nodes['llm-provider'].value='qwen';nodes['llm-provider'].listeners.change();
-  prompt=new URL(fix().href).searchParams.get('text');
-  if(!prompt) {
-    fix().listeners.click();await new Promise(resolve=>setImmediate(resolve));
-    prompt=nodes['llm-prompt-text'].value;
-    assert.equal(result.copied[0],prompt);
-    nodes['llm-prompt-close'].listeners.click();
-  }
-  assert.equal((prompt.match(/Observed reference edge/g)||[]).length,7);
-  assert.equal(prompt.split('Reference source views:\n')[1].split('\n').length,14);
-  assert(!prompt.includes('/wiki/Other_'));assert(!prompt.includes('up to 5'));
-  assert.equal(JSON.stringify(raw),fullData);assert.equal(getFetchCount(),fetches);
-  // Invalid/missing evidence must disable only its own card, without borrowing another candidate.
+  vm.runInContext('renderConnections()',context);
+  const prompt=await preparePrompt(result,fix());
+  assert.equal((prompt.match(/Observed reference edge/g)||[]).length,7);assert.equal(sourceMetadata(prompt).length,16);
+  assert(!prompt.includes('Other_'));assert(!prompt.includes('up to 5'));
   for(const evidence of [[],[{language:'lmo.evil',source_title:'Bad',target_title:'Bad'}]]) {
-    chosen.evidence=evidence;vm.runInContext('renderConnections()',context);
-    assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');
-    assert(nodes['connection-candidates'].children.some(row=>findClass(row,'fix-link').href));
+    chosen.evidence=evidence;vm.runInContext('renderConnections()',context);assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');
+    assert(nodes['connection-candidates'].children.some(row=>findClass(row,'fix-link').tag==='button'));
   }
-  console.log('Single connection prompts: isolated candidate beyond top five, every reference language, four providers, translations, unchanged data, complete oversized fallback and per-card disabled states passed.');
+  console.log('Single connection: isolated candidate beyond top five, all seven reference pairs without truncation, four plain chat URLs and unchanged data passed.');
 }
 async function checkLlmSelection() {
   const raw=fixture();raw.metadata.demo=false;
   raw.pages=Array.from({length:30},(_,i)=>({page_id:i+1,title:`Target ${i}`,orphan:true,category:'Tema'}));
   const record={candidate_count:1,candidates:[{page_id:99,title:'Local source',dead_end:true,evidence:[{language:'lmo',source_title:'Reference source',target_title:'Reference target'}]}]};
   raw.link_candidates=Object.fromEntries(raw.pages.map(page=>[page.page_id,record]));
-  const result=await harness('deorphanize',raw),{nodes,copied,storage,getFetchCount,html}=result;
-  assert.match(html,/<div class="toolbar">[\s\S]*id="dataset"[\s\S]*id="llm-provider"[\s\S]*<\/div>/);
-  assert.deepEqual(nodes['llm-provider'].children.map(option=>option.textContent),['Qwen','Kimi','Mistral','DeepSeek']);
-  assert.equal(nodes['llm-provider'].value,'qwen');assert.equal(copied.length,0);
-  nodes['candidate-search'].value='Target';nodes['candidate-search'].listeners.input();
-  nodes['candidate-more'].listeners.click();assert.equal(nodes['candidate-cards'].children.length,30);
-  const fetches=getFetchCount();
-  nodes['llm-provider'].value='kimi';nodes['llm-provider'].listeners.change();
-  const kimi=findClass(nodes['candidate-cards'].children[0],'fix-link'),kimiUrl=new URL(kimi.href);
-  assert.equal(kimiUrl.origin,'https://www.kimi.ai');
-  assert.equal(kimiUrl.searchParams.get('send_immediately'),'false');assert.equal(kimiUrl.searchParams.get('force_search'),'true');
-  assert.match(kimiUrl.searchParams.get('prefill_prompt'),/Reply in Italian/);
-  assert.deepEqual([...kimiUrl.searchParams.keys()],['send_immediately','force_search','prefill_prompt']);
-  assert(!kimi.listeners.click);assert.equal(copied.length,0);
+  const result=await harness('deorphanize',raw),{nodes,storage}=result;
+  assert.deepEqual(nodes['llm-provider'].children.map(option=>option.textContent),['Qwen','Kimi','Mistral','GLM']);
+  nodes['candidate-search'].value='Target';nodes['candidate-search'].listeners.input();nodes['candidate-more'].listeners.click();
   assert.equal(nodes['candidate-cards'].children.length,30);
-  for(const [provider,url] of [['mistral','https://chat.mistral.ai/chat'],['deepseek','https://chat.deepseek.com/']]) {
-    const before=copied.length;
+  const fetches=result.getFetchCount();
+  for(const provider of ['kimi','mistral','glm']) {
     nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
     assert.equal(nodes['candidate-cards'].children.length,30);assert.equal(nodes['candidate-search'].value,'Target');
-    assert.equal(nodes.dataset.value,'vec');assert.equal(storage.get('orphanwiki-llm'),provider);
-    assert.equal(copied.length,before); // no clipboard or external request on selection/rendering
-    const fix=findClass(nodes['candidate-cards'].children[0],'fix-link');
-    const actual=new URL(fix.href),expected=new URL(url);
-    assert.equal(actual.origin,expected.origin);assert.equal(actual.pathname,expected.pathname);
-    assert.deepEqual([...actual.searchParams.keys()],['q']);assert.equal(fix.target,'_blank');
-    const prompt=actual.searchParams.get('q');
-    assert.match(prompt,/Reply in Italian/);assert.match(prompt,/1 candidate source pages/);
-    assert(prompt.includes('https://vec.wikipedia.org/wiki/Local_source'));
-    assert(prompt.includes('https://lmo.wikipedia.org/wiki/Reference_source → Y_B https://lmo.wikipedia.org/wiki/Reference_target'));
-    assert(!fix.listeners.click);assert.equal(copied.length,before);
-    assert(!nodes['llm-prompt'].open);
+    assert.equal(storage.get('orphanwiki-llm'),provider);assert.equal(result.getFetchCount(),fetches);assert.equal(result.copied.length,0);
   }
-  assert.equal(getFetchCount(),fetches);
   let next=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{storage});
-  assert.equal(next.nodes['llm-provider'].value,'deepseek');
-  let link=findClass(next.nodes['connection-candidates'].children[0],'fix-link');
-  assert.equal(new URL(link.href).origin,'https://chat.deepseek.com');
-  assert.match(new URL(link.href).searchParams.get('q'),/Reply in Italian/);assert(!link.listeners.click);
-  // Full-copy fallback is reserved for oversized URLs on every provider.
-  const long=JSON.parse(JSON.stringify(raw));long.pages[0].title='à'.repeat(1000);
+  assert.equal(next.nodes['llm-provider'].value,'glm');
+  await preparePrompt(next,findClass(next.nodes['connection-candidates'].children[0],'fix-link'));
+  assert.equal(next.nodes['llm-prompt-open'].href,'https://chat.z.ai/');
   for(const preferences of [{clipboardUnavailable:true},{clipboardFailure:true},{blockStorage:true}]) {
-    next=await harness('deorphanize',long,undefined,null,preferences);
+    next=await harness('deorphanize',raw,undefined,null,preferences);
     next.nodes['llm-provider'].value='mistral';next.nodes['llm-provider'].listeners.change();
-    link=descendants(next.nodes['candidate-cards']).find(node=>node.className==='fix-link'&&node.listeners.click);
-    assert(link);assert.equal(link.href,'https://chat.mistral.ai/chat');link.listeners.click();
-    await new Promise(resolve=>setImmediate(resolve));
+    await preparePrompt(next,findClass(next.nodes['candidate-cards'].children[0],'fix-link'));
+    assert.equal(next.copied.length,0);
+    await next.nodes['llm-prompt-copy'].listeners.click();
     assert.equal(next.nodes['llm-prompt'].open,true);
-    assert(next.nodes['llm-prompt-text'].value.includes('https://lmo.wikipedia.org/wiki/Reference_source'));
     if(!preferences.blockStorage)assert.match(next.nodes['llm-prompt-status'].textContent,/copialo manualmente/);
   }
-  next=await harness('deorphanize',raw,undefined,null,{storage:new Map([['orphanwiki-llm','javascript:evil']])});
-  assert.equal(next.nodes['llm-provider'].value,'qwen');
-  next.nodes['llm-provider'].value='__proto__';next.nodes['llm-provider'].listeners.change();
-  assert.equal(next.nodes['llm-provider'].value,'qwen');
-  assert.equal(new URL(findClass(next.nodes['candidate-cards'].children[0],'fix-link').href).hostname,'chat.qwen.ai');
-  next.nodes['llm-provider'].value='mistral';next.nodes['llm-provider'].listeners.change();
-  next.nodes['ui-language-toggle'].listeners.click();
-  link=findClass(next.nodes['candidate-cards'].children[0],'fix-link');
-  assert.match(new URL(link.href).searchParams.get('q'),/Reply in English/);
-  assert(!link.listeners.click);assert.equal(next.copied.length,0);
-  next=await harness('deorphanize',long,undefined,null,{storage:new Map([['orphanwiki-language','en'],['orphanwiki-llm','mistral']])});
-  link=descendants(next.nodes['candidate-cards']).find(node=>node.className==='fix-link'&&node.listeners.click);
-  link.listeners.click();await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(next.nodes['llm-prompt-title'].textContent,'Prompt for Mistral');assert.match(next.nodes['llm-prompt-text'].value,/Reply in English/);
-  assert.match(next.nodes['llm-prompt-status'].textContent,/Prompt copied/);
+  for(const stored of ['javascript:evil','deepseek']) {
+    next=await harness('deorphanize',raw,undefined,null,{storage:new Map([['orphanwiki-llm',stored]])});
+    assert.equal(next.nodes['llm-provider'].value,'qwen');
+    assert.equal(next.requests.filter(request=>request.url.startsWith('https://')).length,0);
+  }
+  next.nodes['llm-provider'].value='__proto__';next.nodes['llm-provider'].listeners.change();assert.equal(next.nodes['llm-provider'].value,'qwen');
+  next.nodes['llm-provider'].value='mistral';next.nodes['llm-provider'].listeners.change();next.nodes['ui-language-toggle'].listeners.click();
+  const prompt=await preparePrompt(next,findClass(next.nodes['candidate-cards'].children[0],'fix-link'));
+  assert.match(prompt,/Reply in English/);assert.equal(next.nodes['llm-prompt-title'].textContent,'Prompt for Mistral');
+  await next.nodes['llm-prompt-copy'].listeners.click();assert.match(next.nodes['llm-prompt-status'].textContent,/Prompt and sources copied/);
   await next.nodes.dataset.listeners.change();
-  assert.equal(next.nodes['llm-prompt'].open,false);assert.equal(next.nodes['llm-provider'].value,'mistral');
-  console.log('LLM selection: all four native prefill URLs, no normal clipboard/dialog, validated preference, unchanged pagination/filters, oversized URL fallback, clipboard failures and localized dialog passed.');
+  assert.equal(next.nodes['llm-prompt'].open,false);assert.equal(next.nodes['llm-prompt-text'].value,'');
+  console.log('Provider selection: preferences and pagination retained, no background sources/clipboard, explicit manual copy fallback, translations and clearing on dataset change passed.');
+}
+async function checkWikitextPreparation() {
+  const raw=fixture();raw.metadata.demo=false;
+  raw.pages=[{page_id:1,title:'Michael Douglas',orphan:true}];
+  raw.link_candidates={1:{candidate_count:1,candidates:[{page_id:2,title:'Michael J. Fox',dead_end:false,evidence:[{language:'co',source_page_id:2,source_title:'Michael J. Fox',target_page_id:1,target_title:'Michael Douglas'}]}]}};
+  const full='{{Infobox}}\n{| class="wikitable"\n| 1995\n| '+"''[[The American President]]''"+'\n| Lewis Rothschild\n|\n|}\n'+('Testo ł à.\n'.repeat(4000))+'\n````\nFINE INTEGRALE';
+  const sources={
+    'vec:1':revisionContent(1,'Michael Douglas','Michael Douglas, ator.'),
+    'vec:2':revisionContent(2,'Michael J. Fox',full),
+    'co:1':revisionContent(1,'Michael Douglas','Michael Douglas, attore.'),
+    'co:2':revisionContent(2,'Michael J. Fox',"* ''[[The American President]]'' (1995), cù [[Michael Douglas]]")
+  };
+  const key=url=>url.hostname.split('.')[0]+':'+url.searchParams.get('pageids');
+  const control=result=>findClass(result.nodes['connection-candidates'].children[0],'fix-link');
+  const result=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>sources[key(url)]});
+  const before=JSON.stringify(raw),prompt=await preparePrompt(result,control(result));
+  assert.equal(result.nodes['llm-prompt-debug'].checked,false);
+  assert(!prompt.includes('OPTIONAL TEST APPENDIX — DEBUG'));
+  assert(prompt.includes(full));assert(prompt.includes('FINE INTEGRALE'));assert(prompt.includes('`````wikitext\n'+full+'\n`````'));
+  assert(prompt.indexOf('END OF SUPPLIED DOCUMENTS — RESPONSE INSTRUCTIONS')>prompt.lastIndexOf('DOCUMENT D4\n'));
+  assert(prompt.indexOf('END OF SUPPLIED DOCUMENTS — RESPONSE INSTRUCTIONS')>prompt.indexOf('FINE INTEGRALE'));
+  assert.equal(sourceMetadata(prompt).length,4);assert(sourceMetadata(prompt).every(row=>row.status==='READABLE'));
+  for(const metadata of sourceMetadata(prompt)) {
+    const expected=sources[metadata.language+':'+metadata.page_id].query.pages[0].revisions[0];
+    assert.equal(metadata.sha1,expected.sha1);assert.equal(metadata.utf8_bytes,expected.size);assert.equal(metadata.revision_id,expected.revid);
+    assert(metadata.revision_url.endsWith('oldid='+expected.revid));
+  }
+  assert.equal(JSON.stringify(raw),before);
+  const fetches=result.getFetchCount();
+  result.nodes['llm-prompt-debug'].checked=true;result.nodes['llm-prompt-debug'].listeners.change();
+  const debug=result.nodes['llm-prompt-text'].value;
+  assert(debug.startsWith(prompt+'\n\nOPTIONAL TEST APPENDIX — DEBUG\n'));
+  assert.match(debug,/Then append a section titled DEBUG/);
+  assert.match(debug,/Do not change the normal proposals to satisfy this appendix/);
+  assert.match(debug,/observable evidence checks, not private reasoning or deliberation/);
+  assert.match(debug,/For ADD LINK, quote only the exact name\/term from column 3 and its intended wikilink, preserving the original spelling\/capitalization/);
+  assert.match(debug,/report FAIL if column 3 includes surrounding sentence context or the normal response adds replacement text\/code for this row/);
+  assert.match(debug,/For BEFORE\/AFTER\/REPLACE, quote the exact local Ctrl\+F anchor and the exact added line containing the target link/);
+  assert.match(debug,/report FAIL without inventing it or rewriting the normal response/);
+  assert.match(debug,/existing local passage, table, list or template invocation hosting the addition/);
+  assert.match(debug,/report FAIL if the proposal creates a section or subsection/);
+  assert(!debug.includes('For a new section/field'));
+  assert.match(debug,/cite supplied evidence of the local parameter support/);
+  assert.equal(result.getFetchCount(),fetches);assert.equal(result.copied.length,0);
+  await result.nodes['llm-prompt-copy'].listeners.click();assert.equal(result.copied[0],debug);
+  result.nodes['llm-prompt-debug'].checked=false;result.nodes['llm-prompt-debug'].listeners.change();
+  assert.equal(result.nodes['llm-prompt-text'].value,prompt);assert.equal(result.getFetchCount(),fetches);
+  result.nodes['llm-prompt-close'].listeners.click();assert.equal(result.nodes['llm-prompt-text'].value,'');
+  assert.equal(result.nodes['llm-prompt-debug'].checked,false);
+  assert(![...result.storage.values()].some(value=>value.includes('FINE INTEGRALE')));
+  const mutations=[
+    payload=>payload.query.pages[0].pageid=999,
+    payload=>payload.query.pages[0].title='Wrong page',
+    payload=>payload.query.pages[0].revisions[0].sha1='0'.repeat(40),
+    payload=>payload.query.pages[0].revisions[0].size++,
+    payload=>payload.query.pages[0].revisions[0].slots.main.content='Truncated',
+    payload=>payload.query.pages[0].revisions[0].slots.main.contentmodel='json',
+    payload=>payload.query.pages[0].revisions[0].slots.main.texthidden=true,
+    payload=>payload.query.pages[0].revisions[0].timestamp='invalid',
+    payload=>payload.query.pages[0].revisions=[],
+    payload=>payload.continue={rvcontinue:'unexpected'}
+  ];
+  for(const mutate of mutations) {
+    const broken=JSON.parse(JSON.stringify(sources['vec:2']));mutate(broken);
+    const test=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>key(url)==='vec:2'?broken:sources[key(url)]});
+    const partial=await preparePrompt(test,control(test)),metadata=sourceMetadata(partial);
+    assert.equal(metadata.filter(row=>row.status==='READABLE').length,3);
+    assert.equal(metadata.find(row=>row.language==='vec'&&row.title==='Michael J. Fox').status,'UNREADABLE');
+    assert(!partial.includes(full));assert.match(test.nodes['llm-prompt-status'].textContent,/3\/4/);
+  }
+  const empty=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>key(url)==='vec:2'?revisionContent(2,'Michael J. Fox',''):sources[key(url)]});
+  const emptyPrompt=await preparePrompt(empty,control(empty));
+  assert.equal(sourceMetadata(emptyPrompt).find(row=>row.language==='vec'&&row.page_id===2).utf8_bytes,0);
+  const failed=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:()=>({error:{code:'blocked'}})});
+  await preparePrompt(failed,control(failed));assert.equal(failed.nodes['llm-prompt-copy'].disabled,true);
+  assert.match(failed.nodes['llm-prompt-status'].textContent,/Nessuna fonte disponibile/);
+  const gates=[];
+  const pending=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>new Promise(resolve=>gates.push(()=>resolve(sources[key(url)])))});
+  const work=control(pending).listeners.click();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(gates.length,3);assert.equal(pending.nodes['llm-prompt-copy'].disabled,true);
+  pending.nodes['llm-prompt-debug'].checked=true;pending.nodes['llm-prompt-debug'].listeners.change();
+  assert.equal(pending.nodes['llm-prompt-text'].value,'');
+  pending.nodes['llm-prompt-close'].listeners.click();
+  assert(pending.requests.filter(row=>row.url.startsWith('https://')).every(row=>row.signal.aborted));
+  gates.forEach(resolve=>resolve());await work;
+  assert.equal(pending.nodes['llm-prompt-text'].value,'');assert.equal(pending.nodes['llm-prompt'].open,false);
+  assert.equal(pending.requests.filter(row=>row.url.startsWith('https://')).length,3);
+  // A superseded preparation must not overwrite a newer source package.
+  let release,hold=true;
+  const racing=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>hold&&key(url)==='vec:2'?
+    new Promise(resolve=>{release=()=>resolve(sources[key(url)]);}):sources[key(url)]});
+  const old=control(racing).listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(typeof release,'function');hold=false;
+  const latest=await preparePrompt(racing,control(racing));release();await old;
+  assert.equal(racing.nodes['llm-prompt-text'].value,latest);
+  racing.nodes['llm-prompt'].listeners.cancel({preventDefault(){}});
+  assert.equal(racing.nodes['llm-prompt-text'].value,'');assert.equal(racing.nodes['llm-prompt'].open,false);
+  // Missing and known IDs for the same reference are one document; different wikis stay separate.
+  raw.link_candidates[1].candidates[0].evidence.push({language:'co',source_title:'Michael J. Fox',target_title:'Michael Douglas'});
+  const deduplicated=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{apiResponse:url=>sources[key(url)]});
+  const deduplicatedPrompt=await preparePrompt(deduplicated,control(deduplicated));
+  assert.equal(sourceMetadata(deduplicatedPrompt).length,4);
+  assert.equal(deduplicated.requests.filter(row=>row.url.startsWith('https://')).length,4);
+  console.log('Wikitext: complete Unicode beyond 32 KB, identity/checksum checks, cross-wiki isolation, opt-in DEBUG without changes to base prompt or requests, partial failures and cancellation passed.');
 }
 async function checkPreferences() {
   const storage=new Map([['orphanwiki-language','en'],['orphanwiki-theme','dark']]);
@@ -936,7 +969,7 @@ async function checkAggregation() {
     if(page==='connections') {
       assert.match(titleLink(nodes['connection-candidates'].children[0]).href,/vec\.wikipedia/);
       assert(descendants(nodes['connection-candidates']).some(n=>n.href?.includes('lmo.wikipedia')));
-      const prompt=new URL(findClass(nodes['connection-candidates'].children[0],'fix-link').href).searchParams.get('text');
+      const prompt=await preparePrompt(result,findClass(nodes['connection-candidates'].children[0],'fix-link'));
       assert(prompt.includes('https://vec.wikipedia.org/wiki/'));assert(!prompt.includes('https://all.wikipedia.org'));
     }
     nodes['ui-language-toggle'].listeners.click();
@@ -1086,7 +1119,7 @@ async function checkEditorialTransports() {
   assert.match(findClass(pms,'connect-button').href,/dataset=all.json&page=1&language=pms/);
   const normal=await harness('deorphanize',index,'?dataset=pms.json',entries,{},files);
   assert.deepEqual(normal.requests.map(request=>request.url),['data/manifest.json','data/pms-cards.json']);
-  const overviewPrompt=new URL(findClass(normal.nodes['candidate-cards'].children[0],'fix-link').href).searchParams.get('text');
+  const overviewPrompt=await preparePrompt(normal,findClass(normal.nodes['candidate-cards'].children[0],'fix-link'));
   const detail=await harness('connections',index,'?dataset=all.json&page=1&language=pms',entries,{},files);
   assert.equal(detail.document.body.dataset.loading,'false',detail.nodes.status.textContent);
   assert.deepEqual(detail.requests.map(request=>request.url),['data/manifest.json','data/all.json','data/pms-connections-v1/1.json']);
@@ -1095,12 +1128,13 @@ async function checkEditorialTransports() {
   assert.equal(detail.nodes['connection-candidates'].children.length,70);
   assert.equal(descendants(detail.nodes['connection-candidates']).filter(node=>node.className==='connection-evidence').length,140);
   const last=detail.nodes['connection-candidates'].children.at(-1);
-  const prompt=new URL(findClass(last,'fix-link').href).searchParams.get('text');
+  const prompt=await preparePrompt(detail,findClass(last,'fix-link'));
   assert(prompt.includes('Source 69'));assert(!prompt.includes('Source 00'));
   assert(prompt.includes('Italian_69'));assert(prompt.includes('Reference_69'));
   assert.match(prompt,/Evaluate only this single proposed link/);
-  await detail.nodes['connection-copy-prompt'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(detail.copied[0],overviewPrompt);
+  const detailOverview=await preparePrompt(detail,detail.nodes['connection-copy-prompt']);
+  assert.equal(detailOverview.split('\n\nWIKIPEDIA DOCUMENTS')[0],overviewPrompt.split('\n\nWIKIPEDIA DOCUMENTS')[0]);
+  assert.equal(detail.copied.length,0);
   for(const mutation of [
     card=>card.metadata={...card.metadata,input_sha256:'stale'},
     card=>card.census_page_count=3,
@@ -1132,36 +1166,21 @@ async function checkConnectionCopy() {
   const raw=fixture();raw.metadata.demo=false;
   const target=raw.pages.find(page=>page.orphan),key=String(target.page_id);
   raw.link_candidates[key]={status:'compared',candidate_count:7,candidates:Array.from({length:7},(_,i)=>({page_id:100+i,title:`Local ${i}`,dead_end:i===6,evidence:[{language:'lmo',source_title:`Reference ${i}`,target_title:target.title}]}))};
-  for(const preferences of [{},{clipboardUnavailable:true},{clipboardFailure:true}]) {
-    const result=await harness('connections',raw,`?dataset=fixture.json&page=${key}`,null,preferences);
-    const {nodes}=result;
-    assert.equal(result.copied.length,0);assert.equal(nodes['llm-prompt'].open,undefined);
-    assert.equal(nodes['connection-copy-prompt'].disabled,false);
-    await nodes['connection-copy-prompt'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
-    const prompt=result.copied[0]||nodes['llm-prompt-text'].value;
-    assert(prompt.includes('Local 6'));assert.equal((prompt.match(/Local X =/g)||[]).length,5);
-    assert(prompt.includes('Wikipedia'));assert(!prompt.includes('creator_key'));
-    if(preferences.clipboardUnavailable||preferences.clipboardFailure){assert.equal(nodes['llm-prompt'].open,true);assert.match(nodes['llm-prompt-status'].textContent,/manualmente/);}
-    else {assert.equal(nodes['llm-prompt'].open,undefined);assert.equal(nodes['connection-copy-prompt'].textContent,'Prompt copiato');}
-    const single=new URL(findClass(nodes['connection-candidates'].children[0],'fix-link').href).searchParams.get('text');
-    assert.match(single,/Evaluate only this single proposed link/);
-    if(!preferences.clipboardUnavailable&&!preferences.clipboardFailure) {
-      nodes['ui-language-toggle'].listeners.click();
-      assert.equal(result.copied.length,1);
-      await nodes['connection-copy-prompt'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
-      assert(result.copied[1].includes('Reply in English'));
-    }
-  }
-  const large=JSON.parse(JSON.stringify(raw));large.pages.find(p=>p.page_id===target.page_id).title='Long '+ 'ł'.repeat(5000);
-  const oversized=await harness('connections',large,`?dataset=fixture.json&page=${key}`);
-  await oversized.nodes['connection-copy-prompt'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
-  assert(oversized.copied[0].length>7500);
-  assert.equal(oversized.nodes['llm-prompt'].open,undefined);
+  const result=await harness('connections',raw,`?dataset=fixture.json&page=${key}`),{nodes}=result;
+  assert.equal(result.copied.length,0);assert.equal(nodes['connection-copy-prompt'].disabled,false);
+  const prompt=await preparePrompt(result,nodes['connection-copy-prompt']);
+  assert(prompt.includes('Local 6'));assert.equal((prompt.match(/^\d+\. LOCAL_X/gm)||[]).length,5);
+  assert.equal(result.copied.length,0);assert(!prompt.includes('creator_key'));
+  await nodes['llm-prompt-copy'].listeners.click();assert.equal(result.copied[0],prompt);
+  const single=await preparePrompt(result,findClass(nodes['connection-candidates'].children[0],'fix-link'));
+  assert.match(single,/Evaluate only this single proposed link/);
+  nodes['ui-language-toggle'].listeners.click();assert.equal(result.copied.length,1);
+  const english=await preparePrompt(result,nodes['connection-copy-prompt']);assert.match(english,/Reply in English/);
   raw.link_candidates[key].candidate_count=0;raw.link_candidates[key].candidates=[];
   const disabled=await harness('connections',raw,`?dataset=fixture.json&page=${key}`);
   assert.equal(disabled.nodes['connection-copy-prompt'].disabled,true);
   await disabled.nodes['connection-copy-prompt'].listeners.click();assert.equal(disabled.copied.length,0);
-  console.log('Connection copy: explicit click only, five priority candidates, unchanged single-card scope, direct clipboard, manual fallback and disabled empty state passed.');
+  console.log('Connection preparation: five priority candidates, single-card scope, separate explicit copy, translated prompts and disabled empty state passed.');
 }
 async function checkPersonalization() {
   const raw=fixture();raw.metadata.demo=false;
@@ -1356,4 +1375,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
