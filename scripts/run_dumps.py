@@ -7,12 +7,18 @@ scientific calculations and publication.
 import argparse
 import hashlib
 import json
+import math
 import os
+import platform
+import resource
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -330,11 +336,232 @@ def log_line(log, message):
     log.flush()
 
 
-def run_step(log, name, command):
-    log_line(log, f'INIZIO {name}: {shlex.join(str(value) for value in command)}')
-    process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, bufsize=1)
+def linux_resources(pid):
+    """Read live tree RSS (shared pages may repeat), swap and host pressure.
+
+    Missing /proc data stays null. Short-lived processes and between-sample
+    peaks can be missed; these are not kernel high-water marks or PSS.
+    """
+    pending, seen = [pid], set()
+    rss, swap, cpu = [], [], []
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        root = Path('/proc') / str(current)
+        try:
+            status = dict(line.split(':', 1) for line in (root / 'status').read_text().splitlines())
+            if 'VmRSS' in status:
+                rss.append(int(status['VmRSS'].split()[0]) * 1024)
+            if 'VmSwap' in status:
+                swap.append(int(status['VmSwap'].split()[0]) * 1024)
+            fields = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+            # Own CPU plus waited-for descendants; still-live descendants are
+            # visited separately. The interval estimate can race process exits.
+            cpu.append(sum(int(value) for value in fields[11:15]) / os.sysconf('SC_CLK_TCK'))
+            # A descendant can be owned by any thread, not only the main one.
+            for task in (root / 'task').iterdir():
+                try:
+                    pending.extend(int(value) for value in (task / 'children').read_text().split())
+                except (OSError, ValueError):
+                    pass
+        except (OSError, ValueError, IndexError):
+            continue
     try:
+        memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+        available = int(memory['MemAvailable'].split()[0]) * 1024
+    except (OSError, ValueError, KeyError):
+        available = None
+    try:
+        # Linux accounts waited-for descendants here, avoiding a sum of
+        # per-process I/O counters that could count reaped workers twice.
+        io = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/io').read_text().splitlines())
+        read_bytes, write_bytes = int(io['read_bytes']), int(io['write_bytes'])
+    except (OSError, ValueError, KeyError):
+        read_bytes = write_bytes = None
+    pressure = {}
+    for kind in ('cpu', 'memory', 'io'):
+        try:
+            pressure[kind] = (Path('/proc/pressure') / kind).read_text().strip()
+        except OSError:
+            pressure[kind] = None
+    return {'tree_rss_bytes': sum(rss) if rss else None,
+            'tree_swap_bytes': sum(swap) if swap else None,
+            'tree_cpu_seconds': sum(cpu) if cpu else None,
+            'host_available_memory_bytes': available,
+            'controller_reaped_read_bytes': read_bytes,
+            'controller_reaped_write_bytes': write_bytes,
+            'host_pressure': pressure,
+            'host_load_average': list(os.getloadavg())}
+
+
+class PipelineBenchmark:
+    """Local operational measurements, separate from all research exports."""
+
+    def __init__(self, log, path, args):
+        self.log, self.path, self.args = log, path, args
+        self.events = path.with_suffix('.metrics.jsonl').open('x', encoding='utf-8', buffering=1)
+        self.lock, self.stop = threading.Lock(), threading.Event()
+        self.started = time.monotonic()
+        self.active = None
+        self.steps = []
+        self.peak_rss = None
+        self.monitor_error = None
+        self.last_cpu_sample = None
+        self.thread = threading.Thread(target=self.monitor, name='pipeline-metrics', daemon=True)
+
+    def emit(self, event, **values):
+        with self.lock:
+            self.events.write(json.dumps({'event': event, 'at': datetime.now(timezone.utc).isoformat(),
+                                         'elapsed_seconds': time.monotonic() - self.started,
+                                         **values}, ensure_ascii=False, allow_nan=False) + '\n')
+
+    def start(self):
+        disks = {}
+        for key in ('dump_root', 'import_dir', 'output_dir', 'work_dir'):
+            value = getattr(self.args, key) or str(project_path(self.args.dump_root) / 'staging')
+            path = project_path(value)
+            existing = path
+            while not existing.exists():
+                existing = existing.parent
+            usage = shutil.disk_usage(existing)
+            disks[key] = {'path': str(path), 'device': existing.stat().st_dev,
+                          'total_bytes': usage.total, 'free_bytes': usage.free}
+        host = {'platform': platform.platform(), 'controller_python': sys.version,
+                'cpu_count': os.cpu_count(),
+                'cpu_affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
+                'disks': disks}
+        for key, filename in (('cpuinfo', '/proc/cpuinfo'), ('memory', '/proc/meminfo'),
+                              ('cgroup_cpu_max', '/sys/fs/cgroup/cpu.max'),
+                              ('cgroup_memory_max', '/sys/fs/cgroup/memory.max')):
+            try:
+                raw = Path(filename).read_text()
+                if key == 'cpuinfo':
+                    raw = next((line.split(':', 1)[1].strip() for line in raw.splitlines()
+                                if line.startswith('model name')), None)
+                host[key] = raw
+            except OSError:
+                host[key] = None
+        identity = {}
+        for name, command in (('git_revision', ['git', 'rev-parse', 'HEAD']),
+                              ('git_tracked_dirty', ['git', 'diff', '--quiet', 'HEAD'])):
+            try:
+                result = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True, check=False)
+            except OSError:
+                identity[name] = None
+                continue
+            identity[name] = ((result.returncode == 1 if result.returncode in (0, 1) else None)
+                              if name == 'git_tracked_dirty' else
+                              (result.stdout.strip() if result.returncode == 0 else None))
+        self.metadata = {'format': 'pipeline_benchmark_v1', 'arguments': vars(self.args), 'host': host,
+                         'code': {**identity, 'runner_sha256': checksum(__file__)},
+                         'config_sha256': {str(path): checksum(path) for path in
+                             (project_path(self.args.languages_file), project_path(self.args.model_config),
+                              PROJECT_ROOT / 'config/quality.json')},
+                         'measurement': {'interval_seconds': self.args.metrics_interval,
+                             'rss': 'sampled sum of controller and live descendants; shared pages may repeat; not PSS',
+                             'cpu': 'getrusage children deltas per completed step; 100 percent = one core',
+                             'io': 'controller plus reaped descendants; physical storage bytes, excludes network and cache hits',
+                             'host': 'load, pressure and available memory include unrelated workloads; cgroup files are mount-root limits'}}
+        self.emit('run_start', **self.metadata)
+        self.sample()
+        self.thread.start()
+
+    def sample(self):
+        with self.lock:
+            active = self.active
+        values = linux_resources(os.getpid())
+        now, cpu = time.monotonic(), values['tree_cpu_seconds']
+        percent = None
+        if self.last_cpu_sample is not None and cpu is not None:
+            elapsed, delta = now - self.last_cpu_sample[0], cpu - self.last_cpu_sample[1]
+            if elapsed > 0 and delta >= 0:
+                percent = 100 * delta / elapsed
+        if cpu is not None:
+            self.last_cpu_sample = now, cpu
+        values['sampled_cpu_percent_one_core'] = percent
+        values['disk_free_bytes'] = {}
+        for key, item in self.metadata['host']['disks'].items():
+            try:
+                path = Path(item['path'])
+                while not path.exists():
+                    path = path.parent
+                values['disk_free_bytes'][key] = shutil.disk_usage(path).free
+            except OSError:
+                values['disk_free_bytes'][key] = None
+        rss = values['tree_rss_bytes']
+        if rss is not None:
+            self.peak_rss = max(self.peak_rss or 0, rss)
+        # Keep step attribution and its observed peak consistent with begin/end.
+        with self.lock:
+            if active is not self.active:
+                active = None
+            if active is not None and rss is not None:
+                active['sampled_peak_tree_rss_bytes'] = max(active['sampled_peak_tree_rss_bytes'] or 0, rss)
+            step = active['name'] if active else None
+        self.emit('sample', step=step, **values)
+        memory = f'{rss / 2**20:.1f} MiB' if rss is not None else 'non disponibile'
+        cpu_label = f'{percent:.1f}%' if percent is not None else 'non disponibile'
+        log_line(self.log, f'RISORSE {step or "orchestrazione"}: RSS albero {memory}; CPU {cpu_label} (100%=1 core); carico host {values["host_load_average"][0]:.2f}')
+
+    def monitor(self):
+        try:
+            while not self.stop.wait(self.args.metrics_interval):
+                self.sample()
+        except Exception as error:
+            self.monitor_error = str(error)
+            log_line(self.log, f'MONITORAGGIO FALLITO: {error}')
+
+    def begin_step(self, name, command):
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        with self.lock:
+            self.active = {'name': name, 'command': [str(value) for value in command],
+                           'sampled_peak_tree_rss_bytes': None}
+        self.emit('step_start', **self.active)
+        return time.monotonic(), before
+
+    def end_step(self, baseline, status):
+        elapsed = time.monotonic() - baseline[0]
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        user, system = after.ru_utime - baseline[1].ru_utime, after.ru_stime - baseline[1].ru_stime
+        with self.lock:
+            step, self.active = self.active, None
+        step.update(wall_seconds=elapsed, user_cpu_seconds=user, system_cpu_seconds=system,
+                    cpu_percent_one_core=100 * (user + system) / elapsed if elapsed else None,
+                    returncode=status,
+                    filesystem_input_operations=after.ru_inblock - baseline[1].ru_inblock,
+                    filesystem_output_operations=after.ru_oublock - baseline[1].ru_oublock)
+        self.steps.append(step)
+        self.emit('step_end', **step)
+        log_line(self.log, f'BENCHMARK {step["name"]}: {elapsed:.2f}s; CPU {step["cpu_percent_one_core"]:.1f}% (100%=1 core)')
+
+    def finish(self, status):
+        self.stop.set()
+        if self.thread.ident is not None:
+            self.thread.join()
+        try:
+            self.sample()
+            result = {**self.metadata, 'status': status, 'wall_seconds': time.monotonic() - self.started,
+                      'sampled_peak_tree_rss_bytes': self.peak_rss,
+                      'monitor_error': self.monitor_error, 'steps': self.steps}
+            self.emit('run_end', **result)
+            prepared = self.path.with_suffix('.json.tmp')
+            prepared.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+            prepared.replace(self.path)
+            log_line(self.log, f'BENCHMARK salvato: {self.path}')
+        finally:
+            self.events.close()
+
+
+def run_step(log, name, command, benchmark=None):
+    log_line(log, f'INIZIO {name}: {shlex.join(str(value) for value in command)}')
+    baseline = benchmark.begin_step(name, command) if benchmark else None
+    process = None
+    try:
+        process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   env={**os.environ, 'PYTHONUNBUFFERED': '1'})
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -342,7 +569,7 @@ def run_step(log, name, command):
             log.flush()
         status = process.wait()
     except BaseException:
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
@@ -351,7 +578,10 @@ def run_step(log, name, command):
                 process.wait()
         raise
     finally:
-        process.stdout.close()
+        if process is not None:
+            process.stdout.close()
+        if benchmark:
+            benchmark.end_step(baseline, process.returncode if process is not None else None)
     if status:
         log_line(log, f'ERRORE {name}: codice di uscita {status}')
         raise subprocess.CalledProcessError(status, command)
@@ -367,7 +597,7 @@ def interrupt_for_shutdown(_signum, _frame):
     raise InterruptedError('SIGTERM')
 
 
-def run_pipeline(args, log):
+def run_pipeline(args, log, benchmark=None):
     from orphanwiki.core import configured_languages
     from orphanwiki.dumps import HISTORY_RULE, _read_first_metadata
     configured = configured_languages(project_path(args.languages_file))
@@ -378,6 +608,11 @@ def run_pipeline(args, log):
     else:
         selected = configured
     languages = [language for language, _ in selected]
+    log_line(log, 'LINGUE ' + ' '.join(languages))
+
+    def step(name, command):
+        run_step(log, name, command, benchmark)
+
     databases = dict(selected)
     dump_root = project_path(args.dump_root)
     import_dir = project_path(args.import_dir)
@@ -395,8 +630,8 @@ def run_pipeline(args, log):
     fetch = [*base, 'fetch-dumps', *source, '--sql-release', args.sql_release,
              '--history-release', args.history_release, '--root', str(dump_root)]
     if args.plan:
-        run_step(log, 'piano dei download', [*fetch, '--plan'])
-        run_step(log, 'piano contenuto corrente', [*base, 'fetch-content', *source, '--languages', *languages,
+        step('piano dei download', [*fetch, '--languages', *languages, '--plan'])
+        step('piano contenuto corrente', [*base, 'fetch-content', *source, '--languages', *languages,
                  '--content-release', args.content_release, '--root', str(dump_root), '--plan'])
         return
     manifests = [manifest_for(dump_root, language, database, args.sql_release, args.history_release)
@@ -421,7 +656,7 @@ def run_pipeline(args, log):
             missing.append(language)
     if missing:
         # Verify or resume only editions without an unchanged completed checkpoint.
-        run_step(log, 'download verificato: ' + ' '.join(missing), [*fetch, '--languages', *missing])
+        step('download verificato: ' + ' '.join(missing), [*fetch, '--languages', *missing])
         manifests = [manifest_for(dump_root, language, database, args.sql_release, args.history_release)
                      for language, database in selected]
         if not all(manifests):
@@ -448,12 +683,12 @@ def run_pipeline(args, log):
             log_line(log, f'SALTA importazione {language}: grafo, cronologia e checkpoint già completi')
             state.save(f'import:{language}', import_inputs, outputs)
         elif not args.force and imported_files_match(graph, history, stage, manifest, metadata, history_required=False):
-            run_step(log, f'aggiornamento cronologia {language}',
+            step(f'aggiornamento cronologia {language}',
                      [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
                       '--work-dir', str(work_dir)])
             state.save(f'import:{language}', import_inputs, outputs)
         else:
-            run_step(log, f'importazione {language}',
+            step(f'importazione {language}',
                      [*base, 'import-dumps', '--manifest', str(manifest),
                       '--output', str(graph), '--history-output', str(history),
                       '--work-dir', str(work_dir)])
@@ -478,13 +713,14 @@ def run_pipeline(args, log):
         else:
             missing_topics.append(language)
     if missing_topics:
-        run_step(log, 'modello dei 64 temi: ' + ' '.join(missing_topics),
+        step('modello dei 64 temi: ' + ' '.join(missing_topics),
                  [*base, 'topics', '--input-dir', str(import_dir), '--output-dir', str(import_dir),
                   '--languages-file', str(project_path(args.languages_file)),
                   '--languages', *missing_topics, '--model', str(project_path(args.model)),
                   '--model-config', str(project_path(args.model_config)),
                   '--work-dir', str(work_dir),
-                  '--time-budget-seconds', str(args.topic_budget_seconds)])
+                  '--time-budget-seconds', str(args.topic_budget_seconds),
+                  '--batch-size', str(args.topic_batch_size)])
         for language in missing_topics:
             checkpoint = import_dir / f'{language}-topics.json'
             graph = import_dir / f'{language}-raw.json'
@@ -501,7 +737,7 @@ def run_pipeline(args, log):
             content_outputs.extend([path, *fetched_files(document)])
     content_inputs = {'languages': [list(pair) for pair in selected], 'release': args.content_release}
     if len(content_outputs) < len(selected) or not state.matches('content-fetch', content_inputs, content_outputs):
-        run_step(log, 'contenuto corrente verificato', [*base, 'fetch-content', *content_source])
+        step('contenuto corrente verificato', [*base, 'fetch-content', *content_source])
         content_outputs = []
         for _, database in selected:
             path = dump_root / database / f'content-{args.content_release}.json'
@@ -514,7 +750,7 @@ def run_pipeline(args, log):
         inputs = {'graph_sha256': checksum(graph), 'manifest_sha256': checksum(manifest),
                   'model_sha256': checksum(PROJECT_ROOT / 'config/quality.json')}
         if not state.matches(f'quality:{language}', inputs, [quality]):
-            run_step(log, f'qualità {language}', [*base, 'quality', '--languages-file', str(project_path(args.languages_file)),
+            step(f'qualità {language}', [*base, 'quality', '--languages-file', str(project_path(args.languages_file)),
                 '--languages', language, '--content-release', args.content_release, '--root', str(dump_root),
                 '--input-dir', str(import_dir), '--output-dir', str(import_dir), '--work-dir', str(work_dir)])
             state.save(f'quality:{language}', inputs, [quality])
@@ -533,7 +769,7 @@ def run_pipeline(args, log):
             log_line(log, 'SALTA confronto interlingua: osservazioni e misure già aggiornate' if len(selected) > 1
                      else 'SALTA analisi: osservazioni e misure già aggiornate')
             return
-        run_step(log, 'aggiornamento misure senza ricalcolo del grafo', [*base, 'refresh-measures',
+        step('aggiornamento misure senza ricalcolo del grafo', [*base, 'refresh-measures',
                  '--languages-file', str(project_path(args.languages_file)), '--languages', *languages,
                  '--input-dir', str(import_dir), '--data-dir', str(output_dir)])
         current = (comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures) if len(selected) > 1
@@ -547,7 +783,7 @@ def run_pipeline(args, log):
         if existing:
             log_line(log, 'SALTA confronto interlingua: aggregato e candidate già pubblicati')
             return
-        run_step(log, 'confronto interlingua: ' + ' '.join(languages),
+        step('confronto interlingua: ' + ' '.join(languages),
                  [*base, 'compare', *(str(path) for path in graph_paths),
                   '--histories', *(str(import_dir / f'{language}-history.json') for language in languages),
                   '--output-dir', str(output_dir), '--work-dir', str(work_dir)])
@@ -560,7 +796,7 @@ def run_pipeline(args, log):
             output_dir, language, databases[language], manifest_hashes[language], topic_spec, measures.get(language) if measures else None):
         log_line(log, f'SALTA analisi {language}: export già pubblicato')
         return
-    run_step(log, f'analisi {language}',
+    step(f'analisi {language}',
              [*base, 'analyze', str(graph_paths[0]), '--history', str(import_dir / f'{language}-history.json'),
               '--output', str(output), '--work-dir', str(work_dir)])
     if not analysis_matches(output_dir, language, databases[language], manifest_hashes[language], topic_spec, measures.get(language) if measures else None):
@@ -586,10 +822,21 @@ def main(argv=None):
                         help='Python con estensione nativa e fastText; predefinito: .venv/bin/python se presente')
     parser.add_argument('--model', default='data/models/johnson-outlink-20220727.bin')
     parser.add_argument('--model-config', default='config/topics.json')
-    parser.add_argument('--topic-budget-seconds', type=float, default=86400)
+    parser.add_argument('--topic-budget-seconds', type=float, default=86400,
+                        help='Budget complessivo dei temi: predefinito 86400 secondi; nessun campionamento')
+    parser.add_argument('--topic-batch-size', type=int, default=256,
+                        help='Voci per blocco dei temi, da 1 a 10000; non limita il censimento')
+    parser.add_argument('--metrics-interval', type=float, default=10,
+                        help='Secondi tra campioni risorse e messaggi di attività; predefinito 10')
     parser.add_argument('--force', action='store_true', help='Ricalcola tutte le fasi, mantenendo i download verificati')
     parser.add_argument('--plan', action='store_true', help='Solo piano dei download, senza importare')
     args = parser.parse_args(argv)
+    if not math.isfinite(args.topic_budget_seconds) or args.topic_budget_seconds <= 0:
+        parser.error('--topic-budget-seconds deve essere positivo e finito')
+    if not math.isfinite(args.metrics_interval) or args.metrics_interval < 0.1:
+        parser.error('--metrics-interval deve essere finito e almeno 0.1 secondi')
+    if not 1 <= args.topic_batch_size <= 10000:
+        parser.error('--topic-batch-size deve essere compreso tra 1 e 10000')
     try:
         sql_date = datetime.strptime(args.sql_release, '%Y%m%d')
         if sql_date.strftime('%Y%m%d') != args.sql_release:
@@ -610,12 +857,20 @@ def main(argv=None):
         log_line(log, f'RELEASE SQL {args.sql_release}; History {args.history_release}; contenuto {args.content_release}')
         previous_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, interrupt_for_shutdown)
+        benchmark = None
+        status = 'failed'
         try:
-            run_pipeline(args, log)
+            if not args.plan:
+                benchmark = PipelineBenchmark(log, log_path.with_suffix('.benchmark.json'), args)
+                benchmark.start()
+            run_pipeline(args, log, benchmark)
+            status = 'completed'
         except KeyboardInterrupt:
+            status = 'interrupted'
             log_line(log, 'INTERROTTO dall’utente; i checkpoint già verificati restano disponibili')
             return 130
         except InterruptedError as error:
+            status = 'interrupted'
             log_line(log, f'INTERROTTO {error}; i checkpoint già verificati restano disponibili')
             return 143
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -623,6 +878,11 @@ def main(argv=None):
             return 1
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
+            if benchmark is not None:
+                if hasattr(benchmark, 'metadata'):
+                    benchmark.finish(status)
+                else:
+                    benchmark.events.close()
         log_line(log, 'PIPELINE COMPLETATA')
     return 0
 

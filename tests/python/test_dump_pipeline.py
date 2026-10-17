@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +52,12 @@ with open(os.environ['PIPELINE_CALLS'], 'a', encoding='utf-8') as calls:
 print('fake stdout ' + command, flush=True)
 if os.environ.get('PAUSE_STAGE') == command:
     time.sleep(30)
+if os.environ.get('WORK_STAGE') == command:
+    import subprocess
+    subprocess.run([sys.executable, '-c',
+        'import time; payload = bytearray(48 * 1024**2); '
+        'start = time.process_time(); exec("while time.process_time() - start < 0.4: pass"); '
+        'time.sleep(0.5)'], check=True)
 if os.environ.get('FAIL_STAGE') == command:
     print('fake stderr ' + command, file=sys.stderr, flush=True)
     sys.exit(7)
@@ -241,7 +249,7 @@ class DumpPipelineTests(unittest.TestCase):
         self.weights = self.root / 'model.bin'
         self.weights.write_bytes(b'fake model')
 
-    def invoke(self, *selection, extra=(), fail=None):
+    def invoke(self, *selection, extra=(), fail=None, work=None):
         if selection and selection[0] == '--languages-file':
             language_file = selection[1]
         else:
@@ -251,6 +259,8 @@ class DumpPipelineTests(unittest.TestCase):
         environment = {**os.environ, 'PIPELINE_CALLS': str(self.calls)}
         if fail:
             environment['FAIL_STAGE'] = fail
+        if work:
+            environment['WORK_STAGE'] = work
         return subprocess.run(
             [sys.executable, str(SCRIPT), '--languages-file', str(language_file),
              '--sql-release', '20261001', '--history-release', '2026-09',
@@ -265,6 +275,76 @@ class DumpPipelineTests(unittest.TestCase):
         logs = list((self.root / 'logs').glob('dumps-*.log'))
         self.assertEqual(len(logs), 1)
         return logs[0].read_text()
+
+    def one_benchmark(self):
+        paths = list((self.root / 'logs').glob('*.benchmark.json'))
+        self.assertEqual(len(paths), 1)
+        return json.loads(paths[0].read_text())
+
+    def metric_events(self):
+        paths = list((self.root / 'logs').glob('*.metrics.jsonl'))
+        self.assertEqual(len(paths), 1)
+        return [json.loads(line) for line in paths[0].read_text().splitlines()]
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc metrics')
+    def test_benchmark_includes_descendant_resources_and_cpu(self):
+        result = self.invoke('vec', work='quality', extra=(
+            '--metrics-interval', '0.1', '--topic-batch-size', '512',
+            '--topic-budget-seconds', '172800'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = self.one_benchmark()
+        self.assertEqual(report['status'], 'completed')
+        self.assertIsNone(report['monitor_error'])
+        self.assertGreater(report['host']['disks']['work_dir']['free_bytes'], 0)
+        self.assertEqual(report['arguments']['topic_batch_size'], 512)
+        self.assertEqual(report['arguments']['topic_budget_seconds'], 172800)
+        self.assertEqual(len(report['code']['runner_sha256']), 64)
+        step = next(row for row in report['steps'] if row['name'] == 'qualità vec')
+        self.assertEqual(step['returncode'], 0)
+        self.assertGreater(step['wall_seconds'], 0.5)
+        self.assertGreater(step['user_cpu_seconds'] + step['system_cpu_seconds'], 0.3)
+        self.assertGreater(step['sampled_peak_tree_rss_bytes'], 48 * 1024**2)
+        events = self.metric_events()
+        self.assertEqual(events[0]['event'], 'run_start')
+        self.assertEqual(events[-1]['event'], 'run_end')
+        samples = [row for row in events if row['event'] == 'sample' and row['step'] == 'qualità vec']
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertGreater(samples[0]['host_available_memory_bytes'], 0)
+        topic = next(row for row in report['steps'] if row['command'][3] == 'topics')['command']
+        self.assertEqual(topic[topic.index('--batch-size') + 1], '512')
+        self.assertEqual(topic[topic.index('--time-budget-seconds') + 1], '172800.0')
+
+    def test_invalid_benchmark_and_topic_controls_do_not_create_outputs(self):
+        for extra in (('--metrics-interval', '0'), ('--metrics-interval', 'nan'),
+                      ('--metrics-interval', 'inf'), ('--topic-budget-seconds', '0'),
+                      ('--topic-budget-seconds', 'nan'), ('--topic-budget-seconds', 'inf'),
+                      ('--topic-batch-size', '0'), ('--topic-batch-size', '10001')):
+            with self.subTest(extra=extra):
+                result = self.invoke('vec', extra=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse((self.root / 'logs').exists())
+
+    def test_missing_proc_resources_remain_unavailable(self):
+        resources = runpy.run_path(str(SCRIPT))['linux_resources']
+        with patch.object(Path, 'read_text', side_effect=OSError('proc unavailable')):
+            sample = resources(os.getpid())
+        for key in ('tree_rss_bytes', 'tree_swap_bytes', 'tree_cpu_seconds',
+                    'host_available_memory_bytes', 'controller_reaped_read_bytes',
+                    'controller_reaped_write_bytes'):
+            self.assertIsNone(sample[key])
+        self.assertEqual(sample['host_pressure'], {'cpu': None, 'memory': None, 'io': None})
+
+    def test_cannot_launch_child_preserves_failure_benchmark(self):
+        self.fake.write_text('#!/missing-synthetic-interpreter\n')
+        result = self.invoke('vec')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.calls.exists())
+        report = self.one_benchmark()
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(len(report['steps']), 1)
+        self.assertIsNone(report['steps'][0]['returncode'])
+        self.assertEqual(self.metric_events()[-1]['event'], 'run_end')
 
     def test_runs_complete_languages_in_order_and_logs_every_step(self):
         result = self.invoke('vec', 'lmo')
@@ -475,6 +555,10 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertIn('fake stderr import-dumps', log)
         self.assertIn('ERRORE importazione vec: codice di uscita 7', log)
         self.assertIn('PIPELINE FALLITA', log)
+        report = self.one_benchmark()
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['steps'][-1]['returncode'], 7)
+        self.assertEqual(self.metric_events()[-1]['status'], 'failed')
 
     def test_plan_only_runs_fetch_and_preserves_import_directory(self):
         result = self.invoke('vec', extra=('--plan',))
@@ -483,6 +567,17 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertFalse((self.root / 'dumps').exists())
         self.assertFalse((self.root / 'imported').exists())
         self.assertIn('PIPELINE COMPLETATA', self.one_log())
+        self.assertEqual(list((self.root / 'logs').glob('*.benchmark.json')), [])
+        self.assertEqual(list((self.root / 'logs').glob('*.metrics.jsonl')), [])
+
+    def test_plan_applies_language_subset_to_sql_and_content(self):
+        result = self.invoke('vec', 'lmo', 'it', extra=('--languages', 'vec', '--plan'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [line for line in self.one_log().splitlines() if 'INIZIO piano' in line]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertIn('--languages vec ', command)
+            self.assertNotIn('--languages vec lmo', command)
 
     def test_rejects_invalid_release_dates_before_any_download(self):
         for extra in (('--sql-release', '20260230'), ('--sql-release', '2026101'),
@@ -566,6 +661,10 @@ class DumpPipelineTests(unittest.TestCase):
             process.communicate(timeout=12)
             self.assertEqual(process.returncode, 143)
         self.assertIn('INTERROTTO SIGTERM', self.one_log())
+        report = self.one_benchmark()
+        self.assertEqual(report['status'], 'interrupted')
+        self.assertEqual(report['steps'][-1]['returncode'], -15)
+        self.assertEqual(self.metric_events()[-1]['status'], 'interrupted')
 
 
 if __name__ == '__main__':
