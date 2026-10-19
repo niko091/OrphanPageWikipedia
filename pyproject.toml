@@ -11,6 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 topics = ["fasttext==0.9.3", "numpy>=1.26,<3"]
+web = ["PyMySQL>=1.1,<2", "gunicorn>=23,<26"]
 
 [tool.maturin]
 python-source = "."

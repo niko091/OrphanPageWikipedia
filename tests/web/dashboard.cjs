@@ -90,8 +90,22 @@ async function harness(page,raw,search='?dataset=fixture.json',entries=null,pref
   const localStorage={getItem:key=>{if(preferences.blockStorage)throw new Error('storage unavailable');return storage.get(key);},setItem:(key,value)=>{if(preferences.blockStorage)throw new Error('storage unavailable');storage.set(key,value);}};
   const copied=[];
   const navigator=preferences.clipboardUnavailable?{}:{clipboard:{writeText:async text=>{if(preferences.clipboardFailure)throw new Error('clipboard denied');copied.push(text);}}};
-  let fetchCount=0;const requests=[];
-  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,TextEncoder,AbortController,crypto:webcrypto,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?(preferences.apiResponse?preferences.apiResponse(new URL(url),options):revisionFixture(new URL(url),[raw,...Object.values(files||{})])):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
+  let fetchCount=0;const requests=[],reviewStore=preferences.reviewStore||new Map();
+  const context=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,TextEncoder,AbortController,crypto:webcrypto,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text,value){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url,options)=>{requests.push({url,method:options?.method||'GET',body:options?.body,headers:options?.headers,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;if(preferences.beforeFetch)await preferences.beforeFetch(url,options);
+    if(String(url).startsWith('api/reviews')) {
+      if(preferences.reviewAPI)return preferences.reviewAPI(url,options);
+      if(preferences.reviewsUnavailable)return {ok:false,status:503,json:async()=>({error:'unavailable'})};
+      if(options?.method==='POST') {
+        const body=JSON.parse(options.body),key=[body.language,body.source_id,body.target_id].join(':');
+        const current=reviewStore.get(key);
+        if((current?.version??0)!==body.version)return {ok:false,status:409,json:async()=>({current})};
+        const review={language:body.language,source_id:body.source_id,target_id:body.target_id,status:body.status,
+          version:body.version+1,updated_at:'2026-10-20T12:00:00Z'};reviewStore.set(key,review);
+        return {ok:true,status:200,json:async()=>({review})};
+      }
+      return {ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[...reviewStore.values()]})};
+    }
+    return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?(preferences.apiResponse?preferences.apiResponse(new URL(url),options):revisionFixture(new URL(url),[raw,...Object.values(files||{})])):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?JSON.parse(JSON.stringify(files[url.slice(5)])):raw};}});
   await nativeReady;
   vm.runInContext(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
   await vm.runInContext('dashboardReady',context);
@@ -937,7 +951,7 @@ async function checkAggregation() {
     const route='?dataset=all.json'+(page==='connections'?'&page=1&language=vec':'');
     const result=await harness(page,index,route,entries,{},files),{nodes,context}=result;
     assert(!nodes.status.textContent.includes('Impossibile caricare'),nodes.status.textContent);
-    assert.equal(result.requests.length,4);
+    assert.equal(result.requests.filter(request=>request.url.startsWith('data/')).length,4);
     assert(result.requests.every(request=>request.cache==='no-store'));
     assert(!nodes.source);
     assert.equal(vm.runInContext('data.metadata.creators.collected_languages',context),2);
@@ -1021,7 +1035,7 @@ async function checkCompactTransport() {
     assert.equal(result.nodes[page==='articles'?'article-info':'creator-info'].textContent,full.nodes[page==='articles'?'article-info':'creator-info'].textContent);
   }
   const deorphanize=await harness('deorphanize',a,'?dataset=vec.json',entries,{},files);
-  assert.deepEqual(deorphanize.requests.map(r=>r.url),['data/manifest.json','data/vec.json']);
+  assert.deepEqual(deorphanize.requests.map(r=>r.url),['data/manifest.json','data/vec.json','api/reviews?dataset=vec.json']);
   let result=await harness('articles',index,'?dataset=all.json',entries.map(e=>e.language==='vec'?{...e,observations_file:'../unsafe.json'}:e),{},files);
   assert.match(result.nodes.status.textContent,/Nome dataset non valido/);
   assert.equal(result.document.body.dataset.loading,'true'); // Prior charts never masquerade as the new selection.
@@ -1111,18 +1125,19 @@ async function checkEditorialTransports() {
   const all=await harness('deorphanize',index,'?dataset=all.json',entries,{},files);
   assert.equal(all.document.body.dataset.loading,'false',all.nodes.status.textContent);
   assert.equal(all.nodes['candidate-cards'].children.length,11);
-  assert.equal(all.requests.length,13); // manifest, index, eleven compact card files
-  assert(all.requests.slice(2).every(request=>request.url.endsWith('-cards.json')));
+  const allData=all.requests.filter(request=>request.url.startsWith('data/'));
+  assert.equal(allData.length,13); // manifest, index, eleven compact card files
+  assert(allData.slice(2).every(request=>request.url.endsWith('-cards.json')));
   assert(!all.nodes.status.textContent.includes('Impossibile'));
   for(const card of all.nodes['candidate-cards'].children)assert.equal(findClass(card,'candidate-badge').textContent,'70');
   const pms=all.nodes['candidate-cards'].children.find(card=>titleLink(card).textContent==='Target pms');
   assert.match(findClass(pms,'connect-button').href,/dataset=all.json&page=1&language=pms/);
   const normal=await harness('deorphanize',index,'?dataset=pms.json',entries,{},files);
-  assert.deepEqual(normal.requests.map(request=>request.url),['data/manifest.json','data/pms-cards.json']);
+  assert.deepEqual(normal.requests.filter(request=>request.url.startsWith('data/')).map(request=>request.url),['data/manifest.json','data/pms-cards.json']);
   const overviewPrompt=await preparePrompt(normal,findClass(normal.nodes['candidate-cards'].children[0],'fix-link'));
   const detail=await harness('connections',index,'?dataset=all.json&page=1&language=pms',entries,{},files);
   assert.equal(detail.document.body.dataset.loading,'false',detail.nodes.status.textContent);
-  assert.deepEqual(detail.requests.map(request=>request.url),['data/manifest.json','data/all.json','data/pms-connections-v1/1.json']);
+  assert.deepEqual(detail.requests.filter(request=>request.url.startsWith('data/')).map(request=>request.url),['data/manifest.json','data/all.json','data/pms-connections-v1/1.json']);
   assert.equal(detail.nodes['connection-candidates'].children.length,50);
   detail.nodes['connection-more'].listeners.click();
   assert.equal(detail.nodes['connection-candidates'].children.length,70);
@@ -1182,6 +1197,134 @@ async function checkConnectionCopy() {
   await disabled.nodes['connection-copy-prompt'].listeners.click();assert.equal(disabled.copied.length,0);
   console.log('Connection preparation: five priority candidates, single-card scope, separate explicit copy, translated prompts and disabled empty state passed.');
 }
+async function checkSharedEditorialReviews() {
+  const raw=fixture();raw.metadata.demo=false;
+  raw.pages=[{page_id:1,title:'Target one',orphan:true},{page_id:10,title:'Target two',orphan:true}];
+  const candidates=[2,3,4].map(id=>({page_id:id,title:'Source '+id,dead_end:id===2,evidence:[
+    {language:'lmo',source_title:'Reference '+id,target_title:'Foreign target'},
+    {language:'it',source_title:'Italian '+id,target_title:'Italian target'}]}));
+  raw.link_candidates={1:{candidate_count:3,status:'compared',candidates},
+    10:{candidate_count:1,status:'compared',candidates:[{page_id:11,title:'Other source',evidence:candidates[0].evidence}]}};
+  const before=JSON.stringify(raw),reviewStore=new Map();
+  const overview=await harness('deorphanize',raw,undefined,null,{reviewStore});
+  assert.equal(overview.requests.filter(request=>request.url.startsWith('api/reviews')).length,1);
+  assert.equal(overview.requests.filter(request=>request.method==='POST').length,0);
+  assert.equal(overview.nodes['llm-prompt-finished'].disabled,true);
+  const card=()=>overview.nodes['candidate-cards'].children.find(card=>titleLink(card).textContent==='Target one');
+  await preparePrompt(overview,findClass(card(),'fix-link'));
+  assert.equal(overview.nodes['llm-prompt-finished'].disabled,false);
+  overview.nodes['llm-prompt-debug'].checked=true;
+  await overview.nodes['llm-prompt-finished'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(overview.nodes['llm-prompt'].open,false);
+  assert.equal(overview.nodes['llm-prompt-text'].value,'');assert.equal(overview.nodes['llm-prompt-debug'].checked,false);
+  assert.equal(overview.nodes['review-dialog'].open,true);
+  assert.equal(overview.nodes['review-rows'].children.length,3);
+  const choose=async(result,index,statusIndex)=>{
+    const row=result.nodes['review-rows'].children[index],button=findClass(row,'review-actions').children[statusIndex];
+    assert.equal(button.disabled,false);button.listeners.click();
+    await new Promise(resolve=>setImmediate(resolve));
+  };
+  await choose(overview,0,0);await choose(overview,1,2);await choose(overview,2,1);
+  assert.equal(reviewStore.size,3);
+  assert.deepEqual([...reviewStore.values()].map(review=>review.status),['fixed','bad_link','not_fixed']);
+  assert.match(overview.nodes['review-dialog-status'].textContent,/salvata.*tutti/);
+  const posts=overview.requests.filter(request=>request.method==='POST');
+  assert.equal(posts.length,3);
+  for(const request of posts) {
+    assert.equal(request.url,'api/reviews');assert.equal(request.headers['Content-Type'],'application/json');
+    const body=JSON.parse(request.body);
+    assert.deepEqual(Object.keys(body).sort(),['dataset','language','source_id','status','target_id','version']);
+    assert.equal(body.target_id,1);assert.equal(body.language,'vec');
+  }
+  overview.nodes['review-close'].listeners.click();
+  assert.equal(overview.nodes['review-rows'].children.length,0);
+  const prompt=await preparePrompt(overview,findClass(card(),'fix-link'));
+  assert(prompt.includes('Source 4'));assert(!prompt.includes('Source 2'));assert(!prompt.includes('Source 3'));
+
+  // A separate browser sees all statuses; closed pairs retain all evidence.
+  const connection=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{reviewStore});
+  const cards=()=>connection.nodes['connection-candidates'].children;
+  assert.deepEqual(cards().map(card=>titleLink(card).textContent),['Source 4','Source 2','Source 3']);
+  assert.equal(descendants(connection.nodes['connection-candidates']).filter(node=>node.className==='connection-evidence').length,6);
+  assert(cards().slice(1).every(card=>findClass(card,'fix-link').getAttribute('aria-disabled')==='true'));
+  assert.match(findClass(cards()[1],'review-badge').textContent,/Fixato/);
+  assert.match(findClass(cards()[2],'review-badge').textContent,/Bad link/);
+  await preparePrompt(connection,findClass(cards()[0],'fix-link'));
+  connection.nodes['llm-prompt-finished'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(connection.nodes['review-rows'].children.length,1);
+  await choose(connection,0,0);
+  await overview.nodes['review-refresh'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(titleLink(overview.nodes['candidate-cards'].children.at(-1)).textContent,'Target one');
+  assert.equal(findClass(card(),'fix-link').getAttribute('aria-disabled'),'true');
+  assert.equal(connection.nodes['connection-candidates'].children.length,3);
+
+  // Closed pairs can be reopened from Connect without preparing another prompt.
+  connection.nodes['review-close'].listeners.click();
+  const source2=cards().find(card=>titleLink(card).textContent==='Source 2');
+  findClass(source2,'review-edge').listeners.click();await new Promise(resolve=>setImmediate(resolve));
+  await choose(connection,0,1);
+  assert.equal(titleLink(cards()[0]).textContent,'Source 2');
+  assert.equal(findClass(cards()[0],'fix-link').tag,'button');
+  assert.equal(reviewStore.get('vec:2:1').status,'not_fixed');
+
+  // Optimistic version checks surface a concurrent review without overwriting it.
+  reviewStore.set('vec:2:1',{...reviewStore.get('vec:2:1'),status:'bad_link',version:3});
+  await choose(connection,0,0);
+  assert.equal(reviewStore.get('vec:2:1').status,'bad_link');
+  assert.match(connection.nodes['review-dialog-status'].textContent,/altro utente/);
+  assert.match(connection.nodes['review-rows'].children[0].children[1].textContent,/Bad link/);
+  connection.nodes['ui-language-toggle'].listeners.click();
+  assert.equal(connection.nodes['review-dialog'].open,false);
+  assert.equal(connection.nodes['review-rows'].children.length,0);
+  assert.match(findClass(cards().find(card=>titleLink(card).textContent==='Source 2'),'review-badge').textContent,/Shared review/);
+  assert.equal(JSON.stringify(raw),before);
+  assert([...overview.storage.keys()].every(key=>!key.includes('review')));
+
+  const offline=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{reviewsUnavailable:true});
+  findClass(offline.nodes['connection-candidates'].children[0],'review-edge').listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(offline.nodes['review-dialog-status'].textContent,/non disponibili/);
+  assert(findClass(offline.nodes['review-rows'].children[0],'review-actions').children.every(button=>button.disabled));
+  assert.equal(offline.requests.filter(request=>request.method==='POST').length,0);
+  const failed=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{
+    reviewAPI:async(url,options)=>options?.method==='POST'?{ok:false,status:503,json:async()=>({error:'unavailable'})}:
+      {ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[]})}
+  });
+  findClass(failed.nodes['connection-candidates'].children[0],'review-edge').listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));await choose(failed,0,0);
+  assert.match(failed.nodes['review-dialog-status'].textContent,/non confermato/);
+  assert.equal(vm.runInContext('editorialReviews.size',failed.context),0);
+  assert.equal(findClass(failed.nodes['connection-candidates'].children[0],'fix-link').tag,'button');
+
+  let releaseSave;
+  const stale=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{
+    reviewAPI:async(url,options)=>options?.method==='POST'?new Promise(resolve=>{
+      const body=JSON.parse(options.body);
+      releaseSave=()=>resolve({ok:true,status:200,json:async()=>({review:{language:body.language,source_id:body.source_id,
+        target_id:body.target_id,status:body.status,version:1,updated_at:'2026-10-20T12:00:00Z'}})});
+    }):{ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[]})}
+  });
+  findClass(stale.nodes['connection-candidates'].children[0],'review-edge').listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  findClass(stale.nodes['review-rows'].children[0],'review-actions').children[0].listeners.click();
+  const saving=stale.requests.find(request=>request.method==='POST');
+  stale.nodes['review-close'].listeners.click();releaseSave();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(saving.signal.aborted,true);
+  assert.equal(stale.nodes['review-dialog'].open,false);
+  assert.equal(vm.runInContext('editorialReviews.size',stale.context),0);
+  assert.equal(stale.nodes['review-rows'].children.length,0);
+
+  const wide=JSON.parse(JSON.stringify(raw));
+  wide.link_candidates[1]={candidate_count:7,status:'compared',candidates:Array.from({length:7},(_,i)=>({
+    page_id:20+i,title:'Wide source '+i,evidence:candidates[0].evidence}))};
+  const capped=await harness('deorphanize',wide);
+  await preparePrompt(capped,findClass(capped.nodes['candidate-cards'].children[0],'fix-link'));
+  capped.nodes['llm-prompt-finished'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(capped.nodes['review-rows'].children.length,5);
+  assert(!capped.nodes['review-rows'].children.some(row=>row.children[0].children[0].textContent==='Wide source 5'));
+  console.log('Shared editorial reviews: Finished pair scope, no text persistence, independent readers, closed-pair ordering/filtering, full Connect evidence, reopening, conflicts, translations, failed/stale saves and unavailable service passed.');
+}
 async function checkPersonalization() {
   const raw=fixture();raw.metadata.demo=false;
   raw.metadata.topics={status:'predicted'};
@@ -1213,10 +1356,13 @@ async function checkPersonalization() {
   assert(api.every(url=>url.searchParams.get('origin')==='*'&&['globaluserinfo','usercontribs'].includes(url.searchParams.get('meta')||url.searchParams.get('list'))));
   assert(api.filter(url=>url.searchParams.get('list')==='usercontribs').every(url=>url.searchParams.get('uclimit')==='100'&&url.searchParams.has('ucuserids')));
   const uncovered=await harness('deorphanize',raw,'?dataset=fixture.json',entries.map(({observations_file,...entry})=>entry),{apiResponse},{'fixture.json':raw});
+  vm.runInContext(`globalThis.interestCalls=0;const originalCalculate=nativeCalculate;
+    nativeCalculate=(kind,input)=>{if(kind==='interests')interestCalls++;return originalCalculate(kind,input);}`,uncovered.context);
   uncovered.nodes['profile-username'].value='Editor';uncovered.nodes['profile-apply'].listeners.click();
   await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
   assert.equal(uncovered.nodes['profile-sort-option'].disabled,true);
-  assert.match(uncovered.nodes['profile-status'].textContent,/Nessun tema osservabile/);
+  assert.match(uncovered.nodes['profile-status'].textContent,/Nessuna.*temi utilizzabili/);
+  assert.equal(vm.runInContext('interestCalls',uncovered.context),0);
   const outside=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiResponse:url=>{
     if(url.hostname==='meta.wikimedia.org')return {query:{globaluserinfo:{id:1,name:'Editor',merged:[
       {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1}]}}};
@@ -1224,15 +1370,243 @@ async function checkPersonalization() {
   }},files);
   outside.nodes['profile-username'].value='Editor';outside.nodes['profile-apply'].listeners.click();
   await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(outside.nodes['profile-sort-option'].disabled,true);
   assert.match(outside.nodes['profile-status'].textContent,/Nessuna delle ultime 100 modifiche/);
   const missing=JSON.parse(JSON.stringify(raw));delete missing.metadata.topics;
   const noModel=await harness('deorphanize',missing,'?dataset=fixture.json',entries,{apiResponse},
-    {'fixture.json':missing,'fixture-observations.json':files['fixture-observations.json']});
+    {'fixture.json':missing,'fixture-observations.json':{...files['fixture-observations.json'],metadata:missing.metadata}});
   noModel.nodes['profile-username'].value='Editor';noModel.nodes['profile-apply'].listeners.click();
   await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
-  assert.match(noModel.nodes['profile-status'].textContent,/non contengono ancora le predizioni/);
-  assert.equal(noModel.requests.filter(request=>request.url.endsWith('-observations.json')).length,0);
-  console.log('Personalization: explicit identity lookup, two Wikipedia contribution reads, local topic coverage and topic-first ranking passed.');
+  assert.match(noModel.nodes['profile-status'].textContent,/Nessuna.*temi utilizzabili/);
+  assert.equal(noModel.nodes['profile-sort-option'].disabled,true);
+
+  // English edits inform the ranking of Venetian cards without loading English
+  // cards or an aggregate. Read only the newest real census for each language.
+  const crossRaw=JSON.parse(JSON.stringify(raw));
+  const crossTarget=crossRaw.pages.filter(page=>page.orphan).at(-1);
+  assert.notEqual(crossTarget.page_id,target.page_id);
+  for(const page of crossRaw.pages)page.topic_labels=page.page_id===crossTarget.page_id?['Culture.Media.Music']:[];
+  const englishMetadata={...raw.metadata,language:'en',finished_at:'2026-10-02T00:00:00Z'};
+  const englishObservations={format:'observations_v1',metadata:englishMetadata,
+    columns:['page_id','topic_labels','topic_status'],rows:[[999,['Culture.Media.Music'],'predicted']]};
+  const crossEntries=[...entries,
+    {language:'en',file:'en-old.json',date:'2026-09-01T00:00:00Z',observations_file:'en-old-observations.json'},
+    {language:'en',file:'en-new.json',date:englishMetadata.finished_at,observations_file:'en-observations.json'},
+    {language:'en',file:'en-demo.json',date:'2027-01-01T00:00:00Z',demo:true,observations_file:'en-demo-observations.json'},
+    {language:'all',kind:'aggregate',file:'all.json',date:'2027-01-01T00:00:00Z',observations_file:'all-observations.json'}];
+  const crossFiles={...files,'fixture.json':crossRaw,'en-observations.json':englishObservations};
+  const apply=async result=>{
+    result.nodes['profile-username'].value='Editor';result.nodes['profile-apply'].listeners.click();
+    await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+  };
+  const cross=await harness('deorphanize',crossRaw,'?dataset=fixture.json',crossEntries,{apiResponse},crossFiles);
+  assert.equal(cross.requests.filter(request=>request.url.endsWith('-observations.json')).length,0);
+  await apply(cross);
+  assert.equal(cross.nodes['candidate-sort'].value,'personalized');
+  assert.equal(titleLink(cross.nodes['candidate-cards'].children[0]).textContent,crossTarget.title);
+  assert.equal(cross.nodes['candidate-cards'].children.length,25);
+  assert.match(cross.nodes['candidate-info'].textContent,new RegExp(`^${crossRaw.pages.filter(page=>page.orphan).length} orfane`));
+  assert.match(cross.nodes['profile-status'].textContent,/2 modifiche.*2.*EN, VEC/);
+  assert(cross.requests.some(request=>request.url==='data/en-observations.json'));
+  assert(!cross.requests.some(request=>/en-old|en-demo|all\.json|all-observations|en-new\.json/.test(request.url)));
+  assert(cross.nodes['candidate-cards'].children.every(card=>titleLink(card).href.startsWith('https://vec.wikipedia.org/')));
+
+  // Foreign topics alone suffice when local observations are unavailable.
+  const foreignOnly=await harness('deorphanize',crossRaw,'?dataset=fixture.json',crossEntries.filter(entry=>entry.language!=='vec')
+    .concat(entries.map(({observations_file,...entry})=>entry)),{apiResponse},crossFiles);
+  await apply(foreignOnly);
+  assert.equal(foreignOnly.nodes['candidate-sort'].value,'personalized');
+  assert.equal(titleLink(foreignOnly.nodes['candidate-cards'].children[0]).textContent,crossTarget.title);
+  assert.match(foreignOnly.nodes['profile-status'].textContent,/2 modifiche.*1.*EN\./);
+
+  for(const patch of [{language:'lmo'},{finished_at:'2026-09-01T00:00:00Z'},{complete:false},{demo:true}]) {
+    const invalid=await harness('deorphanize',crossRaw,'?dataset=fixture.json',crossEntries,{apiResponse},
+      {...crossFiles,'en-observations.json':{...englishObservations,metadata:{...englishMetadata,...patch}}});
+    await apply(invalid);
+    assert.equal(invalid.nodes['profile-sort-option'].disabled,true);
+    assert.match(invalid.nodes['profile-status'].textContent,/Personalizzazione non disponibile/);
+  }
+  console.log('Personalization: explicit identity lookup, cross-language topics, latest manifest census, coverage, validation and topic-first ranking passed.');
+}
+async function checkProfileTopicShards() {
+  const raw=fixture();raw.metadata.demo=false;raw.metadata.topics={status:'predicted'};
+  const entry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,
+    observations_file:'must-not-load.json',profile_topics_dir:'topics'};
+  const index={format:'profile_topics_index_v1',metadata:raw.metadata,shard_size:1024,shards:[0,1],census_page_count:4};
+  const shard={format:'profile_topics_shard_v1',metadata:raw.metadata,bucket:0,
+    rows:[[1,'predicted',['Culture.Media.Music']],[2,'predicted',[]],[3,'missing',null]]};
+  const files={'fixture.json':raw,'topics/index.json':index,'topics/0.json':shard,
+    'topics/1.json':{...shard,bucket:1,rows:[[1024,'predicted',['Culture.Media.Films']]]}};
+  const result=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{},files);
+  result.context.edits=[1,2,3,1024,99999,1].map(page_id=>({language:'vec',page_id,namespace:0,
+    timestamp:'2026-10-01T00:00:00Z',topic_labels:null}));
+  const enriched=await vm.runInContext('observedTopics(edits,profileRequestVersion)',result.context);
+  assert.deepEqual(JSON.parse(JSON.stringify(enriched.map(edit=>edit.topic_labels))),
+    [['Culture.Media.Music'],[],null,['Culture.Media.Films'],null,['Culture.Media.Music']]);
+  assert.equal(result.requests.filter(request=>request.url.startsWith('data/topics/')).length,3);
+  const before=result.requests.length;
+  await vm.runInContext('observedTopics(edits,profileRequestVersion)',result.context);
+  assert.equal(result.requests.length,before);
+  for(const [path,patch] of [
+    ['topics/index.json',{metadata:{...raw.metadata,language:'en'}}],
+    ['topics/index.json',{shard_size:0}],['topics/index.json',{shards:[1,0]}],
+    ['topics/0.json',{bucket:1}],['topics/0.json',{metadata:{...raw.metadata,finished_at:'old'}}],
+    ['topics/0.json',{rows:[[1024,'predicted',[]]]}],
+    ['topics/0.json',{rows:[[1,'predicted',[]],[1,'predicted',[]]]}],
+    ['topics/0.json',{rows:Array.from({length:1025},(_,id)=>[id+1,'predicted',[]])}]
+  ]) {
+    const invalid=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{},
+      {...files,[path]:{...files[path],...patch}});
+    invalid.context.edits=[result.context.edits[0]];
+    await assert.rejects(vm.runInContext('observedTopics(edits,profileRequestVersion)',invalid.context),/Trasporto osservazioni non valido/);
+  }
+  const unsafe=await harness('deorphanize',raw,'?dataset=fixture.json',[{...entry,profile_topics_dir:'../topics'}],{},files);
+  unsafe.context.edits=[result.context.edits[0]];
+  await assert.rejects(vm.runInContext('observedTopics(edits,profileRequestVersion)',unsafe.context),/Trasporto osservazioni non valido/);
+
+  let release;
+  const stale=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{
+    beforeFetch:url=>url==='data/topics/index.json'?new Promise(resolve=>{release=resolve;}):undefined
+  },files);
+  stale.context.edits=[result.context.edits[0]];
+  const loading=vm.runInContext('observedTopics(edits,profileRequestVersion)',stale.context);
+  vm.runInContext('++profileRequestVersion;profileController.abort();profileController=new AbortController()',stale.context);
+  release();
+  await assert.rejects(loading,error=>error.name==='AbortError');
+  assert.equal(vm.runInContext('profileTopicCache.size',stale.context),0);
+  assert(stale.requests.find(request=>request.url==='data/topics/index.json').signal.aborted);
+  assert(!stale.requests.some(request=>request.url==='data/topics/0.json'));
+  console.log('Profile topic shards: sparse IDs, empty/missing topics, deduplication, bounded caching, metadata validation and cancellation passed.');
+}
+async function benchmarkPersonalization() {
+  // Fixed census and edit sequences; compare deterministic work, not noisy CPU
+  // timings or public API latency. No production files or network are used.
+  const raw=fixture();raw.metadata={language:'vec',complete:true,demo:false,
+    started_at:'2026-10-01T00:00:00Z',finished_at:'2026-10-01T00:00:00Z',topics:{status:'predicted'}};
+  const languages=['vec','en','fr','de'],size=65536,files={'fixture.json':raw};
+  const columns=['page_id','topic_status','topic_labels','title','orphan','length_bytes',
+    'age_days','creator_key','in_degree','out_degree','quality_score','category'];
+  const entries=languages.map(language=>({language,file:language==='vec'?'fixture.json':language+'.json',
+    date:raw.metadata.finished_at,observations_file:language+'-observations.json',profile_topics_dir:language+'-topics'}));
+  for(const entry of entries) {
+    const metadata={...raw.metadata,language:entry.language};
+    const rows=Array.from({length:size},(_,i)=>{
+      const id=i+1,status=id%13===0?'missing':'predicted';
+      const labels=status==='missing'?null:id%7===0?[]:[id%2?'Culture.Media.Music':'Culture.Media.Films'];
+      return [id,status,labels,'Synthetic article '+id+' '+ 'x'.repeat(80),id%3===0,5000,1000,'registered:12',3,7,0.5,'Synthetic category'];
+    });
+    files[entry.observations_file]={format:'observations_v1',metadata,columns,rows};
+    const buckets=new Map();
+    for(const row of rows) {
+      const bucket=Math.floor(row[0]/1024);
+      if(!buckets.has(bucket))buckets.set(bucket,[]);
+      buckets.get(bucket).push(row.slice(0,3));
+    }
+    files[entry.profile_topics_dir+'/index.json']={format:'profile_topics_index_v1',metadata,
+      shard_size:1024,shards:[...buckets.keys()],census_page_count:size};
+    for(const [bucket,shardRows] of buckets)files[entry.profile_topics_dir+'/'+bucket+'.json']={
+      format:'profile_topics_shard_v1',metadata,bucket,rows:shardRows};
+  }
+  let gated=false;
+  const topicPending=[];
+  const result=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{
+    beforeFetch:(url,options)=>gated&&String(url).includes('-topics/')?new Promise((resolve,reject)=>{
+      topicPending.push(resolve);options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
+    }):undefined
+  },files);
+  for(const workload of ['clustered','dispersed']) {
+    const edits=Array.from({length:100},(_,i)=>({language:languages[i%4],
+      page_id:workload==='clustered'?100+Math.floor(i/4):1+Math.floor(i/4)*2048,
+      namespace:0,timestamp:'2026-10-01T00:00:00Z',topic_labels:null}));
+    // Include repeated edits, missing pages, missing predictions and known
+    // negatives; preserve every edit and its original order in both paths.
+    edits[96]={...edits[0]};edits[97].page_id=999999;edits[98].namespace=1;edits[99].page_id=14;
+    const reference=edits.map(edit=>{
+      const entry=entries.find(entry=>entry.language===edit.language);
+      const row=files[entry.observations_file].rows.find(row=>row[0]===edit.page_id);
+      return {...edit,topic_labels:edit.namespace===0&&row?.[1]==='predicted'?row[2]:null};
+    });
+    const legacyFiles=entries.map(entry=>files[entry.observations_file]);
+    const baseline={requests:legacyFiles.length,rows:legacyFiles.reduce((n,file)=>n+file.rows.length,0),
+      bytes:legacyFiles.reduce((n,file)=>n+Buffer.byteLength(JSON.stringify(file)),0)};
+    vm.runInContext('profileTopicCache.clear()',result.context);
+    result.context.benchmarkEdits=edits;
+    const offset=result.requests.length;
+    gated=true;
+    let finished=false,rounds=0,maxConcurrent=0;
+    const loading=vm.runInContext('observedTopics(benchmarkEdits,profileRequestVersion)',result.context)
+      .then(value=>{finished=true;return value;});
+    for(let turn=0;!finished;turn++) {
+      assert(turn<40,'topic scheduler must finish');
+      await new Promise(resolve=>setImmediate(resolve));
+      if(topicPending.length) {
+        rounds++;maxConcurrent=Math.max(maxConcurrent,topicPending.length);
+        assert(topicPending.length<=4,'shared topic request budget');
+        for(const release of topicPending.splice(0))release();
+      }
+    }
+    gated=false;
+    const actual=await loading;
+    assert.deepEqual(JSON.parse(JSON.stringify(actual)),reference);
+    const requests=result.requests.slice(offset);
+    assert(requests.every(request=>!request.url.endsWith('-observations.json')));
+    const optimized={requests:requests.length,rows:requests.reduce((n,request)=>n+(files[request.url.slice(5)].rows?.length??0),0),
+      bytes:requests.reduce((n,request)=>n+Buffer.byteLength(JSON.stringify(files[request.url.slice(5)])),0)};
+    assert.deepEqual({requests:optimized.requests,rows:optimized.rows},workload==='clustered'?
+      {requests:8,rows:4092}:{requests:100,rows:98300});
+    assert(optimized.bytes<baseline.bytes*0.2);
+    assert(optimized.rows<baseline.rows*0.4);
+    const sequentialRounds=entries.reduce((n,entry)=>n+1+Math.ceil(requests.filter(request=>
+      request.url.startsWith('data/'+entry.profile_topics_dir+'/')&&!request.url.endsWith('/index.json')).length/4),0);
+    assert.equal(rounds,workload==='clustered'?2:25);
+    assert.equal(maxConcurrent,4);
+    assert(rounds<sequentialRounds);
+    const warmOffset=result.requests.length;
+    const warm=await vm.runInContext('observedTopics(benchmarkEdits,profileRequestVersion)',result.context);
+    assert.deepEqual(JSON.parse(JSON.stringify(warm)),reference);
+    assert.equal(result.requests.length,warmOffset);
+    console.log('Personalization deterministic benchmark: '+JSON.stringify({workload,edits:100,census_pages:size*4,
+      baseline,optimized,sequential_sharded_rounds:sequentialRounds,parallel_sharded_rounds:rounds,max_concurrent:maxConcurrent,warm_requests:0}));
+  }
+
+  // A logical round completes only when the test releases all outstanding
+  // responses. This makes the contribution fan-out benchmark reproducible.
+  const wikiLanguages=Array.from({length:24},(_,i)=>'a'+String.fromCharCode(97+i));
+  const pending=[],contributions=wikiLanguages.flatMap((language,index)=>Array.from({length:100},(_,i)=>({
+    language,page_id:1000+i,namespace:0,timestamp:new Date(Date.UTC(2026,9,1,0,Math.floor(index/2),Math.floor(i/2))).toISOString(),topic_labels:null})));
+  const scheduled=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{
+    beforeFetch:(url,options)=>String(url).includes('list=usercontribs')?new Promise((resolve,reject)=>{
+      pending.push(resolve);options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
+    }):undefined,
+    apiResponse:url=>url.hostname==='meta.wikimedia.org'?{query:{globaluserinfo:{id:1,name:'Editor',merged:wikiLanguages.map((language,i)=>({
+      wiki:language+'wiki',url:'https://'+language+'.wikipedia.org',id:i+1}))}}}:
+      {query:{usercontribs:contributions.filter(edit=>edit.language===url.hostname.split('.')[0]).map(edit=>({
+        userid:wikiLanguages.indexOf(edit.language)+1,pageid:edit.page_id,ns:edit.namespace,timestamp:edit.timestamp}))}}
+  },files);
+  vm.runInContext(`globalThis.retainedEditPeaks=[];const originalSort=Array.prototype.sort;
+    Array.prototype.sort=function(...args){
+      if(this.length&&this[0]?.namespace!==undefined&&this[0]?.topic_labels===null)retainedEditPeaks.push(this.length);
+      return originalSort.apply(this,args);
+    };`,scheduled.context);
+  let finished=false;
+  const recent=vm.runInContext("recentWikipediaEdits('Editor',profileController.signal)",scheduled.context).then(value=>{finished=true;return value;});
+  let rounds=0,maxConcurrent=0;
+  while(!finished) {
+    await new Promise(resolve=>setImmediate(resolve));
+    if(pending.length) {
+      maxConcurrent=Math.max(maxConcurrent,pending.length);rounds++;
+      for(const release of pending.splice(0).reverse())release();
+    }
+    assert(rounds<=3);
+  }
+  const actual=await recent;
+  contributions.sort((a,b)=>b.timestamp.localeCompare(a.timestamp)||a.language.localeCompare(b.language)||a.page_id-b.page_id);
+  assert.deepEqual(JSON.parse(JSON.stringify(actual)),contributions.slice(0,100));
+  assert.equal(rounds,3);assert.equal(maxConcurrent,8);
+  const retainedPeak=vm.runInContext('Math.max(...retainedEditPeaks)',scheduled.context);
+  assert.equal(retainedPeak,200);
+  console.log('Personalization deterministic contribution benchmark: '+JSON.stringify({wikipedias:24,edits:100,
+    baseline_rounds:6,optimized_rounds:rounds,max_concurrent:maxConcurrent,previous_retained_peak:2400,retained_peak:retainedPeak}));
 }
 async function checkCreatorHistory() {
   const raw=fixture();
@@ -1375,4 +1749,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

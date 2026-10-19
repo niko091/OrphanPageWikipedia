@@ -14,6 +14,7 @@ from pathlib import Path
 HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
 MEASURES_RULE = 'creation_quality_creators_v2'
 ARTICLE_PREVIEW_LIMIT = 25
+TOPIC_LOOKUP_SHARD_SIZE = 1024
 
 
 def prepared_summaries_match(summary_path, creators_path, metadata, sources, page_count=None):
@@ -805,6 +806,8 @@ def write_dashboard_exports(source, folder, expected=None):
     source, folder = Path(source), Path(folder)
     initial = source.stat()
     events = iter_export_sections(source)
+    topic_staging = tempfile.TemporaryDirectory(prefix='orphanwiki-profile-')
+    topic_database = None
     try:
         section, _, metadata = next(events)
         if section != 'metadata' or metadata.get('complete') is not True:
@@ -820,6 +823,8 @@ def write_dashboard_exports(source, folder, expected=None):
                      'summary_file': source.stem + '-summary.json',
                      'creator_index_file': source.stem + '-creators.json',
                      'cards_file': source.stem + '-cards.json', 'connections_dir': directory}
+        topic_directory = source.stem + '-profile-topics-' + generation
+        filenames['profile_topics_dir'] = topic_directory
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
             raise ValueError('I trasporti devono essere distinti dal dataset originale')
         from ._native import DashboardSummaryAccumulator
@@ -827,6 +832,8 @@ def write_dashboard_exports(source, folder, expected=None):
             metadata.get('creators', {}).get('status') not in ('collected', 'partially_collected')
             and metadata.get('history', {}).get('status') in ('collected', 'partially_collected'))
         summary_batch = []
+        topic_database = sqlite3.connect(Path(topic_staging.name) / 'topics.sqlite')
+        topic_database.execute('CREATE TABLE topics (page_id INTEGER PRIMARY KEY, status TEXT, labels TEXT)')
         orphans, summaries, shortlists, seen, article_preview = {}, {}, {}, set(), []
 
         def detail(identifier, record):
@@ -842,6 +849,8 @@ def write_dashboard_exports(source, folder, expected=None):
                     if type(pid) is not int or pid <= 0 or pid in seen or type(record.get('orphan')) is not bool:
                         raise ValueError('Osservazione o identificativo duplicato non valido')
                     seen.add(pid)
+                    topic_database.execute('INSERT INTO topics VALUES (?, ?, ?)',
+                        (pid, record.get('topic_status'), json.dumps(record.get('topic_labels'), ensure_ascii=False)))
                     add_article_preview(article_preview, record)
                     summary_batch.append(record)
                     if len(summary_batch) == 512:
@@ -880,6 +889,26 @@ def write_dashboard_exports(source, folder, expected=None):
 
         write_observations(folder / filenames['observations_file'],
                            {'metadata': metadata, 'pages': pages(), 'link_candidates': summaries})
+        topic_shards, topic_rows, topic_bucket = [], [], None
+
+        def write_topic_shard():
+            if topic_bucket is not None:
+                write_json(folder / topic_directory / f'{topic_bucket}.json',
+                           {'format': 'profile_topics_shard_v1', 'metadata': metadata,
+                            'bucket': topic_bucket, 'rows': topic_rows})
+                topic_shards.append(topic_bucket)
+
+        for pid, status, labels in topic_database.execute('SELECT page_id, status, labels FROM topics ORDER BY page_id'):
+            bucket = pid // TOPIC_LOOKUP_SHARD_SIZE
+            if bucket != topic_bucket:
+                write_topic_shard()
+                topic_rows, topic_bucket = [], bucket
+            topic_rows.append([pid, status, json.loads(labels)])
+        write_topic_shard()
+        write_json(folder / topic_directory / 'index.json',
+                   {'format': 'profile_topics_index_v1', 'metadata': metadata,
+                    'shard_size': TOPIC_LOOKUP_SHARD_SIZE, 'shards': topic_shards,
+                    'census_page_count': len(seen)})
         if summary_batch:
             summary.add_batch(json.dumps(summary_batch, ensure_ascii=False))
         summary_count, summary_json = summary.finish()
@@ -900,6 +929,9 @@ def write_dashboard_exports(source, folder, expected=None):
         return filenames
     finally:
         events.close()
+        if topic_database is not None:
+            topic_database.close()
+        topic_staging.cleanup()
 
 
 def write_summary_files(summary_path, creators_path, metadata, count, report_json, sources, article_preview):

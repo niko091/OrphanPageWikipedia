@@ -373,6 +373,29 @@ dialog textarea {
   flex-wrap: wrap;
 }
 
+.review-row {
+  border-top: 1px solid var(--border);
+  padding: 16px 0;
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.review-actions button[aria-pressed="true"] {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.review-badge {
+  font-size: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
 .prompt-actions button:last-child {
   margin-left: auto;
 }

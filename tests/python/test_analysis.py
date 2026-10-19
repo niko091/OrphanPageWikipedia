@@ -351,6 +351,22 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(path.with_suffix('.csv').read_bytes(), csv_bytes)
             entry = json.loads((Path(folder) / 'manifest.json').read_text())[0]
             self.assertEqual(entry['observations_file'], compact.name)
+            topic_directory = Path(folder) / entry['profile_topics_dir']
+            topic_index = json.loads((topic_directory / 'index.json').read_text())
+            self.assertEqual(topic_index['format'], 'profile_topics_index_v1')
+            self.assertEqual(topic_index['metadata'], result['metadata'])
+            self.assertEqual(topic_index['census_page_count'], len(result['pages']))
+            self.assertEqual(topic_index['shard_size'], 1024)
+            topic_rows = []
+            for bucket in topic_index['shards']:
+                shard = json.loads((topic_directory / f'{bucket}.json').read_text())
+                self.assertEqual(shard['metadata'], result['metadata'])
+                self.assertEqual(shard['bucket'], bucket)
+                self.assertLessEqual(len(shard['rows']), 1024)
+                self.assertTrue(all(row[0] // 1024 == bucket for row in shard['rows']))
+                topic_rows.extend(shard['rows'])
+            self.assertEqual(topic_rows, [[p['page_id'], p.get('topic_status'), p.get('topic_labels')]
+                                         for p in sorted(result['pages'], key=lambda p: p['page_id'])])
             summary = json.loads((Path(folder) / entry['summary_file']).read_text())
             creators = json.loads((Path(folder) / entry['creator_index_file']).read_text())
             self.assertEqual(summary['format'], 'dashboard_summary_v1')
@@ -367,6 +383,30 @@ class ExportTests(unittest.TestCase):
             self.assertNotIn('creators', summary['reports'])
             self.assertFalse(list(Path(folder).glob('*.tmp')))
         self.assertEqual(result, original)
+
+    def test_profile_topic_shards_preserve_sparse_unordered_ids_and_missing_topics(self):
+        result = analyze(demo())
+        result['metadata']['topics'] = {'status': 'predicted'}
+        result['pages'] = [dict(page, page_id=pid, topic_status=status, topic_labels=labels)
+                           for page, (pid, status, labels) in zip(result['pages'], [
+                               (9000, 'predicted', []), (1024, 'missing', None),
+                               (1, 'predicted', ['Culture.Media.Music'])])]
+        result['link_candidates'] = {}
+        before = copy.deepcopy(result)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            export_result(result, root / 'wiki.json')
+            entry = json.loads((root / 'manifest.json').read_text())[0]
+            directory = root / entry['profile_topics_dir']
+            index = json.loads((directory / 'index.json').read_text())
+            self.assertEqual(index['shards'], [0, 1, 8])
+            self.assertEqual(index['census_page_count'], 3)
+            self.assertEqual([json.loads((directory / f'{bucket}.json').read_text())['rows']
+                              for bucket in index['shards']], [
+                                  [[1, 'predicted', ['Culture.Media.Music']]],
+                                  [[1024, 'missing', None]], [[9000, 'predicted', []]]])
+            self.assertEqual(len(list(directory.glob('*.json'))), 4)
+        self.assertEqual(result, before)
 
     def test_dashboard_conversion_failure_preserves_old_publications(self):
         with tempfile.TemporaryDirectory() as folder:
