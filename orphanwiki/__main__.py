@@ -337,6 +337,11 @@ def main():
     history_import.add_argument('--output-dir', default='data/imported')
     history_import.add_argument('--output', help='Predefinito: data/imported/<lingua>-history.json')
     history_import.add_argument('--work-dir', default='data/dumps/staging')
+    for history_parser in (imported, history_import):
+        history_parser.add_argument('--history-cache-mib', type=int, default=256,
+                                    help='Cache SQLite History in MiB, da 1 a 65536; predefinita 256')
+        history_parser.add_argument('--history-commit-rows', type=int, default=250000,
+                                    help='Record tra commit History, da 1 a 10000000; nessun limite al censimento')
     compare = sub.add_parser('compare', help='Confronto interlingua in tutte le direzioni')
     compare.add_argument('inputs', nargs='*', help='Raccolte complete, una per lingua; senza argomenti legge tutti i *-raw.json')
     compare.add_argument('--input-dir', default='data')
@@ -367,6 +372,10 @@ def main():
     args = parser.parse_args()
     if hasattr(args, 'batch_size') and not 1 <= args.batch_size <= 10000:
         parser.error('--batch-size deve essere compreso tra 1 e 10000; non limita il numero di voci')
+    if hasattr(args, 'history_cache_mib') and not 1 <= args.history_cache_mib <= 65536:
+        parser.error('--history-cache-mib deve essere compreso tra 1 e 65536')
+    if hasattr(args, 'history_commit_rows') and not 1 <= args.history_commit_rows <= 10000000:
+        parser.error('--history-commit-rows deve essere compreso tra 1 e 10000000')
     if args.command in ('fetch-content', 'quality', 'refresh-measures'):
         from .dumps import fetch_content, infer_quality, refresh_measures
         selected = configured_languages(args.languages_file)
@@ -408,7 +417,8 @@ def main():
         output = args.output or f'data/imported/{language}-raw.json'
         import_graph(args.manifest, output, args.work_dir)
         history_output = args.history_output or f'data/imported/{language}-history.json'
-        import_history(args.manifest, history_output, args.work_dir)
+        import_history(args.manifest, history_output, args.work_dir,
+                       cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
     elif args.command == 'import-history':
         from .dumps import import_history
         if args.manifest:
@@ -418,7 +428,8 @@ def main():
             language = manifest['language']
             wiki_database(language, manifest.get('database'))
             output = args.output or f'data/imported/{language}-history.json'
-            import_history(args.manifest, output, args.work_dir)
+            import_history(args.manifest, output, args.work_dir,
+                           cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
         else:
             if not args.sql_release or not args.history_release or args.output:
                 parser.error('Senza --manifest indicare --sql-release e --history-release; usare --output-dir')
@@ -429,7 +440,8 @@ def main():
             for language, database in selected:
                 if language in languages:
                     import_history(Path(args.root) / database / f'manifest-{args.sql_release}-{args.history_release}.json',
-                                   Path(args.output_dir) / f'{language}-history.json', args.work_dir)
+                                   Path(args.output_dir) / f'{language}-history.json', args.work_dir,
+                                   cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
     elif args.command == 'topics':
         if not math.isfinite(args.time_budget_seconds) or args.time_budget_seconds <= 0:
             parser.error('Il budget deve essere un numero positivo finito')

@@ -318,12 +318,28 @@ class DumpPipelineTests(unittest.TestCase):
         for extra in (('--metrics-interval', '0'), ('--metrics-interval', 'nan'),
                       ('--metrics-interval', 'inf'), ('--topic-budget-seconds', '0'),
                       ('--topic-budget-seconds', 'nan'), ('--topic-budget-seconds', 'inf'),
-                      ('--topic-batch-size', '0'), ('--topic-batch-size', '10001')):
+                      ('--topic-batch-size', '0'), ('--topic-batch-size', '10001'),
+                      ('--history-cache-mib', '0'), ('--history-cache-mib', '65537'),
+                      ('--history-commit-rows', '0'), ('--history-commit-rows', '10000001')):
             with self.subTest(extra=extra):
                 result = self.invoke('vec', extra=extra)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.calls.exists())
                 self.assertFalse((self.root / 'logs').exists())
+
+    def test_history_controls_reach_each_import_and_do_not_invalidate_completed_steps(self):
+        result = self.invoke('vec', 'lmo', extra=('--history-cache-mib', '1024', '--history-commit-rows', '100000'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = self.one_benchmark()
+        steps = [row['command'] for row in report['steps'] if row['command'][3] == 'import-dumps']
+        self.assertEqual(len(steps), 2)
+        for command in steps:
+            self.assertEqual(command[command.index('--history-cache-mib') + 1], '1024')
+            self.assertEqual(command[command.index('--history-commit-rows') + 1], '100000')
+        before = self.calls.read_text()
+        rerun = self.invoke('vec', 'lmo', extra=('--history-cache-mib', '2048', '--history-commit-rows', '250000'))
+        self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
+        self.assertEqual(self.calls.read_text(), before)
 
     def test_missing_proc_resources_remain_unavailable(self):
         resources = runpy.run_path(str(SCRIPT))['linux_resources']
@@ -543,6 +559,10 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual([line.split(':', 1)[0] for line in self.calls.read_text().splitlines()],
                          ['fetch-dumps', 'import-history', 'topics', 'fetch-content', 'quality', 'analyze'])
         self.assertIn('aggiornamento cronologia it', result.stdout)
+        history_command = next(step['command'] for step in self.one_benchmark()['steps']
+                               if step['command'][3] == 'import-history')
+        self.assertEqual(history_command[history_command.index('--history-cache-mib') + 1], '256')
+        self.assertEqual(history_command[history_command.index('--history-commit-rows') + 1], '250000')
         self.assertTrue((self.root / 'imported' / 'it-topics.json').exists())
 
     def test_failure_stops_before_next_language_and_records_stderr(self):

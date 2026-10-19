@@ -625,6 +625,8 @@ def run_pipeline(args, log, benchmark=None):
         python = PROJECT_ROOT / python
     require_file(python, 'Interprete Python')
     base = [str(python), '-m', 'orphanwiki']
+    history_options = ['--history-cache-mib', str(args.history_cache_mib),
+                       '--history-commit-rows', str(args.history_commit_rows)]
     state = StepState(dump_root / 'pipeline-state.json') if not args.plan else None
     source = ['--languages-file', str(project_path(args.languages_file))]
     fetch = [*base, 'fetch-dumps', *source, '--sql-release', args.sql_release,
@@ -685,13 +687,13 @@ def run_pipeline(args, log, benchmark=None):
         elif not args.force and imported_files_match(graph, history, stage, manifest, metadata, history_required=False):
             step(f'aggiornamento cronologia {language}',
                      [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
-                      '--work-dir', str(work_dir)])
+                      '--work-dir', str(work_dir), *history_options])
             state.save(f'import:{language}', import_inputs, outputs)
         else:
             step(f'importazione {language}',
                      [*base, 'import-dumps', '--manifest', str(manifest),
                       '--output', str(graph), '--history-output', str(history),
-                      '--work-dir', str(work_dir)])
+                      '--work-dir', str(work_dir), *history_options])
             state.save(f'import:{language}', import_inputs, outputs)
         require_file(graph, 'Grafo importato')
         require_file(history, 'Cronologia importata')
@@ -828,6 +830,10 @@ def main(argv=None):
                         help='Voci per blocco dei temi, da 1 a 10000; non limita il censimento')
     parser.add_argument('--metrics-interval', type=float, default=10,
                         help='Secondi tra campioni risorse e messaggi di attività; predefinito 10')
+    parser.add_argument('--history-cache-mib', type=int, default=256,
+                        help='Cache SQLite History in MiB, da 1 a 65536; predefinita 256')
+    parser.add_argument('--history-commit-rows', type=int, default=250000,
+                        help='Record tra commit History, da 1 a 10000000; predefinito 250000')
     parser.add_argument('--force', action='store_true', help='Ricalcola tutte le fasi, mantenendo i download verificati')
     parser.add_argument('--plan', action='store_true', help='Solo piano dei download, senza importare')
     args = parser.parse_args(argv)
@@ -837,6 +843,10 @@ def main(argv=None):
         parser.error('--metrics-interval deve essere finito e almeno 0.1 secondi')
     if not 1 <= args.topic_batch_size <= 10000:
         parser.error('--topic-batch-size deve essere compreso tra 1 e 10000')
+    if not 1 <= args.history_cache_mib <= 65536:
+        parser.error('--history-cache-mib deve essere compreso tra 1 e 65536')
+    if not 1 <= args.history_commit_rows <= 10000000:
+        parser.error('--history-commit-rows deve essere compreso tra 1 e 10000000')
     try:
         sql_date = datetime.strptime(args.sql_release, '%Y%m%d')
         if sql_date.strftime('%Y%m%d') != args.sql_release:

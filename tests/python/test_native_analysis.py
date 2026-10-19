@@ -7,6 +7,35 @@ from orphanwiki import _native
 
 
 class NativeAnalysisTests(unittest.TestCase):
+    def test_history_activity_matches_definition_for_many_unsorted_creation_dates(self):
+        from collections import Counter
+        from datetime import datetime, timedelta
+        from random import Random
+        rng = Random(42)
+        start = datetime(2020, 1, 1)
+        events = [(start + timedelta(hours=12 * i), rng.choice((-1, 0, 0, 1, 2))) for i in range(1200)]
+        queries = [start + timedelta(days=rng.randrange(-30, 660)) for _ in range(300)]
+        queries.extend(queries[:5])
+        rng.shuffle(events)
+        actual = _native.history_activity(
+            [(at.isoformat(sep=' ') + '.0', ns) for at, ns in events],
+            [at.isoformat(sep=' ') + '.0' for at in queries])
+        months = Counter((at.year, at.month) for at, _ in events)
+        expected = []
+        for creation in queries:
+            before = [ns for at, ns in events if at < creation]
+            main = before.count(0)
+            month = creation.replace(day=1) - timedelta(days=1)
+            streak = 0
+            while months[month.year, month.month] >= 5:
+                streak += 1
+                month = month.replace(day=1) - timedelta(days=1)
+            bucket = next(name for limit, name in ((0, 'none'), (1, 'one'), (2, 'two'),
+                          (6, 'three_to_six'), (12, 'seven_to_twelve'), (24, 'thirteen_to_twenty_four'),
+                          (float('inf'), 'over_twenty_four')) if streak <= limit)
+            expected.append((main, len(before) - main, streak, bucket))
+        self.assertEqual(actual, expected)
+
     def test_age_dates_match_instants_and_keep_unknowns(self):
         ages = _native.article_ages('2026-01-02T00:00:00Z', [
             None, '2026-01-01T01:00:00+01:00',

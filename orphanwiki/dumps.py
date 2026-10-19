@@ -13,8 +13,10 @@ import re
 import sqlite3
 import tempfile
 import math
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import MutableMapping
+from collections import OrderedDict
 from contextlib import closing
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -29,6 +31,7 @@ BASE = 'https://dumps.wikimedia.org'
 SQL_TABLES = ('page', 'pagelinks', 'linktarget', 'redirect', 'page_props',
               'categorylinks', 'user_groups')
 HISTORY_RULE = 'mediawiki_history_page_creation_v2'
+HISTORY_CREATION_CACHE = 100_000
 USER_AGENT = 'OrphanWiki/0.1 (public Wikimedia dump research importer)'
 
 
@@ -74,12 +77,12 @@ class DiskPages(MutableMapping):
         self.connection.commit()
 
     def export_pages(self):
-        for page_id, encoded in self.connection.execute('SELECT id,data FROM pages ORDER BY id'):
-            page = json.loads(encoded)
-            for kind in ('links', 'categories'):
-                page[kind] = [row[0] for row in self.connection.execute(
-                    f'SELECT target FROM {kind} WHERE id=? ORDER BY rowid', (page_id,))]
-            yield page
+        # Three indexed streams replace two SQLite queries per article. Share
+        # the bounded merge used by native analysis; retain source row order.
+        for batch in _stage_page_batches(self.connection, 512, include_links=True):
+            for _, page, targets, categories in batch:
+                page['links'], page['categories'] = targets, categories
+                yield page
 
 
 class _Links(HTMLParser):
@@ -814,13 +817,25 @@ def _history_rows(path, database):
             yield fields
 
 
-def _history_scan(connection, name, path, digest, phase, database, page_ids, user_ids=None):
+def _history_scan(connection, name, path, digest, phase, database, page_ids, user_ids=None,
+                  *, commit_rows=250_000):
+    """Scan the entire partition, bounding buffers and exact duplicate evidence.
+
+    Batches bound Python memory independently of transaction size. The small
+    positive cache only suppresses identical creation triples already buffered
+    or inserted in this scan; eviction merely repeats an INSERT OR IGNORE.
+    Completed partition identities retain the existing scientific definition.
+    """
+    if type(commit_rows) is not int or not 1 <= commit_rows <= 10_000_000:
+        raise ValueError('Commit History: usare da 1 a 10000000 record')
     previous = connection.execute('SELECT sha256 FROM history_imported WHERE file=? AND phase=?',
                                   (name, phase)).fetchone()
     identity = digest + ':' + HISTORY_RULE if phase == 'initial' else digest + ':' + hashlib.sha256(
         json.dumps(sorted(user_ids or ())).encode()).hexdigest()
     if previous and previous[0] == identity:
+        print(f'MediaWiki History {database}: {name} {phase}, SALTA checkpoint completo', flush=True)
         return
+    print(f'MediaWiki History {database}: {name} {phase}, INIZIO preparazione staging', flush=True)
     table = 'history_initial' if phase == 'initial' else 'history_edit'
     connection.execute(f'DELETE FROM {table} WHERE file=?', (name,))
     if phase == 'initial':
@@ -829,14 +844,68 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
     connection.execute('DELETE FROM history_imported WHERE file=? AND phase=?', (name, phase))
     connection.commit()
     batch, events, creations = [], [], set()
-    count = 0
-    for row in _history_rows(path, database):
+    recent_creations = OrderedDict()
+    count = scanned = pending = commits = cache_hits = 0
+    sqlite_seconds = 0.0
+    started = reported = time.monotonic()
+
+    def flush():
+        nonlocal count, pending, commits, sqlite_seconds
+        rows = len(batch) + len(events) + len(creations)
+        if not rows:
+            return
+        before = time.monotonic()
+        if batch:
+            query = ('INSERT INTO history_initial VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+                     if phase == 'initial' else 'INSERT INTO history_edit VALUES(?,?,?,?,?)')
+            connection.executemany(query, batch)
+            count += len(batch)
+            batch.clear()
+        if events:
+            connection.executemany('INSERT INTO history_page_event VALUES(?,?,?,?)', events)
+            events.clear()
+        if creations:
+            connection.executemany('INSERT OR IGNORE INTO history_creation VALUES(?,?,?)', sorted(creations))
+            creations.clear()
+        pending += rows
+        if pending >= commit_rows:
+            connection.commit()
+            commits += 1
+            pending = 0
+        sqlite_seconds += time.monotonic() - before
+
+    def progress(done=False):
+        nonlocal reported
+        now = time.monotonic()
+        if not done and now - reported < 30:
+            return
+        elapsed = now - started
+        print(f'MediaWiki History {database}: {name} {phase}, '
+              f'{scanned:,} righe lette; {count + len(batch):,} righe utili; '
+              f'{cache_hits:,} creazioni duplicate in cache; {commits:,} commit; '
+              f'{elapsed:.1f}s, SQLite {sqlite_seconds:.1f}s; '
+              f'{scanned / max(elapsed, 0.001):,.0f} righe/s' + ('; COMPLETATO' if done else ''), flush=True)
+        reported = now
+
+    print(f'MediaWiki History {database}: {name} {phase}, INIZIO scansione', flush=True)
+    for scanned, row in enumerate(_history_rows(path, database), 1):
+        # Check progress even when none of the scanned rows are retained.
+        if scanned % 10000 == 0:
+            progress()
         if phase == 'initial':
             page_id = int(row[28]) if row[28].isdecimal() else None
             if page_id not in page_ids:
                 continue
             if row[2] in ('page', 'revision') and row[37]:
-                creations.add((name, page_id, row[37]))
+                evidence = (page_id, row[37])
+                if evidence in recent_creations:
+                    recent_creations.move_to_end(evidence)
+                    cache_hits += 1
+                else:
+                    recent_creations[evidence] = None
+                    if len(recent_creations) > HISTORY_CREATION_CACHE:
+                        recent_creations.popitem(last=False)
+                    creations.add((name, *evidence))
             if row[2] == 'page' and row[3] in ('create', 'import', 'merge'):
                 events.append((name, page_id, row[3], row[4]))
             elif row[2] == 'revision' and row[3] == 'create' and row[61] == '0':
@@ -856,32 +925,15 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
                 if historical_ns.lstrip('-').isdecimal():
                     batch.append((name, int(row[60]), user_id, row[4], int(historical_ns)))
         if len(batch) >= 5000 or len(events) >= 5000 or len(creations) >= 5000:
-            if batch:
-                query = ('INSERT INTO history_initial VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
-                         if phase == 'initial' else 'INSERT INTO history_edit VALUES(?,?,?,?,?)')
-                connection.executemany(query, batch)
-                count += len(batch)
-                batch.clear()
-            if events:
-                connection.executemany('INSERT INTO history_page_event VALUES(?,?,?,?)', events)
-                events.clear()
-            if creations:
-                connection.executemany('INSERT OR IGNORE INTO history_creation VALUES(?,?,?)', creations)
-                creations.clear()
-            connection.commit()
-    if batch:
-        query = ('INSERT INTO history_initial VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
-                 if phase == 'initial' else 'INSERT INTO history_edit VALUES(?,?,?,?,?)')
-        connection.executemany(query, batch)
-        count += len(batch)
-    if events:
-        connection.executemany('INSERT INTO history_page_event VALUES(?,?,?,?)', events)
-    if creations:
-        connection.executemany('INSERT OR IGNORE INTO history_creation VALUES(?,?,?)', creations)
-    connection.commit()
+            flush()
+            progress()
+    flush()
+    before = time.monotonic()
     connection.execute('INSERT INTO history_imported VALUES(?,?,?)', (name, phase, identity))
     connection.commit()
-    print(f'MediaWiki History {database}: {name} {phase}, {count:,} righe utili', flush=True)
+    commits += 1
+    sqlite_seconds += time.monotonic() - before
+    progress(done=True)
 
 
 def _history_records(connection, page_ids, database):
@@ -959,10 +1011,14 @@ def _history_records(connection, page_ids, database):
     return records
 
 
-def import_history(manifest_path, output, work_dir):
+def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_rows=250_000):
     """Keep reconstructed creator evidence separate from the SQL graph."""
     from ._native import history_activity
 
+    if type(cache_mib) is not int or not 1 <= cache_mib <= 65536:
+        raise ValueError('Cache History: usare da 1 a 65536 MiB')
+    if type(commit_rows) is not int or not 1 <= commit_rows <= 10_000_000:
+        raise ValueError('Commit History: usare da 1 a 10000000 record')
     manifest = json.loads(Path(manifest_path).read_text())
     language = manifest['language']
     database = wiki_database(language, manifest.get('database'))
@@ -978,7 +1034,9 @@ def import_history(manifest_path, output, work_dir):
         raise ValueError('Output e input/staging devono essere distinti')
     with closing(sqlite3.connect(stage_path)) as connection:
         connection.execute('PRAGMA temp_store=FILE')
-        connection.execute('PRAGMA cache_size=-8192')
+        connection.execute(f'PRAGMA cache_size=-{cache_mib * 1024}')
+        print(f'MediaWiki History {database}: cache SQLite {cache_mib} MiB; '
+              f'commit ogni circa {commit_rows:,} record; batch Python fino a 5000 per tipo', flush=True)
         _history_schema(connection)
         if all(table in manifest['files'] for table in SQL_TABLES):
             imported = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
@@ -994,7 +1052,8 @@ def import_history(manifest_path, output, work_dir):
                     or _hash(path, 'sha256') != data['sha256_local']):
                 raise ValueError(f'Partizione MediaWiki History modificata: {name}')
             _history_scan(connection, name, path, data['sha256_local'], 'initial',
-                          database, page_ids)
+                          database, page_ids, commit_rows=commit_rows)
+        print(f'MediaWiki History {database}: ricostruzione creazione e attribuzione autori', flush=True)
         records = _history_records(connection, page_ids, database)
         snapshot = (_history_timestamp(manifest['files'].get('user_groups', {}).get('job_updated')) or
                     datetime.strptime(manifest['sql_release'], '%Y%m%d').replace(tzinfo=timezone.utc).isoformat())
@@ -1022,8 +1081,10 @@ def import_history(manifest_path, output, work_dir):
                     if record['creator_user_id'] is not None}
         for name, data in files:
             _history_scan(connection, name, Path(data['path']), data['sha256_local'],
-                          'activity', database, page_ids, user_ids)
+                          'activity', database, page_ids, user_ids, commit_rows=commit_rows)
+        print(f'MediaWiki History {database}: indicizzazione attività autori', flush=True)
         connection.execute('CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)')
+        print(f'MediaWiki History {database}: calcolo misure autori', flush=True)
         by_user = {}
         for record in records:
             if record['creator_user_id'] is not None:

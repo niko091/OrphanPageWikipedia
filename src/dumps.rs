@@ -124,35 +124,51 @@ pub fn history_activity(
         let month = time.year() * 12 + i32::try_from(time.month()).map_err(|e| e.to_string())?;
         *month_counts.entry(month).or_default() += 1;
     }
-    creations
+    // Sort queries once and sweep the edits once. Counting the entire earlier
+    // prefix separately for each creation was O(edits * creations) for prolific
+    // authors. Keep input order, duplicates and the strict timestamp boundary.
+    let mut ordered_creations = creations
         .into_iter()
-        .map(|value| {
-            let creation = parse(&value)?;
-            let earlier = edits.partition_point(|(time, _)| *time < creation);
-            let main = edits[..earlier].iter().filter(|(_, ns)| *ns == 0).count();
-            let other = earlier - main;
-            // The creation month is unfinished at the event. Only complete
-            // previous calendar months enter the Vital Signs stability streak.
-            let mut month = creation.year() * 12
-                + i32::try_from(creation.month()).map_err(|e| e.to_string())?
-                - 1;
-            let mut active_months = 0;
+        .enumerate()
+        .map(|(index, value)| parse(&value).map(|creation| (index, creation)))
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered_creations.sort_unstable_by_key(|(_, creation)| *creation);
+    let mut result = (0..ordered_creations.len())
+        .map(|_| (0, 0, 0, String::new()))
+        .collect::<Vec<_>>();
+    let mut earlier = 0;
+    let mut main = 0;
+    let mut streaks = HashMap::new();
+    for (index, creation) in ordered_creations {
+        while earlier < edits.len() && edits[earlier].0 < creation {
+            main += usize::from(edits[earlier].1 == 0);
+            earlier += 1;
+        }
+        // The creation month is unfinished at the event. Only complete
+        // previous calendar months enter the Vital Signs stability streak.
+        let month =
+            creation.year() * 12 + i32::try_from(creation.month()).map_err(|e| e.to_string())? - 1;
+        let active_months = *streaks.entry(month).or_insert_with(|| {
+            let mut month = month;
+            let mut count = 0;
             while month_counts.get(&month).copied().unwrap_or(0) >= 5 {
-                active_months += 1;
+                count += 1;
                 month -= 1;
             }
-            let bucket = match active_months {
-                0 => "none",
-                1 => "one",
-                2 => "two",
-                3..=6 => "three_to_six",
-                7..=12 => "seven_to_twelve",
-                13..=24 => "thirteen_to_twenty_four",
-                _ => "over_twenty_four",
-            };
-            Ok((main, other, active_months, bucket.to_owned()))
-        })
-        .collect()
+            count
+        });
+        let bucket = match active_months {
+            0 => "none",
+            1 => "one",
+            2 => "two",
+            3..=6 => "three_to_six",
+            7..=12 => "seven_to_twelve",
+            13..=24 => "thirteen_to_twenty_four",
+            _ => "over_twenty_four",
+        };
+        result[index] = (main, earlier - main, active_months, bucket.to_owned());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -173,6 +189,66 @@ mod tests {
         events.push(("2026-03-01 12:00:00.0".to_owned(), 0));
         let metrics = history_activity(events, vec!["2026-03-01 12:00:00.0".to_owned()]).unwrap();
         assert_eq!(metrics, vec![(5, 5, 2, "two".to_owned())]);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn prior_activity_sweep_preserves_query_order_duplicates_and_time_boundaries() {
+        let events = vec![
+            ("2026-03-01 12:00:00.0".to_owned(), 0),
+            ("2026-01-01 00:00:00.0".to_owned(), -1),
+            ("2026-02-01 00:00:00.0".to_owned(), 0),
+            ("2026-02-01 00:00:00.0".to_owned(), 1),
+        ];
+        let queries = [
+            "2026-04-01 00:00:00.0",
+            "2026-02-01 00:00:00.0",
+            "2026-01-01 00:00:00.0",
+            "2026-04-01 00:00:00.0",
+            "2025-01-01 00:00:00.0",
+            "2026-02-01 00:00:00.1",
+        ];
+        let result =
+            history_activity(events, queries.iter().map(|s| (*s).to_owned()).collect()).unwrap();
+        let expected = [(2, 2), (0, 1), (0, 0), (2, 2), (0, 0), (1, 2)];
+        for (actual, (main, other)) in result.iter().zip(expected) {
+            assert_eq!(actual, &(main, other, 0, "none".to_owned()));
+        }
+        assert_eq!(result.len(), queries.len());
+        assert!(history_activity(Vec::new(), vec!["invalid".to_owned()]).is_err());
+        assert!(history_activity(vec![("invalid".to_owned(), 0)], Vec::new()).is_err());
+        assert_eq!(
+            history_activity(Vec::new(), Vec::new()).unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn prior_activity_caches_streaks_without_changing_creation_month_exclusion() {
+        let mut events = Vec::new();
+        for month in 1..=4 {
+            for day in 1..=5 {
+                events.push((format!("2026-{month:02}-{day:02} 10:00:00.0"), 0));
+            }
+        }
+        let queries = [
+            "2026-04-30 12:00:00.0",
+            "2026-02-01 12:00:00.0",
+            "2026-04-01 12:00:00.0",
+            "2026-05-01 12:00:00.0",
+        ];
+        let result =
+            history_activity(events, queries.iter().map(|s| (*s).to_owned()).collect()).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                (20, 0, 3, "three_to_six".to_owned()),
+                (6, 0, 1, "one".to_owned()),
+                (16, 0, 3, "three_to_six".to_owned()),
+                (20, 0, 4, "three_to_six".to_owned()),
+            ]
+        );
     }
 
     #[test]

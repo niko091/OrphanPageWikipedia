@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +29,148 @@ class Response(io.BytesIO):
 
 
 class DumpTests(unittest.TestCase):
+    def test_sql_export_streams_relations_without_queries_per_article(self):
+        from orphanwiki.dumps import DiskPages
+        with closing(sqlite3.connect(':memory:')) as db:
+            pages = DiskPages(db)
+            expected = []
+            for pid in range(1, 1101):
+                page = {'page_id': pid * 2, 'title': f'Vòce {pid}', 'revision_id': pid}
+                pages[pid * 2] = page
+                links = ['Target', f'Àlias {pid}', 'Target'] if pid % 3 else []
+                categories = ['Category B', 'Category A'] if pid % 2 else []
+                for target in links:
+                    pages.add('links', pid * 2, target)
+                for category in categories:
+                    pages.add('categories', pid * 2, category)
+                expected.append({**page, 'links': links, 'categories': categories})
+            pages.prepare_export()
+            selects = []
+            db.set_trace_callback(lambda sql: selects.append(sql) if sql.startswith('SELECT') else None)
+            self.assertEqual(list(pages.export_pages()), expected)
+            self.assertLessEqual(len(selects), 3)
+
+    def test_history_cli_passes_operational_controls_without_changing_sources(self):
+        from orphanwiki.__main__ import main
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = Path(folder) / 'manifest.json'
+            manifest.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki'}))
+            for command in ('import-dumps', 'import-history'):
+                with self.subTest(command=command):
+                    argv = ['orphanwiki', command, '--manifest', str(manifest),
+                            '--work-dir', folder, '--history-cache-mib', '1024',
+                            '--history-commit-rows', '100000']
+                    with patch.object(sys, 'argv', argv), \
+                            patch('orphanwiki.dumps.import_graph') as graph_import, \
+                            patch('orphanwiki.dumps.import_history') as history_import:
+                        main()
+                    history_import.assert_called_once_with(
+                        str(manifest), 'data/imported/vec-history.json', folder,
+                        cache_mib=1024, commit_rows=100000)
+                    self.assertEqual(graph_import.call_count, int(command == 'import-dumps'))
+            for option, value in (('--history-cache-mib', '0'), ('--history-cache-mib', '65537'),
+                                  ('--history-commit-rows', '0'), ('--history-commit-rows', '10000001')):
+                with self.subTest(option=option, value=value), patch.object(sys, 'argv', [
+                        'orphanwiki', 'import-history', '--manifest', 'does-not-exist', option, value]), \
+                        redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_history_deduplication_preserves_conflicts_and_initial_revisions(self):
+        from orphanwiki.dumps import _history_schema, _history_scan, _history_records
+        def rows():
+            for cycle in range(3):
+                for pid in range(1, 6002):
+                    row = [''] * 78
+                    row[0], row[2], row[3], row[4] = 'vecwiki', 'revision', 'create', '2019-01-01 00:00:00.0'
+                    row[6], row[28], row[37] = '42', str(pid), row[4]
+                    row[60], row[61] = str(pid + cycle * 6001), '0' if cycle == 0 else '1'
+                    row[63] = 'user' if pid == 2 else ''
+                    yield row
+            row = row.copy()
+            row[28], row[37], row[61] = '1', '2020-01-01 00:00:00.0', '1'
+            yield row
+            row = row.copy()
+            row[28], row[37] = '3', 'invalid'
+            yield row
+        snapshots = []
+        for commit_rows, cache_size in ((1, 2), (250000, 100000)):
+            with self.subTest(commit_rows=commit_rows), closing(sqlite3.connect(':memory:')) as db:
+                _history_schema(db)
+                creation_inserts = []
+                db.set_trace_callback(lambda sql: creation_inserts.append(1)
+                                      if sql.startswith('INSERT OR IGNORE INTO history_creation') else None)
+                with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows()), \
+                        patch('orphanwiki.dumps.HISTORY_CREATION_CACHE', cache_size), redirect_stdout(io.StringIO()):
+                    _history_scan(db, 'partition', None, 'digest', 'initial', 'vecwiki',
+                                  set(range(1, 6002)), commit_rows=commit_rows)
+                snapshot = {table: db.execute(f'SELECT * FROM {table} ORDER BY 1,2,3').fetchall()
+                            for table in ('history_initial', 'history_creation', 'history_imported')}
+                snapshots.append(snapshot)
+                self.assertEqual(len(snapshot['history_initial']), 6001)
+                self.assertEqual(len(snapshot['history_creation']), 6003)
+                records = _history_records(db, {1, 2, 3}, 'vecwiki')
+                self.assertEqual(records[0]['creation_date_status'], 'ambiguous_history_creation')
+                self.assertEqual(records[1]['creator_attribution'], 'history_hidden_or_unregistered_creator')
+                self.assertEqual(records[2]['creation_date_status'], 'ambiguous_history_creation')
+                if cache_size == 100000:
+                    self.assertEqual(len(creation_inserts), 6003)
+                else:
+                    self.assertGreater(len(creation_inserts), 6003)
+                with patch('orphanwiki.dumps._history_rows', side_effect=AssertionError('must reuse checkpoint')), \
+                        redirect_stdout(io.StringIO()):
+                    _history_scan(db, 'partition', None, 'digest', 'initial', 'vecwiki',
+                                  set(range(1, 6002)), commit_rows=5000)
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_history_interrupted_partition_retries_without_duplicates_or_losing_completed_files(self):
+        from orphanwiki.dumps import _history_schema, _history_scan
+        def rows(limit, fail=False):
+            for pid in range(1, limit + 1):
+                row = [''] * 78
+                row[0], row[2:5] = 'vecwiki', ['revision', 'create', '2020-01-01 00:00:00.0']
+                row[6], row[28], row[31], row[37], row[60], row[61] = '42', str(pid), '0', row[4], str(pid), '0'
+                yield row
+            if fail:
+                raise ValueError('synthetic truncated partition')
+        for phase, table in (('initial', 'history_initial'), ('activity', 'history_edit')):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / 'stage.sqlite'
+                with closing(sqlite3.connect(path)) as db, redirect_stdout(io.StringIO()):
+                    _history_schema(db)
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(2)):
+                        _history_scan(db, 'complete', None, 'old', phase, 'vecwiki', {1, 2}, {42})
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(5001, fail=True)), \
+                            self.assertRaisesRegex(ValueError, 'truncated'):
+                        _history_scan(db, 'partial', None, 'new', phase, 'vecwiki',
+                                      set(range(1, 6002)), {42}, commit_rows=1)
+                with closing(sqlite3.connect(path)) as db, redirect_stdout(io.StringIO()):
+                    self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table} WHERE file="partial"').fetchone()[0], 5000)
+                    self.assertIsNone(db.execute('SELECT 1 FROM history_imported WHERE file="partial"').fetchone())
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(6001)):
+                        _history_scan(db, 'partial', None, 'new', phase, 'vecwiki',
+                                      set(range(1, 6002)), {42}, commit_rows=250000)
+                    self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table} WHERE file="partial"').fetchone()[0], 6001)
+                    self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table} WHERE file="complete"').fetchone()[0], 2)
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM history_imported').fetchone()[0], 2)
+                    if phase == 'initial':
+                        self.assertEqual(db.execute('SELECT COUNT(*) FROM history_creation WHERE file="partial"').fetchone()[0], 6001)
+
+    def test_history_progress_includes_scanned_rows_even_when_none_are_retained(self):
+        from orphanwiki.dumps import _history_schema, _history_scan
+        with closing(sqlite3.connect(':memory:')) as db:
+            _history_schema(db)
+            row = [''] * 78
+            row[28] = '999'
+            log = io.StringIO()
+            with patch('orphanwiki.dumps._history_rows', return_value=iter([row] * 10000)), \
+                    patch('orphanwiki.dumps.time.monotonic', side_effect=(0, 31, 32, 33, 34)), redirect_stdout(log):
+                _history_scan(db, 'empty', None, 'digest', 'initial', 'vecwiki', {1})
+            messages = log.getvalue().splitlines()
+            self.assertTrue(any('10,000 righe lette; 0 righe utili' in message and 'COMPLETATO' not in message
+                                for message in messages))
+            self.assertIn('COMPLETATO', messages[-1])
+
     def test_staged_item_mapping_excludes_ambiguous_and_invalid_qids(self):
         from orphanwiki.core import _comparison_schema
         with closing(sqlite3.connect(':memory:')) as source, closing(sqlite3.connect(':memory:')) as destination:
