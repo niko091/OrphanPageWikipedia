@@ -74,6 +74,11 @@ p {
   align-items: flex-end;
 }
 
+body[data-page="articles"] .toolbar,
+body[data-page="creators"] .toolbar {
+  padding-bottom: 24px;
+}
+
 .panel-head {
   justify-content: space-between;
 }
