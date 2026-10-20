@@ -84,7 +84,9 @@ def _publish_prepared(prepared, destination, excluded=()):
     manifest = prepared / 'manifest.json'
     excluded = set(excluded)
     for path in sorted(prepared.rglob('*')):
-        if path.is_file() and path != manifest and path not in excluded:
+        if path.is_dir():
+            (destination / path.relative_to(prepared)).mkdir(parents=True, exist_ok=True)
+        elif path.is_file() and path != manifest and path not in excluded:
             target = destination / path.relative_to(prepared)
             target.parent.mkdir(parents=True, exist_ok=True)
             path.replace(target)

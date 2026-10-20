@@ -235,6 +235,10 @@ elif command == 'refresh-measures':
             (output / filename).write_text(json.dumps(document))
             sidecars(output, filename, [filename])
             (output / entry['connections_dir']).mkdir(exist_ok=True)
+            if 'articles_file' in entry:
+                (output / entry['articles_file']).write_text('{}')
+            if 'cards_dir' in entry:
+                (output / entry['cards_dir']).mkdir(exist_ok=True)
 '''
 
 
@@ -456,6 +460,35 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(calls.count('compare'), 1)
         self.assertEqual(calls.count('refresh-measures'), 1)
         self.assertEqual(calls.count('import-dumps'), 2)
+
+    def test_missing_article_index_or_card_directory_refreshes_only_transports_and_measures(self):
+        first = self.invoke('vec', 'lmo')
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        output = self.root / 'web-data'
+        manifest_path = output / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        entry = next(item for item in manifest if item['language'] == 'vec')
+        entry.update(articles_file='vec-articles.json', cards_dir='vec-card-records')
+        article = output / entry['articles_file']
+        cards = output / entry['cards_dir']
+        article.write_text('{}')
+        cards.mkdir()
+        manifest_path.write_text(json.dumps(manifest))
+        before = self.calls.read_text()
+        rerun = self.invoke('vec', 'lmo')
+        self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
+        self.assertEqual(self.calls.read_text(), before)
+        for missing in (article, cards):
+            if missing.is_dir():
+                missing.rmdir()
+            else:
+                missing.unlink()
+            result = self.invoke('vec', 'lmo')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(missing.exists())
+        self.assertEqual(self.calls.read_text().count('compare:'), 1)
+        self.assertEqual(self.calls.read_text().count('refresh-measures:'), 2)
+        self.assertEqual(self.calls.read_text().count('topics:'), 1)
 
     def test_quality_release_change_reuses_sql_topics_and_matching(self):
         first = self.invoke('vec', 'lmo')

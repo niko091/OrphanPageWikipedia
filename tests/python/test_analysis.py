@@ -15,6 +15,27 @@ from orphanwiki.categories import classify
 from orphanwiki.core import analyze, write_json, json_sha256, write_observations, iter_export_sections, write_dashboard_exports, prepared_summaries_match, OBSERVATION_COLUMNS
 
 
+def reconstructed_cards(root, entry):
+    index = json.loads((root / entry['cards_file']).read_text())
+    assert index['format'] == 'orphan_cards_v2'
+    pages, records = [], {}
+    for row in index['rows']:
+        projected = dict(zip(index['columns'], row))
+        identifier = str(projected['page_id'])
+        card = json.loads((root / entry['cards_dir'] / f'{identifier}.json').read_text())
+        assert card['format'] == 'orphan_card_v1'
+        assert card['card_identity'] == index['card_identity']
+        assert card['census_page_count'] == index['census_page_count']
+        assert {field: card['page'].get(field) for field in index['columns']} == projected
+        pages.append(card['page'])
+        if card['candidate_record'] is not None:
+            record = card['candidate_record']
+            assert [candidate['page_id'] for candidate in record['candidates']] == index['link_candidates'][identifier]['candidate_ids']
+            records[identifier] = record
+    return {'format': 'orphan_cards_v1', 'metadata': index['metadata'],
+            'census_page_count': index['census_page_count'], 'pages': pages, 'link_candidates': records}
+
+
 class GraphTests(unittest.TestCase):
     def test_native_empty_and_invalid(self):
         self.assertEqual(graph_counts([], [], {}), ([], [], 0))
@@ -495,7 +516,7 @@ class ExportTests(unittest.TestCase):
             rebuild_dashboard(root)
             entry = json.loads((root / 'manifest.json').read_text())[0]
             for key in ('observations_file', 'articles_file', 'summary_file', 'creator_index_file',
-                        'cards_file', 'connections_dir', 'profile_topics_dir'):
+                        'cards_file', 'cards_dir', 'connections_dir', 'profile_topics_dir'):
                 self.assertNotEqual(entry[key], old_entry[key])
                 self.assertTrue((root / entry[key]).exists())
                 self.assertTrue((root / old_entry[key]).exists())
@@ -529,7 +550,7 @@ class ExportTests(unittest.TestCase):
             root = Path(folder)
             export_result(result, root / 'wiki.json')
             entry = json.loads((root / 'manifest.json').read_text())[0]
-            cards = json.loads((root / entry['cards_file']).read_text())
+            cards = reconstructed_cards(root, entry)
             self.assertEqual(cards['census_page_count'], len(result['pages']))
             self.assertEqual(cards['pages'], [p for p in result['pages'] if p['orphan']])
             overview = cards['link_candidates'][identifier]
@@ -550,9 +571,33 @@ class ExportTests(unittest.TestCase):
             canonical = (root / 'wiki.json').read_bytes()
             rebuild_dashboard(root)
             self.assertEqual((root / 'wiki.json').read_bytes(), canonical)
-            self.assertEqual(json.loads((root / entry['cards_file']).read_text()), cards)
+            self.assertEqual(reconstructed_cards(root, entry), cards)
             self.assertEqual(json.loads((root / entry['connections_dir'] / (identifier + '.json')).read_text()), detail)
         self.assertEqual(result, before)
+
+    def test_empty_editorial_index_keeps_the_full_census_and_empty_directories(self):
+        raw = demo()
+        raw['pages'] = raw['pages'][:3]
+        for index, page in enumerate(raw['pages']):
+            page['links'] = [raw['pages'][(index + 1) % 3]['title']]
+        result = analyze(raw)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            export_result(result, root / 'wiki.json')
+            entry = json.loads((root / 'manifest.json').read_text())[0]
+            index = json.loads((root / entry['cards_file']).read_text())
+            self.assertEqual(index['census_page_count'], 3)
+            self.assertEqual(index['rows'], [])
+            self.assertEqual(index['link_candidates'], {})
+            for key in ('cards_dir', 'connections_dir'):
+                self.assertTrue((root / entry[key]).is_dir())
+                self.assertEqual(list((root / entry[key]).iterdir()), [])
+            self.assertEqual(reconstructed_cards(root, entry)['pages'], [])
+            rebuild_dashboard(root)
+            converted = json.loads((root / 'manifest.json').read_text())[0]
+            for key in ('cards_dir', 'connections_dir'):
+                self.assertTrue((root / converted[key]).is_dir())
+                self.assertEqual(list((root / converted[key]).iterdir()), [])
 
     def test_editorial_shortlists_skip_invalid_evidence_without_changing_detail(self):
         result = analyze(demo())
@@ -569,7 +614,7 @@ class ExportTests(unittest.TestCase):
             root = Path(folder)
             export_result(result, root / 'wiki.json')
             entry = json.loads((root / 'manifest.json').read_text())[0]
-            cards = json.loads((root / entry['cards_file']).read_text())
+            cards = reconstructed_cards(root, entry)
             self.assertEqual(cards['link_candidates'][identifier]['candidates'], [valid])
             detail = json.loads((root / entry['connections_dir'] / (identifier + '.json')).read_text())
             self.assertEqual(detail['link_candidates'][identifier], record)

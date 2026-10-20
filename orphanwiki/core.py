@@ -918,9 +918,10 @@ def write_observations(path, result):
 def write_dashboard_exports(source, folder, expected=None, *, transport_generation=None):
     """Project an ordered canonical export into bounded browser transports.
 
-    Cards contain all orphans, exact counts and a small prompt shortlist. A
-    separate record per orphan retains every candidate and reference edge for
-    the detail page. Read one canonical record at a time; never modify it.
+    Card indices contain every orphan, exact counts and shortlist identities;
+    rich shortlists live in separate visible-card records. Complete detail
+    records retain every candidate and reference edge for the detail page.
+    Read one canonical record at a time; never modify it.
     Canonical candidate order is native dead-end/title/ID order. The overview
     retains the first five eligible candidates from each dead-end group so UI
     ranking can choose its five without loading every reference edge.
@@ -944,15 +945,21 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
         generation = json_sha256([metadata, initial.st_size, initial.st_mtime_ns])[:12]
         stem = source.stem + ('-' + transport_generation if transport_generation else '')
         directory = stem + '-connections-' + generation
+        card_identity = json_sha256(['orphan_cards_v2', metadata, initial.st_size,
+                                     initial.st_mtime_ns, transport_generation])
+        card_directory = stem + '-cards-' + card_identity[:12]
         filenames = {'observations_file': stem + '-observations.json',
                      'articles_file': stem + '-articles.json',
                      'summary_file': stem + '-summary.json',
                      'creator_index_file': stem + '-creators.json',
-                     'cards_file': stem + '-cards.json', 'connections_dir': directory}
+                     'cards_file': stem + '-cards-v2.json', 'cards_dir': card_directory,
+                     'connections_dir': directory}
         topic_directory = stem + '-profile-topics-' + generation
         filenames['profile_topics_dir'] = topic_directory
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
             raise ValueError('I trasporti devono essere distinti dal dataset originale')
+        for name in (directory, card_directory):
+            (folder / name).mkdir(parents=True, exist_ok=True)
         from ._native import DashboardSummaryAccumulator
         summary = DashboardSummaryAccumulator(metadata['language'], False,
             metadata.get('creators', {}).get('status') not in ('collected', 'partially_collected')
@@ -968,6 +975,12 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                        {'format': 'connections_v1', 'metadata': metadata,
                         'census_page_count': len(seen), 'pages': [orphans[identifier]],
                         'link_candidates': {identifier: record}})
+
+        def card(identifier, record):
+            write_json(folder / card_directory / (identifier + '.json'),
+                       {'format': 'orphan_card_v1', 'card_identity': card_identity,
+                        'census_page_count': len(seen), 'page': orphans[identifier],
+                        'candidate_record': record})
 
         def pages():
             for section, identifier, record in events:
@@ -1010,7 +1023,9 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                             selected.append({**candidate, 'evidence': [reference]})
                             group_sizes[group] += 1
                             selected_ids.add(pid)
-                    shortlists[identifier] = {**candidate_summary, 'candidates': selected}
+                    shortlists[identifier] = {**candidate_summary,
+                                             'candidate_ids': [candidate['page_id'] for candidate in selected]}
+                    card(identifier, {**candidate_summary, 'candidates': selected})
                     detail(identifier, record)
             if (source.stat().st_size, source.stat().st_mtime_ns) != (initial.st_size, initial.st_mtime_ns):
                 raise ValueError('Esportazione modificata durante la conversione')
@@ -1056,9 +1071,12 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                             [page for _, page in article_preview])
         for identifier in orphans.keys() - summaries.keys():
             detail(identifier, {})
+            card(identifier, None)
         write_json(folder / filenames['cards_file'],
-                   {'format': 'orphan_cards_v1', 'metadata': metadata, 'census_page_count': len(seen),
-                    'pages': None, 'link_candidates': None}, arrays={'pages': orphans.values()},
+                   {'format': 'orphan_cards_v2', 'metadata': metadata, 'census_page_count': len(seen),
+                    'card_identity': card_identity, 'columns': ARTICLE_INDEX_COLUMNS,
+                    'rows': None, 'link_candidates': None},
+                   arrays={'rows': ([page.get(field) for field in ARTICLE_INDEX_COLUMNS] for page in orphans.values())},
                    mappings={'link_candidates': shortlists.items()})
         return filenames
     finally:

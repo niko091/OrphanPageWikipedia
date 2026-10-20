@@ -1181,6 +1181,152 @@ async function checkEditorialTransports() {
   assert.equal(legacy.document.body.dataset.loading,'true');
   assert.equal(JSON.stringify(files),before);
   console.log('Editorial transports: eleven-language cards without canonical downloads, focused detail, all evidence, prompt parity, stale/unsafe rejection and unchanged inputs passed.');
+  await checkCardIndex();
+}
+async function checkCardIndex() {
+  const raw=fixture(),template=raw.pages[0],columns=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'];
+  raw.metadata.demo=false;
+  const targets=Array.from({length:300},(_,i)=>({...template,page_id:i+1,title:`Target ${String(i+1).padStart(3,'0')}`,
+    orphan:true,in_degree:0,category:i%2?'Scritori':'Musica',length_bytes:i%7?i*50:null,created_at:i%11?'2020-01-01T00:00:00Z':null,
+    topic_status:i%3?'predicted':'missing',topic_labels:i%3===1?['Culture.Media.Music']:i%3===2?[]:null}));
+  const sources=Array.from({length:12},(_,i)=>({...template,page_id:1000+i,title:`Source ${i}`,orphan:false}));
+  raw.pages=[...targets,...sources];raw.link_candidates={};
+  const index={format:'orphan_cards_v2',metadata:raw.metadata,census_page_count:raw.pages.length,card_identity:'a'.repeat(64),
+    columns,rows:targets.map(page=>columns.map(key=>page[key]??null)),link_candidates:{}};
+  const legacy={format:'orphan_cards_v1',metadata:raw.metadata,census_page_count:raw.pages.length,pages:targets,link_candidates:{}};
+  const entry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,cards_file:'card-index.json',cards_dir:'card-records',connections_dir:'details'};
+  const legacyEntry={...entry,cards_file:'legacy-cards.json'};delete legacyEntry.cards_dir;
+  const files={'fixture.json':raw,'card-index.json':index,'legacy-cards.json':legacy};
+  for(const target of targets) {
+    const candidates=sources.map((source,i)=>({page_id:source.page_id,title:source.title,out_degree:i<5?0:2,dead_end:i<5,
+      evidence:[{language:'lmo',source_page_id:3000+i,source_title:`Reference ${i}`,target_page_id:2000+target.page_id,target_title:`Reference ${target.page_id}`},
+        {language:'pms',source_page_id:4000+i,source_title:`Other ${i}`,target_page_id:5000+target.page_id,target_title:`Other ${target.page_id}`}]}));
+    const full={status:'compared',candidate_count:12,candidates};
+    const shortlist={...full,candidates:candidates.slice(0,10).map(candidate=>({...candidate,evidence:candidate.evidence.slice(0,1)}))};
+    raw.link_candidates[target.page_id]=full;legacy.link_candidates[target.page_id]=shortlist;
+    index.link_candidates[target.page_id]={status:'compared',candidate_count:12,candidate_ids:shortlist.candidates.map(candidate=>candidate.page_id)};
+    files[`card-records/${target.page_id}.json`]={format:'orphan_card_v1',card_identity:index.card_identity,
+      census_page_count:raw.pages.length,page:target,candidate_record:shortlist};
+    files[`details/${target.page_id}.json`]={format:'connections_v1',metadata:raw.metadata,
+      census_page_count:raw.pages.length,pages:[target],link_candidates:{[target.page_id]:full}};
+  }
+  for(const [id,count] of [[299,0],[300,null]]) {
+    const record={status:count===null?'missing_item':'compared',candidate_count:count,candidates:[]};
+    legacy.link_candidates[id]=record;raw.link_candidates[id]=record;
+    index.link_candidates[id]={status:record.status,candidate_count:count,candidate_ids:[]};
+    files[`card-records/${id}.json`].candidate_record=record;
+    files[`details/${id}.json`].link_candidates[id]=record;
+  }
+  const reviews=new Map();
+  for(const source of sources.slice(0,10))reviews.set(`vec:${source.page_id}:1`,{language:'vec',source_id:source.page_id,target_id:1,status:'fixed',version:1,updated_at:'2026-10-20T00:00:00Z'});
+  reviews.set('vec:1000:2',{language:'vec',source_id:1000,target_id:2,status:'bad_link',version:1,updated_at:'2026-10-20T00:00:00Z'});
+  let active=0,maximum=0,hold=false;const held=[];
+  const beforeFetch=async(url,options)=>{
+    if(!/^data\/(?:lmo-)?card-records\//.test(String(url)))return;
+    active++;maximum=Math.max(maximum,active);
+    try {
+      if(hold)await new Promise((resolve,reject)=>{held.push({url,signal:options.signal,resolve});options.signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true});});
+      else await new Promise(resolve=>setImmediate(resolve));
+    } finally {active--;}
+  };
+  const old=await harness('deorphanize',raw,'?dataset=fixture.json',[legacyEntry],{reviewStore:reviews},files);
+  const next=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{reviewStore:reviews,beforeFetch},files);
+  const cards=result=>result.nodes['candidate-cards'].children.filter(node=>node.className==='candidate-card');
+  const snapshot=result=>cards(result).map(card=>[titleLink(card).textContent,findClass(card,'candidate-badge').textContent,
+    findClass(card,'connect-button').href,findClass(card,'fix-link').getAttribute('aria-disabled')??false]);
+  assert.deepEqual(snapshot(next),snapshot(old));assert.equal(maximum,4);
+  const firstRequests=next.requests.filter(request=>request.url.startsWith('data/card-records/'));
+  assert.equal(firstRequests.length,25);
+  assert.deepEqual(firstRequests.map(request=>Number(request.url.match(/(\d+)\.json$/)[1])).sort((a,b)=>a-b),Array.from({length:25},(_,i)=>i+2));
+  assert(!next.requests.some(request=>request.url.startsWith('https://')||request.url==='data/fixture.json'));
+  const bytes=document=>Buffer.byteLength(JSON.stringify(document));
+  const transferred=bytes(index)+firstRequests.reduce((sum,request)=>sum+bytes(files[request.url.slice(5)]),0);
+  assert(transferred<=bytes(legacy)*.25);
+  const promptOld=await preparePrompt(old,findClass(cards(old)[0],'fix-link'));
+  const promptNext=await preparePrompt(next,findClass(cards(next)[0],'fix-link'));
+  const stablePrompt=prompt=>prompt.replace(/"retrieved_at": "[^"]+"/g,'"retrieved_at": "<retrieval>"');
+  assert.equal(stablePrompt(promptNext),stablePrompt(promptOld));
+  for(const result of [old,next])result.nodes['llm-prompt-close'].listeners.click();
+  for(const result of [old,next])vm.runInContext(`{
+    const report=calculateReport('interests',{edits:[{language:'vec',topic_labels:['Culture.Media.Music']}],
+      candidates:data.pages.map(page=>({key:pageKey(page),language:pageLanguage(page),topic_labels:page.topic_status==='predicted'?page.topic_labels:null})),aggregate:false});
+    profileScores=new Map(report.scores.map(row=>[row.key,{topic:row.topic,language:row.language}]));
+    $('profile-sort-option').disabled=false;$('candidate-sort').value='personalized';candidateCards();
+  }`,result.context);
+  await vm.runInContext('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));
+  assert(cards(next).every(card=>Number(titleLink(card).textContent.slice(-3))%3===2));
+  const change=async(id,value)=>{
+    for(const result of [old,next]){result.nodes[id].value=value;result.nodes[id].listeners.input();}
+    await vm.runInContext('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));
+  };
+  for(const order of ['title-asc','category-asc','length-desc','length-asc','date-desc','date-asc','candidates-asc','candidates-desc'])await change('candidate-sort',order);
+  await change('candidate-category','scri');await change('candidate-category','');
+  for(const result of [old,next])result.nodes['candidate-more'].listeners.click();
+  await vm.runInContext('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));assert.equal(cards(next).length,50);
+  await change('candidate-search','Target 001');
+  assert.equal(cards(next)[0].children[0].children.filter(node=>node.className==='candidate-hint').at(-1).textContent,
+    cards(old)[0].children[0].children.filter(node=>node.className==='candidate-hint').at(-1).textContent);
+  assert.equal(vm.runInContext('Object.values(data.link_candidates).filter(record=>record.candidates).length',next.context),0);
+  hold=true;next.nodes['candidate-search'].value='Target 1';next.nodes['candidate-search'].listeners.input();
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(held.length,4);
+  hold=false;await change('candidate-search','Target 2');
+  assert(held.every(request=>request.signal.aborted));assert(maximum<=4);
+  assert(cards(next).every(card=>titleLink(card).textContent.startsWith('Target 2')));
+  assert.equal(vm.runInContext('Object.values(data.link_candidates).filter(record=>record.candidates).length',next.context),25);
+  for(const [search,badge] of [['Target 299','0'],['Target 300','—']]) {
+    const before=next.requests.length;await change('candidate-search',search);
+    assert.equal(findClass(cards(next)[0],'candidate-badge').textContent,badge);
+    assert.equal(next.requests.length,before);
+  }
+  const lmoMetadata={...raw.metadata,language:'lmo',creators:{...raw.metadata.creators,language:'lmo',languages_scanned:['lmo']}};
+  const lmoIndex=JSON.parse(JSON.stringify(index));lmoIndex.metadata=lmoMetadata;lmoIndex.card_identity='b'.repeat(64);
+  const lmoLegacy={...legacy,metadata:lmoMetadata,pages:JSON.parse(JSON.stringify(legacy.pages)),link_candidates:{}};
+  for(const target of targets) {
+    const record=JSON.parse(JSON.stringify(files[`card-records/${target.page_id}.json`]));record.card_identity=lmoIndex.card_identity;
+    for(const candidate of record.candidate_record.candidates)candidate.evidence[0].language='vec';
+    files[`lmo-card-records/${target.page_id}.json`]=record;lmoLegacy.link_candidates[target.page_id]=record.candidate_record;
+  }
+  files['lmo-card-index.json']=lmoIndex;files['lmo-legacy-cards.json']=lmoLegacy;
+  const lmoEntry={...entry,language:'lmo',file:'lmo.json',date:lmoMetadata.finished_at,cards_file:'lmo-card-index.json',cards_dir:'lmo-card-records',connections_dir:'lmo-details'};
+  const lmoLegacyEntry={...lmoEntry,cards_file:'lmo-legacy-cards.json'};delete lmoLegacyEntry.cards_dir;
+  const aggregate={metadata:{language:'all',kind:'aggregate',languages:['vec','lmo'],demo:false,complete:true,
+    started_at:raw.metadata.started_at,finished_at:raw.metadata.finished_at},members:[
+      {language:'vec',file:'fixture.json',page_count:raw.pages.length,metadata:raw.metadata},
+      {language:'lmo',file:'lmo.json',page_count:raw.pages.length,metadata:lmoMetadata}]};
+  files['all.json']=aggregate;
+  const allEntry={language:'all',file:'all.json',date:raw.metadata.finished_at,kind:'aggregate'};
+  const oldAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,legacyEntry,lmoLegacyEntry],{reviewStore:reviews},files);
+  const newAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,entry,lmoEntry],{reviewStore:reviews,beforeFetch},files);
+  assert.deepEqual(snapshot(newAll),snapshot(oldAll));
+  assert.equal(newAll.requests.filter(request=>/^data\/(?:lmo-)?card-records\//.test(request.url)).length,25);assert(maximum<=4);
+  assert(!newAll.requests.some(request=>request.url==='data/fixture.json'||request.url==='data/lmo.json'));
+  hold=true;next.nodes['candidate-search'].value='Target 1';next.nodes['candidate-search'].listeners.input();
+  await new Promise(resolve=>setImmediate(resolve));const switched=held.slice(-4);assert(switched.every(request=>!request.signal.aborted));
+  hold=false;next.context.switchEntry=lmoEntry;await vm.runInContext('load(switchEntry)',next.context);
+  assert(switched.every(request=>request.signal.aborted));assert(maximum<=4);
+  assert.equal(vm.runInContext('data.metadata.language',next.context),'lmo');
+  assert(cards(next).every(card=>findClass(card,'connect-button').href.includes('dataset=lmo.json')));
+  for(const mutate of [card=>card.card_identity='b'.repeat(64),card=>card.page.title='wrong',
+    card=>card.candidate_record.candidates.pop(),card=>card.candidate_record.candidates[0].evidence[0].language='vec']) {
+    const bad=JSON.parse(JSON.stringify(files['card-records/2.json']));mutate(bad);
+    const result=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{reviewStore:reviews}, {...files,'card-records/2.json':bad});
+    assert.equal(findClass(cards(result)[0],'fix-link').getAttribute('aria-disabled'),'true');
+    assert.equal(result.copied.length,0);
+  }
+  for(const mutate of [card=>card.link_candidates[2].candidate_ids.push(1000),card=>card.rows[0][2]=false,
+    card=>card.link_candidates[2].candidate_count=0,card=>card.link_candidates[999]={candidate_count:null,candidate_ids:[]}]) {
+    const bad=JSON.parse(JSON.stringify(index));mutate(bad);
+    const result=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{}, {...files,'card-index.json':bad});
+    assert.match(result.nodes.status.textContent,/Impossibile caricare/);
+    assert(!result.requests.some(request=>request.url.startsWith('data/card-records/')));
+  }
+  const unsafe=await harness('deorphanize',raw,'?dataset=fixture.json',[{...entry,cards_dir:'../outside'}],{},files);
+  assert.match(unsafe.nodes.status.textContent,/Nome dataset non valido/);assert(!unsafe.requests.some(request=>request.url.includes('outside')));
+  const empty=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{}, {...files,'card-index.json':{...index,rows:[],link_candidates:{}}});
+  assert.equal(empty.document.body.dataset.loading,'false');assert.equal(cards(empty).length,0);
+  assert(!empty.requests.some(request=>request.url.startsWith('data/card-records/')));
+  console.log('Editorial card index: '+JSON.stringify({orphans:targets.length,visible:25,legacy_bytes:bytes(legacy),index_and_visible_bytes:transferred,
+    maximum_concurrent:maximum,retained_rich_records:25,global_order_and_prompt_parity:true}));
 }
 async function checkConnectionCopy() {
   const raw=fixture();raw.metadata.demo=false;

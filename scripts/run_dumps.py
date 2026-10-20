@@ -202,7 +202,10 @@ def approved_outputs(output_dir, files):
         entry = indexed[language, filename]
         if not prepared_summary_matches(output_dir, entry, [filename]):
             return None
-        for key in ('file', 'observations_file', 'cards_file'):
+        transport_keys = ['file', 'observations_file', 'cards_file']
+        if 'articles_file' in entry:
+            transport_keys.append('articles_file')
+        for key in transport_keys:
             name = entry.get(key)
             if not isinstance(name, str) or not name or Path(name).name != name:
                 return None
@@ -214,6 +217,10 @@ def approved_outputs(output_dir, files):
         if (not isinstance(detail_dir, str) or not detail_dir or
                 Path(detail_dir).name != detail_dir or
                 not (output_dir / detail_dir).is_dir()):
+            return None
+        card_dir = entry.get('cards_dir')
+        if 'cards_dir' in entry and (not isinstance(card_dir, str) or not card_dir or
+                Path(card_dir).name != card_dir or not (output_dir / card_dir).is_dir()):
             return None
     return paths
 

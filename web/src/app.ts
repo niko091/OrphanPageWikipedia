@@ -5,6 +5,7 @@ type MetricField = 'age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'c
   'creator_prior_articles' | 'creator_tenure_days' | 'creator_articles_created_total' | 'creator_orphans_current' |
   'creator_continuity_months_before_creation' | 'creator_prior_edits_main_history' |
   'creator_prior_edits_other_history' | 'quality_score';
+const ARTICLE_INDEX_FIELDS=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'] as const;
 type PageObservation = Partial<Record<MetricField, number | null>> & {
   page_id: number; title: string; orphan: boolean; language?: string;
   category?: string | null; category_status?: string; revision_id?: number | null;
@@ -40,12 +41,15 @@ interface Candidate {
 interface PromptCandidate extends Candidate { references: ReferenceEdge[]; }
 interface CandidateRecord {
   candidate_count?: number | null; status?: string; candidates?: Candidate[];
+  candidate_ids?: number[];
 }
+interface CardTransport { directory: string; identity: string; metadata: DatasetMetadata; census_page_count: number; }
 interface Dataset {
   metadata: DatasetMetadata; pages: PageObservation[];
   format?: string; census_page_count?: number;
   link_candidates?: Record<string, CandidateRecord>; biographies?: unknown;
   members?: AggregateMember[];
+  card_transports?: Record<string, CardTransport>;
 }
 interface AggregateMember {
   language: string; file: string; page_count: number; metadata: DatasetMetadata;
@@ -53,11 +57,12 @@ interface AggregateMember {
 interface ManifestEntry {
   language: string; file: string; date: string; published_at?: string; kind?: string; demo?: boolean;
   observations_file?: string; articles_file?: string; summary_file?: string; creator_index_file?: string;
-  cards_file?: string; connections_dir?: string; profile_topics_dir?: string;
+  cards_file?: string; cards_dir?: string; connections_dir?: string; profile_topics_dir?: string;
 }
 interface CompactObservations {
   format: string; metadata: DatasetMetadata; columns: string[]; rows: unknown[][];
   census_page_count?: number;
+  card_identity?: string;
   link_candidates?: Record<string, CandidateRecord>;
 }
 interface Provider { name: string; url: string; }
@@ -590,6 +595,9 @@ let profileController = new AbortController();
 const profileTopicCache = new Map<string, Map<number, string[] | null>>();
 let profileContributions: RecentEdit[] | null = null;
 let profileScores: Map<string, {topic: number; language: number}> | null = null;
+let cardRequestVersion=0,cardController=new AbortController(),cardHydration: Promise<void>=Promise.resolve();
+let activeCardFetches=0;
+const waitingCardFetches: (()=>void)[]=[];
 
 async function wikimediaAPI(url: URL, signal?: AbortSignal): Promise<unknown> {
   if(url.protocol!=='https:' || !(url.hostname==='meta.wikimedia.org'||/^[a-z][a-z0-9-]{0,19}\.wikipedia\.org$/.test(url.hostname)))
@@ -1122,16 +1130,16 @@ let reviewContext: ReviewContext | null=null,activePromptReview: ReviewContext |
 let reviewVersion=0,reviewReadVersion=0,reviewSaving=false;
 let reviewSaveController: AbortController | null=null;
 const reviewLabels: Record<ReviewStatus,string>={fixed:'Fixato',not_fixed:'Non fixato',bad_link:'Bad link'};
-function reviewedEdge(page: PageObservation,candidate: Candidate): EditorialReview | undefined {
-  return editorialReviews.get(reviewKey(pageLanguage(page),candidate.page_id,page.page_id));
+function reviewedEdge(page: PageObservation,sourceID: number): EditorialReview | undefined {
+  return editorialReviews.get(reviewKey(pageLanguage(page),sourceID,page.page_id));
 }
-function closedEdge(page: PageObservation,candidate: Candidate): boolean {
-  const status=reviewedEdge(page,candidate)?.status;
+function closedEdge(page: PageObservation,sourceID: number): boolean {
+  const status=reviewedEdge(page,sourceID)?.status;
   return status==='fixed'||status==='bad_link';
 }
 function reviewedOnly(page: PageObservation,record?: CandidateRecord): boolean {
-  const candidates=record?.candidates;
-  return Boolean(candidates?.length)&&candidates!==undefined&&candidates.every(candidate=>closedEdge(page,candidate));
+  const ids=record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[];
+  return ids.length>0&&ids.every(id=>closedEdge(page,id));
 }
 function parseReview(value: unknown): EditorialReview {
   if(!isRecord(value)||typeof value.language!=='string'||!/^[a-z][a-z0-9-]{0,19}$/.test(value.language)||value.language==='all'||
@@ -1238,7 +1246,7 @@ function fixRequest(page: PageObservation, record?: CandidateRecord, focusedCand
   // Keep only the first five ranked candidates without sorting the full list.
   for(const candidate of focusedCandidate?[focusedCandidate]:record.candidates||[]) {
     if(!Number.isSafeInteger(candidate?.page_id)||candidate.page_id<=0||candidate.page_id===page.page_id||typeof candidate.title!=='string'||!candidate.title.trim()||selected.some(row=>row.page_id===candidate.page_id))continue;
-    if(closedEdge(page,candidate))continue;
+    if(closedEdge(page,candidate.page_id))continue;
     const evidence=Array.isArray(candidate.evidence)?candidate.evidence:[];
     const references=single?evidence.filter(validReference):[evidence.find(validReference)].filter(validReference);
     if(!references.length)continue;
@@ -1447,8 +1455,59 @@ function creatorList() {
     {n:number(rows.length),shown:number(Math.min(creatorLimit,rows.length))}):t('Dati sui creatori non disponibili per questa raccolta.');
   $('creator-more')!.hidden=creatorLimit>=rows.length;
 }
+interface VisibleCardRequest { page: PageObservation; record: CandidateRecord; footer: HTMLElement; connect: HTMLAnchorElement; }
+async function readVisibleCard(filename: string,signal: AbortSignal): Promise<unknown> {
+  if(!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*\/[1-9][0-9]*\.json$/.test(filename))throw new Error('Nome dataset non valido');
+  if(activeCardFetches>=4)await new Promise<void>(resolve=>waitingCardFetches.push(resolve));else activeCardFetches++;
+  try {
+    signal.throwIfAborted();
+    const response=await fetch('data/'+filename,{cache:'no-store',credentials:'omit',signal});
+    if(!response.ok)throw new Error('Dataset non disponibile');
+    return await response.json();
+  } finally {const next=waitingCardFetches.shift();if(next)next();else activeCardFetches--;}
+}
+async function hydrateVisibleCards(requests: VisibleCardRequest[],request: number,signal: AbortSignal): Promise<void> {
+  const snapshot=data,version=loadVersion;
+  const current=()=>!signal.aborted&&request===cardRequestVersion&&version===loadVersion&&data===snapshot;
+  let position=0;
+  await Promise.all(Array.from({length:Math.min(4,requests.length)},async()=>{
+    while(current()&&position<requests.length) {
+      const {page,record,footer,connect}=requests[position++];
+      try {
+        const transport=snapshot.card_transports?.[pageLanguage(page)];
+        if(!transport)throw new Error('Osservazioni compatte non valide');
+        const payload=await readVisibleCard(`${transport.directory}/${page.page_id}.json`,signal);
+        if(!current())return;
+        if(!isRecord(payload)||!isRecord(payload.page)||!isRecord(payload.candidate_record))throw new Error('Osservazioni compatte non valide');
+        const fullPage=payload.page,fullRecord=payload.candidate_record;
+        if(payload.format!=='orphan_card_v1'||payload.card_identity!==transport.identity||
+          payload.census_page_count!==transport.census_page_count||fullPage.page_id!==page.page_id||
+          fullPage.title!==page.title||fullPage.orphan!==true||
+          canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>fullPage[key]))!==canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>page[key]))||
+          fullRecord.status!==record.status||fullRecord.candidate_count!==record.candidate_count||
+          !Array.isArray(fullRecord.candidates))throw new Error('Osservazioni compatte non valide');
+        const candidates: unknown[]=fullRecord.candidates;
+        if(canonicalJSON(candidates.map(candidate=>isRecord(candidate)?candidate.page_id:null))!==canonicalJSON(record.candidate_ids)||
+          candidates.some(candidate=>!isRecord(candidate)||typeof candidate.title!=='string'||!candidate.title.trim()||
+            (candidate.out_degree!=null&&(!Number.isSafeInteger(candidate.out_degree)||Number(candidate.out_degree)<0))||
+            (candidate.dead_end!=null&&typeof candidate.dead_end!=='boolean')||!Array.isArray(candidate.evidence)||candidate.evidence.length!==1||
+            candidate.evidence.some((edge: unknown)=>!isRecord(edge)||typeof edge.language!=='string'||
+              !/^[a-z][a-z0-9-]{0,19}$/.test(edge.language)||['all',pageLanguage(page)].includes(edge.language)||
+              typeof edge.source_title!=='string'||!edge.source_title.trim()||typeof edge.target_title!=='string'||!edge.target_title.trim()||
+              [edge.source_page_id,edge.target_page_id].some(id=>id!=null&&(!Number.isSafeInteger(id)||Number(id)<=0)))))
+          throw new Error('Osservazioni compatte non valide');
+        validateDataset({metadata:transport.metadata,pages:[fullPage as PageObservation]});
+        record.candidates=candidates as Candidate[];
+        footer.replaceChildren(fixLink(fixRequest(page,record)),connect);
+      } catch {
+        if(current()&&footer.children[0])footer.children[0].setAttribute('title',t('Dati non disponibili'));
+      }
+    }
+  }));
+}
 function candidateCards() {
   if(!deorphanizePage)return;
+  const request=++cardRequestVersion;cardController.abort();cardController=new AbortController();
   const records=data.link_candidates||{};
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
   const orphans=data.pages.filter(p=>p.orphan);
@@ -1465,22 +1524,29 @@ function candidateCards() {
   sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
   $('candidate-info')!.textContent=t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
   const box=$('candidate-cards')!;box.replaceChildren();
-  for(const page of sorted.slice(0,candidateLimit)) {
+  const visible=sorted.slice(0,candidateLimit),keys=new Set(visible.map(pageKey)),pending: VisibleCardRequest[]=[];
+  for(const [key,record] of Object.entries(records))if(record?.candidate_ids&&!keys.has(key))delete record.candidates;
+  for(const page of visible) {
     const record=records[pageKey(page)],count=record?.candidate_count;
     const card=element('article',null,'candidate-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');
     header.append(cardTitle('h3',page.title,pageLanguage(page)),element('span',count==null?'—':number(count),'candidate-badge'));
     body.append(header,element('p',label(page),'candidate-category'),element('p',count==null?t('Dati non disponibili'):t('{n} pagine candidate',{n:number(count)}),'candidate-hint'));
-    const reviewed=(record?.candidates||[]).filter(candidate=>closedEdge(page,candidate)).length;
+    const reviewed=(record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[]).filter(id=>closedEdge(page,id)).length;
     if(reviewed)body.append(element('p',t('{n} coppie segnate come Fixato o Bad link, escluse dai prompt.',{n:number(reviewed)}),'candidate-hint'));
     const footer=element('div',null,'candidate-footer'),connect=element('a',t('Connetti'),'connect-button');
     connect.href=`connections.html?dataset=${encodeURIComponent(datasetFile)}&page=${encodeURIComponent(page.page_id)}`;
     if(data.metadata.kind==='aggregate') connect.href+=`&language=${encodeURIComponent(pageLanguage(page))}`;
     connect.setAttribute('aria-label',t('Connetti {title}',{title:page.title}));
     footer.append(fixLink(fixRequest(page,record)),connect);card.append(body,footer);box.append(card);
+    if(data.card_transports?.[pageLanguage(page)]&&record?.candidate_ids?.length&&!record.candidates&&!reviewedOnly(page,record)) {
+      footer.children[0].setAttribute('title',t('Caricamento…'));
+      pending.push({page,record,footer,connect});
+    }
   }
   if(!sorted.length)box.append(element('p',t('Nessuna voce orfana corrispondente.')));
   $('candidate-more')!.hidden=candidateLimit>=sorted.length;
+  cardHydration=hydrateVisibleCards(pending,request,cardController.signal);
 }
 function renderConnections() {
   const id=new URLSearchParams(window.location.search).get('page');
@@ -1497,7 +1563,7 @@ function renderConnections() {
   copyButton.disabled=!connectionCopyRequest;
   copyButton.textContent=t('Prepara prompt e fonti');
   copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
-  const candidates=[...(record?.candidates||[])].sort((a,b)=>Number(closedEdge(page,a))-Number(closedEdge(page,b))||candidateOrder(a,b));
+  const candidates=[...(record?.candidates||[])].sort((a,b)=>Number(closedEdge(page,a.page_id))-Number(closedEdge(page,b.page_id))||candidateOrder(a,b));
   const box=$('connection-candidates')!;box.replaceChildren();
   $('connection-info')!.textContent=count==null?(t(candidateReasons[record?.status ?? '']||'Confronto tra lingue non ancora disponibile.'))
     :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.',{n:number(count),shown:number(Math.min(connectionLimit,candidates.length))});
@@ -1505,7 +1571,7 @@ function renderConnections() {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
     if(candidate.dead_end===true)header.append(element('span','Dead-end page','dead-end-badge'));
-    const review=reviewedEdge(page,candidate);
+    const review=reviewedEdge(page,candidate.page_id);
     if(review)header.append(element('span',t('Valutazione condivisa: {status}',{status:t(reviewLabels[review.status])}),'review-badge'));
     body.append(header);
     const proposed=element('div',null,'connection-proposed');
@@ -1527,14 +1593,15 @@ function validateDataset(next: Dataset) {
   if(!next?.metadata||!Array.isArray(next.pages)||!/^[a-z][a-z0-9-]{0,19}$/.test(next.metadata.language)||next.metadata.language==='all')throw new Error('Codice lingua non valido');
   if(next.metadata.biographies || next.biographies || next.pages.some(p=>'gender_group' in p || 'biography' in p)) throw new Error('Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali');
 }
-function unpackObservations(next: CompactObservations, expectedFormat: 'observations_v1'|'article_index_v1'='observations_v1'): Dataset {
+function unpackObservations(next: CompactObservations, expectedFormat: 'observations_v1'|'article_index_v1'|'orphan_cards_v2'='observations_v1'): Dataset {
   if(!next||typeof next!=='object')throw new Error('Osservazioni compatte non valide');
   const columns=next.columns;
-  const required=expectedFormat==='article_index_v1'?['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree']:['page_id','title','orphan'];
+  const required: readonly string[]=expectedFormat!=='observations_v1'?ARTICLE_INDEX_FIELDS:['page_id','title','orphan'];
   if(next.format!==expectedFormat||!Array.isArray(columns)||!columns.length||new Set(columns).size!==columns.length||
     columns.some(key=>typeof key!=='string'||!/^[a-z][a-z0-9_]*$/.test(key)||['constructor','prototype','biography','gender_group'].includes(key))||
     !required.every(key=>columns.includes(key))||!Array.isArray(next.rows)||
-    (expectedFormat==='article_index_v1'&&(columns.length!==required.length||next.census_page_count!==next.rows.length)))throw new Error('Osservazioni compatte non valide');
+    (expectedFormat!=='observations_v1'&&(columns.length!==required.length||!Number.isSafeInteger(next.census_page_count)||
+      (next.census_page_count??-1)<next.rows.length||expectedFormat==='article_index_v1'&&next.census_page_count!==next.rows.length)))throw new Error('Osservazioni compatte non valide');
   const seen=new Set();
   const pages=next.rows.map(row=>{
     if(!Array.isArray(row)||row.length!==columns.length)throw new Error('Osservazioni compatte non valide');
@@ -1542,7 +1609,7 @@ function unpackObservations(next: CompactObservations, expectedFormat: 'observat
     if(typeof page.page_id!=='number'||!Number.isSafeInteger(page.page_id)||page.page_id<=0||seen.has(page.page_id)||typeof page.title!=='string'||typeof page.orphan!=='boolean')throw new Error('Osservazioni compatte non valide');
     seen.add(page.page_id);return page as PageObservation;
   });
-  return {metadata:next.metadata,pages,census_page_count:next.census_page_count,link_candidates:next.link_candidates||{}};
+  return {format:next.format,metadata:next.metadata,pages,census_page_count:next.census_page_count,link_candidates:next.link_candidates||{}};
 }
 async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promise<Dataset> {
   const articleIndex=forArticleExplorer&&!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&entry.articles_file;
@@ -1567,6 +1634,24 @@ async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promi
   const next=await response.json();
   if(articleIndex&&(next.metadata?.language!==entry.language||next.metadata?.finished_at!==entry.date||
     next.metadata?.complete!==true||Boolean(next.metadata?.demo)!==Boolean(entry.demo)))throw new Error('Indice degli articoli non valido');
+  if(cards&&next.format==='orphan_cards_v2') {
+    if(!entry.cards_dir||!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(entry.cards_dir)||
+      typeof next.card_identity!=='string'||!/^[a-f0-9]{64}$/.test(next.card_identity))throw new Error('Nome dataset non valido');
+    const wiki=unpackObservations(next,'orphan_cards_v2');validateDataset(wiki);
+    if(wiki.metadata.language!==entry.language||wiki.metadata.finished_at!==entry.date||wiki.metadata.complete!==true||
+      Boolean(wiki.metadata.demo)!==Boolean(entry.demo)||wiki.pages.some(page=>page.orphan!==true))throw new Error('Osservazioni compatte non valide');
+    const ids=new Set(wiki.pages.map(page=>page.page_id));
+    for(const [id,record] of Object.entries(wiki.link_candidates||{})) {
+      if(!/^[1-9][0-9]*$/.test(id)||!ids.has(Number(id))||!isRecord(record)||!Array.isArray(record.candidate_ids)||
+        record.candidate_ids.length>10||new Set(record.candidate_ids).size!==record.candidate_ids.length||
+        record.candidate_ids.some((source: unknown)=>typeof source!=='number'||!Number.isSafeInteger(source)||source<=0||source===Number(id))||
+        (record.candidate_count!=null&&(typeof record.candidate_count!=='number'||!Number.isSafeInteger(record.candidate_count)||record.candidate_count<record.candidate_ids.length))||
+        (record.candidate_ids.length>0&&record.candidate_count==null))throw new Error('Osservazioni compatte non valide');
+    }
+    wiki.card_transports={[entry.language]:{directory:entry.cards_dir,identity:next.card_identity,
+      metadata:wiki.metadata,census_page_count:next.census_page_count}};
+    return wiki;
+  }
   if(cards||detail) {
     validateDataset(next);
     const seen=new Set<number>();
@@ -1645,6 +1730,7 @@ async function loadAggregate(index: Dataset,version: number,forArticleExplorer=f
       page.language=member.language;pooled.pages.push(page);
     }
     for(const [id,record] of Object.entries(wiki.link_candidates||{}))pooled.link_candidates[`${member.language}:${id}`]=record;
+    if(wiki.card_transports)pooled.card_transports={...pooled.card_transports,...wiki.card_transports};
   }
   if(canonicalJSON([...languages].sort())!==canonicalJSON([...index.metadata.languages].sort()))throw new Error('Indice aggregato non valido');
   const count=creatorMetadata.length;
@@ -1678,6 +1764,7 @@ function selectedEntry(): ManifestEntry | undefined {
 }
 async function load(entry: ManifestEntry) {
   closePrompt();
+  ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
   const version=++loadVersion;
   articleListLoading=false;
   ++profileRequestVersion;profileScores=null;
@@ -1727,6 +1814,8 @@ async function load(entry: ManifestEntry) {
   lastError=null;
   document.body.dataset.loading='false';
   renderDataset();
+  if(deorphanizePage)await cardHydration;
+  if(version!==loadVersion)return;
   if(deorphanizePage&&profileContributions){const profileVersion=++profileRequestVersion;void scoreProfile(profileContributions,profileVersion).catch(error=>{
     if(profileVersion===profileRequestVersion)$('profile-status')!.textContent=t('Personalizzazione non disponibile: {error}',{error:String(error)});
   });}
