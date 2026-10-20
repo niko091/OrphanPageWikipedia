@@ -380,6 +380,17 @@ class ExportTests(unittest.TestCase):
             entry = json.loads((Path(folder) / 'manifest.json').read_text())[0]
             self.assertNotEqual(entry['observations_file'], compact.name)
             self.assertEqual((Path(folder) / entry['observations_file']).read_bytes(), expected)
+            article_index = json.loads((Path(folder) / entry['articles_file']).read_text())
+            self.assertEqual(article_index['format'], 'article_index_v1')
+            self.assertEqual(article_index['metadata'], result['metadata'])
+            self.assertEqual(article_index['census_page_count'], len(result['pages']))
+            self.assertEqual(set(article_index['columns']), {'page_id', 'title', 'orphan', 'category',
+                             'topic_status', 'topic_labels', 'length_bytes', 'created_at', 'in_degree'})
+            self.assertEqual(article_index['rows'], [[page.get(field) for field in article_index['columns']]
+                                                    for page in result['pages']])
+            self.assertEqual(article_index['link_candidates'],
+                             {str(orphan['page_id']): {'status': 'compared', 'candidate_count': 1}})
+            self.assertLess((Path(folder) / entry['articles_file']).stat().st_size, len(expected) * .75)
             topic_directory = Path(folder) / entry['profile_topics_dir']
             topic_index = json.loads((topic_directory / 'index.json').read_text())
             self.assertEqual(topic_index['format'], 'profile_topics_index_v1')
@@ -483,7 +494,7 @@ class ExportTests(unittest.TestCase):
             self.assertTrue({path.relative_to(root) for path in root.rglob('*') if path.is_file()} - old.keys())
             rebuild_dashboard(root)
             entry = json.loads((root / 'manifest.json').read_text())[0]
-            for key in ('observations_file', 'summary_file', 'creator_index_file',
+            for key in ('observations_file', 'articles_file', 'summary_file', 'creator_index_file',
                         'cards_file', 'connections_dir', 'profile_topics_dir'):
                 self.assertNotEqual(entry[key], old_entry[key])
                 self.assertTrue((root / entry[key]).exists())

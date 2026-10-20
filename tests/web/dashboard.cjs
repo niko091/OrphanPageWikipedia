@@ -1660,6 +1660,91 @@ async function checkPreparedSummaries() {
   assert.equal(creators.nodes['creator-section'].hidden,false);
   assert.equal(creators.nodes['creator-rows'].children.length,15);
   console.log('Prepared Rust summaries: the first 25 articles render from the summary without a full transport or load button.');
+  await checkArticleIndex();
+}
+async function checkArticleIndex() {
+  const raw=fixture(),summary=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-summary.json')));
+  const observations=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-observations.json')));
+  const articleIndex=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-articles.json')));
+  for(const document of [raw,summary,observations,articleIndex])document.metadata.demo=false;
+  for(const [position,page] of raw.pages.entries()) {
+    page.topic_status=position%3?'predicted':'missing';
+    page.topic_labels=position%3===1?['Culture.Media.Music','STEM.STEM*']:position%3===2?[]:null;
+    if(position%11===0)page.length_bytes=null;
+    if(position%13===0)page.created_at=null;
+    if(position%17===0)page.category=null;
+  }
+  const byID=new Map(raw.pages.map(page=>[page.page_id,page]));
+  for(const document of [observations,articleIndex])
+    document.rows=document.rows.map(row=>document.columns.map(key=>byID.get(row[document.columns.indexOf('page_id')])[key]??null));
+  const entry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,
+    summary_file:'fixture-summary.json',observations_file:'fixture-observations.json',articles_file:'fixture-articles.json'};
+  const files={'fixture.json':raw,'fixture-summary.json':summary,'fixture-observations.json':observations,'fixture-articles.json':articleIndex};
+  const legacyEntry={...entry};delete legacyEntry.articles_file;
+  const legacy=await harness('articles',raw,'?dataset=fixture.json',[legacyEntry],{},files);
+  const indexed=await harness('articles',raw,'?dataset=fixture.json',[entry],{},files);
+  for(const result of [legacy,indexed])result.nodes['article-more'].listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(indexed.nodes['article-rows'].children.length,50);
+  assert(indexed.requests.some(request=>request.url==='data/fixture-articles.json'));
+  assert(!indexed.requests.some(request=>['data/fixture.json','data/fixture-observations.json'].includes(request.url)));
+  assert(legacy.requests.some(request=>request.url==='data/fixture-observations.json'));
+  const rows=result=>result.nodes['article-rows'].children.map(row=>[
+    row.children[0].children[0].textContent,...row.children.slice(1).map(cell=>cell.textContent)]);
+  const parity=()=>assert.deepEqual(rows(indexed),rows(legacy));
+  const change=(id,value)=>{
+    for(const result of [legacy,indexed]) {
+      const node=result.nodes[id];node.value=value;(node.listeners.input||node.listeners.change)();
+    }
+    parity();
+  };
+  parity();
+  for(const group of ['all','non-orphans','orphans']) {
+    change('article-group',group);
+    for(const order of ['title-asc','category-asc','length-desc','length-asc','date-desc','date-asc','candidates-desc','candidates-asc'])
+      change('article-sort',order);
+  }
+  change('article-search','1');change('article-search','');
+  change('article-category','scri');change('article-category','');
+  change('article-classification','macro');change('article-macro','Culture');
+  change('article-classification','topics');change('article-category','Music');
+  change('article-classification','categories');change('article-category','');change('article-group','all');
+  for(const result of [legacy,indexed])result.nodes['article-more'].listeners.click();
+  parity();assert.equal(indexed.nodes['article-rows'].children.length,50);
+  for(const id of ['theme-toggle','ui-language-toggle']) {
+    for(const result of [legacy,indexed])result.nodes[id].listeners.click();
+    parity();
+    assert.deepEqual(indexed.nodes.metrics.children.map(node=>node.children[0].textContent),
+      legacy.nodes.metrics.children.map(node=>node.children[0].textContent));
+  }
+  const bytes=document=>Buffer.byteLength(JSON.stringify(document));
+  assert(bytes(articleIndex)<bytes(observations)*.5);
+  for(const mutate of [
+    document=>document.census_page_count++,
+    document=>{document.rows.pop();document.census_page_count--;},
+    document=>document.metadata.finished_at='2000-01-01',
+    document=>document.metadata.measures_rule='obsolete',
+    document=>document.format='observations_v1',
+    document=>{document.columns.pop();document.rows.forEach(row=>row.pop());},
+    document=>document.rows[1][0]=document.rows[0][0]
+  ]) {
+    const bad=JSON.parse(JSON.stringify(articleIndex));mutate(bad);
+    const result=await harness('articles',raw,'?dataset=fixture.json',[entry],{}, {...files,'fixture-articles.json':bad});
+    result.nodes['article-more'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
+    assert.match(result.nodes['article-info'].textContent,/non valid/);
+  }
+  const lmo=JSON.parse(fs.readFileSync(path.join(fixtureDir,'lmo-demo-articles.json')));lmo.metadata.demo=false;
+  const lmoEntry={language:'lmo',file:'lmo-demo.json',date:lmo.metadata.finished_at,demo:false,articles_file:'lmo-demo-articles.json'};
+  const aggregate={metadata:{...raw.metadata,language:'all',kind:'aggregate',languages:['vec','lmo']},pages:[],
+    members:[{language:'vec',file:entry.file,page_count:raw.pages.length,metadata:raw.metadata},
+      {language:'lmo',file:lmoEntry.file,page_count:lmo.census_page_count,metadata:lmo.metadata}]};
+  const pooled=await harness('articles',raw,'?dataset=fixture.json',[entry,lmoEntry],{}, {...files,'lmo-demo-articles.json':lmo});
+  pooled.context.articleAggregate=aggregate;
+  const result=await vm.runInContext('loadAggregate(articleAggregate,loadVersion,true)',pooled.context);
+  assert.equal(result.pages.length,raw.pages.length+lmo.census_page_count);
+  assert(pooled.requests.some(request=>request.url==='data/lmo-demo-articles.json'));
+  assert(!pooled.requests.some(request=>request.url.endsWith('-observations.json')||request.url==='data/lmo-demo.json'));
+  console.log('Article explorer index: '+JSON.stringify({census_pages:raw.pages.length,legacy_bytes:bytes(observations),index_bytes:bytes(articleIndex),identical_global_filters_and_orders:true}));
 }
 async function checkReconstructedCreatorFallback() {
   const raw=fixture();raw.metadata.creators.status='not_collected';

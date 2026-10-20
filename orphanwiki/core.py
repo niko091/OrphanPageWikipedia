@@ -872,6 +872,11 @@ OBSERVATION_COLUMNS = (
     'content_revision_id', 'quality_revision_relation',
 )
 
+ARTICLE_INDEX_COLUMNS = (
+    'page_id', 'title', 'orphan', 'category', 'topic_status', 'topic_labels',
+    'length_bytes', 'created_at', 'in_degree',
+)
+
 
 def add_article_preview(preview, page, language=None):
     """Keep the first 25 orphan titles from a complete page stream."""
@@ -940,6 +945,7 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
         stem = source.stem + ('-' + transport_generation if transport_generation else '')
         directory = stem + '-connections-' + generation
         filenames = {'observations_file': stem + '-observations.json',
+                     'articles_file': stem + '-articles.json',
                      'summary_file': stem + '-summary.json',
                      'creator_index_file': stem + '-creators.json',
                      'cards_file': stem + '-cards.json', 'connections_dir': directory}
@@ -953,7 +959,8 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
             and metadata.get('history', {}).get('status') in ('collected', 'partially_collected'))
         summary_batch = []
         topic_database = sqlite3.connect(Path(topic_staging.name) / 'topics.sqlite')
-        topic_database.execute('CREATE TABLE topics (page_id INTEGER PRIMARY KEY, status TEXT, labels TEXT)')
+        topic_database.execute('CREATE TABLE topics (page_id INTEGER PRIMARY KEY, status TEXT, labels TEXT, '
+                               'position INTEGER NOT NULL, article TEXT NOT NULL)')
         orphans, summaries, shortlists, seen, article_preview = {}, {}, {}, set(), []
 
         def detail(identifier, record):
@@ -969,8 +976,9 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                     if type(pid) is not int or pid <= 0 or pid in seen or type(record.get('orphan')) is not bool:
                         raise ValueError('Osservazione o identificativo duplicato non valido')
                     seen.add(pid)
-                    topic_database.execute('INSERT INTO topics VALUES (?, ?, ?)',
-                        (pid, record.get('topic_status'), json.dumps(record.get('topic_labels'), ensure_ascii=False)))
+                    topic_database.execute('INSERT INTO topics VALUES (?, ?, ?, ?, ?)',
+                        (pid, record.get('topic_status'), json.dumps(record.get('topic_labels'), ensure_ascii=False),
+                         len(seen) - 1, json.dumps([record.get(field) for field in ARTICLE_INDEX_COLUMNS], ensure_ascii=False)))
                     add_article_preview(article_preview, record)
                     summary_batch.append(_summary_page(record))
                     if len(summary_batch) == 512:
@@ -1034,6 +1042,12 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
         summary_count, summary_json = summary.finish()
         if summary_count != len(seen):
             raise ValueError('Riepilogo del censimento incompleto')
+        write_json(folder / filenames['articles_file'],
+                   {'format': 'article_index_v1', 'metadata': metadata, 'census_page_count': len(seen),
+                    'columns': ARTICLE_INDEX_COLUMNS, 'rows': None, 'link_candidates': None},
+                   arrays={'rows': (json.loads(row[0]) for row in
+                                   topic_database.execute('SELECT article FROM topics ORDER BY position'))},
+                   mappings={'link_candidates': summaries.items()})
         write_summary_files(folder / filenames['summary_file'],
                             folder / filenames['creator_index_file'], metadata,
                             summary_count, summary_json,

@@ -52,11 +52,12 @@ interface AggregateMember {
 }
 interface ManifestEntry {
   language: string; file: string; date: string; published_at?: string; kind?: string; demo?: boolean;
-  observations_file?: string; summary_file?: string; creator_index_file?: string;
+  observations_file?: string; articles_file?: string; summary_file?: string; creator_index_file?: string;
   cards_file?: string; connections_dir?: string; profile_topics_dir?: string;
 }
 interface CompactObservations {
   format: string; metadata: DatasetMetadata; columns: string[]; rows: unknown[][];
+  census_page_count?: number;
   link_candidates?: Record<string, CandidateRecord>;
 }
 interface Provider { name: string; url: string; }
@@ -308,6 +309,7 @@ const translations: Record<string, string> = {
   "Ultima disponibile": "Latest",
   "Caricamento {language}: {current}/{total} lingue…": "Loading {language}: {current}/{total} languages…",
   "Osservazioni compatte non valide": "Invalid compact observations",
+  "Indice degli articoli non valido": "Invalid article index",
   "Dataset troppo grande per il browser: esegui python -m orphanwiki dashboard --data-dir web/data": "Dataset too large for the browser: run python -m orphanwiki dashboard --data-dir web/data",
   "Classificazione": "Classification",
   "Categorie Wikipedia": "Wikipedia categories",
@@ -1525,12 +1527,14 @@ function validateDataset(next: Dataset) {
   if(!next?.metadata||!Array.isArray(next.pages)||!/^[a-z][a-z0-9-]{0,19}$/.test(next.metadata.language)||next.metadata.language==='all')throw new Error('Codice lingua non valido');
   if(next.metadata.biographies || next.biographies || next.pages.some(p=>'gender_group' in p || 'biography' in p)) throw new Error('Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali');
 }
-function unpackObservations(next: CompactObservations): Dataset {
+function unpackObservations(next: CompactObservations, expectedFormat: 'observations_v1'|'article_index_v1'='observations_v1'): Dataset {
   if(!next||typeof next!=='object')throw new Error('Osservazioni compatte non valide');
   const columns=next.columns;
-  if(next.format!=='observations_v1'||!Array.isArray(columns)||!columns.length||new Set(columns).size!==columns.length||
+  const required=expectedFormat==='article_index_v1'?['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree']:['page_id','title','orphan'];
+  if(next.format!==expectedFormat||!Array.isArray(columns)||!columns.length||new Set(columns).size!==columns.length||
     columns.some(key=>typeof key!=='string'||!/^[a-z][a-z0-9_]*$/.test(key)||['constructor','prototype','biography','gender_group'].includes(key))||
-    !['page_id','title','orphan'].every(key=>columns.includes(key))||!Array.isArray(next.rows))throw new Error('Osservazioni compatte non valide');
+    !required.every(key=>columns.includes(key))||!Array.isArray(next.rows)||
+    (expectedFormat==='article_index_v1'&&(columns.length!==required.length||next.census_page_count!==next.rows.length)))throw new Error('Osservazioni compatte non valide');
   const seen=new Set();
   const pages=next.rows.map(row=>{
     if(!Array.isArray(row)||row.length!==columns.length)throw new Error('Osservazioni compatte non valide');
@@ -1538,10 +1542,11 @@ function unpackObservations(next: CompactObservations): Dataset {
     if(typeof page.page_id!=='number'||!Number.isSafeInteger(page.page_id)||page.page_id<=0||seen.has(page.page_id)||typeof page.title!=='string'||typeof page.orphan!=='boolean')throw new Error('Osservazioni compatte non valide');
     seen.add(page.page_id);return page as PageObservation;
   });
-  return {metadata:next.metadata,pages,link_candidates:next.link_candidates||{}};
+  return {metadata:next.metadata,pages,census_page_count:next.census_page_count,link_candidates:next.link_candidates||{}};
 }
-async function readDataset(entry: ManifestEntry): Promise<Dataset> {
-  const compact=!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&entry.observations_file;
+async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promise<Dataset> {
+  const articleIndex=forArticleExplorer&&!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&entry.articles_file;
+  const compact=!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&(articleIndex||entry.observations_file);
   const cards=deorphanizePage&&entry.kind!=='aggregate'&&entry.cards_file;
   const detail=connectionsPage&&entry.kind!=='aggregate'&&entry.connections_dir;
   for(const filename of [compact,cards])if(filename&&!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome dataset non valido');
@@ -1560,6 +1565,8 @@ async function readDataset(entry: ManifestEntry): Promise<Dataset> {
   if(!compact&&!cards&&!detail&&Number(response.headers?.get('Content-Length'))>=512*1024*1024)
     throw new Error('Dataset troppo grande per il browser: esegui python -m orphanwiki dashboard --data-dir web/data');
   const next=await response.json();
+  if(articleIndex&&(next.metadata?.language!==entry.language||next.metadata?.finished_at!==entry.date||
+    next.metadata?.complete!==true||Boolean(next.metadata?.demo)!==Boolean(entry.demo)))throw new Error('Indice degli articoli non valido');
   if(cards||detail) {
     validateDataset(next);
     const seen=new Set<number>();
@@ -1572,7 +1579,7 @@ async function readDataset(entry: ManifestEntry): Promise<Dataset> {
     }
     for(const id of Object.keys(next.link_candidates||{}))if(!/^[1-9][0-9]*$/.test(id)||!seen.has(Number(id)))throw new Error('Osservazioni compatte non valide');
   }
-  return compact?unpackObservations(next):next;
+  return compact?unpackObservations(next,articleIndex?'article_index_v1':'observations_v1'):next;
 }
 async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> {
   const filename=entry.summary_file;
@@ -1612,7 +1619,7 @@ async function readCreatorIndex(entry: ManifestEntry, summary: DashboardSummaryD
     throw new Error('Indice dei creatori non valido');
   return index.creators;
 }
-async function loadAggregate(index: Dataset,version: number): Promise<Dataset | null> {
+async function loadAggregate(index: Dataset,version: number,forArticleExplorer=false): Promise<Dataset | null> {
   if(!Array.isArray(index.members)||!index.members.length||index.metadata.language!=='all'||index.metadata.complete!==true||!Array.isArray(index.metadata.languages))throw new Error('Indice aggregato non valido');
   const pooled: Dataset & {link_candidates: Record<string, CandidateRecord>} = {metadata:{...index.metadata},pages:[],link_candidates:{}};
   const languages=new Set<string>(),creatorMetadata: CreatorMetadata[] = [],historyMetadata: HistoryMetadata[] = [];
@@ -1631,7 +1638,7 @@ async function loadAggregate(index: Dataset,version: number): Promise<Dataset | 
     if(focused&&member.language!==targetLanguage)continue;
     if(version!==loadVersion)return null;
     $('status')!.textContent=t('Caricamento {language}: {current}/{total} lingue…',{language:member.language.toUpperCase(),current:position+1,total:index.members.length});
-    const wiki=await readDataset(entry);if(version!==loadVersion)return null;validateDataset(wiki);
+    const wiki=await readDataset(entry,forArticleExplorer);if(version!==loadVersion)return null;validateDataset(wiki);
     if(wiki.metadata.language!==member.language||wiki.metadata.complete!==true||Boolean(wiki.metadata.demo)!==Boolean(index.metadata.demo)||canonicalJSON(wiki.metadata)!==canonicalJSON(member.metadata)||(wiki.census_page_count??wiki.pages.length)!==member.page_count)throw new Error('Indice aggregato non valido');
     for(const page of wiki.pages) {
       // Assign identities by local wiki, even when page IDs or actor keys overlap.
@@ -1731,11 +1738,15 @@ async function loadFullArticles() {
   articleListLoading=true;$('article-more')!.disabled=true;
   $('article-info')!.textContent=t('Caricamento dell’elenco completo delle voci…');
   try {
-    let full=await readDataset(entry);
+    let full=await readDataset(entry,true);
     if(version!==loadVersion)return;
-    if(full.metadata.kind==='aggregate')full=await loadAggregate(full,version) as Dataset;
-    else validateDataset(full);
+    if(full.metadata.kind==='aggregate')full=await loadAggregate(full,version,true) as Dataset;
+    else {
+      validateDataset(full);
+      if(precomputed&&canonicalJSON(full.metadata)!==canonicalJSON(precomputed.metadata))throw new Error('Indice degli articoli non valido');
+    }
     if(version!==loadVersion||!full)return;
+    if(precomputed&&full.pages.length!==precomputed.census_page_count)throw new Error('Indice degli articoli non valido');
     data=full;summaryOnly=false;
     refreshCategoryChoices();articleList();
   } catch(error) {
