@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
-MEASURES_RULE = 'creation_quality_creators_v2'
+MEASURES_RULE = 'creation_quality_creators_v3'
+QUALITY_REVISION_RULE = 'selected_official_xml_revision_v1'
 ARTICLE_PREVIEW_LIMIT = 25
 TOPIC_LOOKUP_SHARD_SIZE = 1024
 SUMMARY_FIELDS = (
@@ -51,7 +52,7 @@ def prepared_summaries_match(summary_path, creators_path, metadata, sources, pag
         metadata_matches = summary_metadata == metadata
     count = summary.get('census_page_count')
     return (summary.get('format') == 'dashboard_summary_v1'
-            and summary.get('measures_rule') == MEASURES_RULE
+            and summary.get('measures_rule') == metadata.get('measures_rule', MEASURES_RULE)
             and summary.get('histogram_rule') == HISTOGRAM_RULE
             and isinstance(summary.get('reports'), dict)
             and isinstance(summary['reports'].get('overview'), dict)
@@ -263,6 +264,7 @@ def aggregate_index(results, files):
         raise ValueError('Non mescolare dati sintetici e dati reali')
     age_rules = {m['metadata'].get('age_rule') for m in members}
     historical_age_rules = {m['metadata'].get('historical_age_rule') for m in members}
+    measure_rules = {m['metadata'].get('measures_rule') for m in members}
     from ._native import collection_interval
     start, finish = collection_interval([(m['metadata']['started_at'], m['metadata']['finished_at']) for m in members])
     return {'metadata': {
@@ -277,6 +279,8 @@ def aggregate_index(results, files):
         'age_rule': next(iter(age_rules)) if len(age_rules) == 1 else 'mixed_per_language',
         'historical_age_rule': (next(iter(historical_age_rules)) if len(historical_age_rules) == 1
                                 else 'mixed_per_language'),
+        'measures_rule': (next(iter(measure_rules)) if len(measure_rules) == 1
+                          else 'mixed_per_language'),
         'length_unit': 'UTF-8 wikitext bytes',
     }, 'members': members}
 
@@ -683,8 +687,13 @@ def quality_metadata(meta, graph, count, file_checksum=None):
             or meta.get('dump_manifest_sha256') != graph.get('dump_manifest_sha256')
             or meta.get('graph_finished_at') != graph.get('finished_at')
             or meta.get('census_page_count') != count
+            or meta.get('quality_revision_rule') != QUALITY_REVISION_RULE
             or type(meta.get('scored_pages')) is not int or not 0 <= meta['scored_pages'] <= count
             or meta.get('missing_pages') != count - meta['scored_pages']
+            or any(type(meta.get(key)) is not int or meta[key] < 0 for key in
+                   ('same_revision_pages', 'different_revision_pages', 'unavailable_revision_pages'))
+            or sum(meta[key] for key in ('same_revision_pages', 'different_revision_pages',
+                                         'unavailable_revision_pages')) != count
             or (file_checksum is not None and meta.get('input_file_sha256') != file_checksum)):
         raise ValueError('Qualità non corrispondente al grafo SQL completo')
     normalizers = meta.get('normalizers')
@@ -700,11 +709,20 @@ def _join_quality_rows(rows, by_id):
         if record is None or record.get('revision_id') != row.get('revision_id'):
             raise ValueError('Qualità mancante o revisione diversa')
         score, status = record.get('quality_score'), record.get('quality_status')
-        if (status not in ('scored', 'missing_current_page', 'revision_mismatch', 'missing_wikitext')
+        relation = record.get('quality_revision_relation')
+        content_revision = record.get('content_revision_id')
+        if (status not in ('scored', 'missing_current_page', 'missing_wikitext')
+                or relation not in ('same', 'different', 'unavailable')
+                or (relation == 'unavailable') != (content_revision is None)
+                or (content_revision is not None and (type(content_revision) is not int or content_revision <= 0))
+                or (relation == 'same' and content_revision != row.get('revision_id'))
+                or (relation == 'different' and content_revision == row.get('revision_id'))
+                or (status == 'missing_current_page') != (relation == 'unavailable')
                 or (status == 'scored' and (type(score) not in (float, int) or not 0 <= score <= 0.998001))
                 or (status != 'scored' and score is not None)):
             raise ValueError('Punteggio qualità non valido')
-        row.update(quality_score=score, quality_status=status)
+        row.update(quality_score=score, quality_status=status,
+                   content_revision_id=content_revision, quality_revision_relation=relation)
 
 
 def attach_quality(rows, graph, supplement):
@@ -716,6 +734,10 @@ def attach_quality(rows, graph, supplement):
     _join_quality_rows(rows, by_id)
     if sum(row['quality_status'] == 'scored' for row in rows) != meta.get('scored_pages'):
         raise ValueError('Copertura qualità incoerente')
+    for relation, key in (('same', 'same_revision_pages'), ('different', 'different_revision_pages'),
+                          ('unavailable', 'unavailable_revision_pages')):
+        if sum(row['quality_revision_relation'] == relation for row in rows) != meta[key]:
+            raise ValueError('Relazione delle revisioni qualità incoerente')
     return {**meta, 'input_sha256': json_sha256(supplement)}
 
 
@@ -781,6 +803,7 @@ OBSERVATION_COLUMNS = (
     'creator_groups_at_creation_history', 'creator_continuity_months_before_creation',
     'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history',
     'creator_prior_edits_other_history', 'quality_score', 'quality_status',
+    'content_revision_id', 'quality_revision_relation',
 )
 
 
@@ -970,7 +993,7 @@ def write_summary_files(summary_path, creators_path, metadata, count, report_jso
     reports['categories'] = reports['categories'][:20]
     shared = {'metadata': metadata, 'sources': sources, 'census_page_count': count}
     write_json(summary_path, {'format': 'dashboard_summary_v1', 'histogram_rule': HISTOGRAM_RULE,
-                             'measures_rule': MEASURES_RULE,
+                             'measures_rule': metadata.get('measures_rule', MEASURES_RULE),
                               **shared, 'reports': reports, 'article_preview': article_preview})
     write_json(creators_path, {'format': 'creator_index_v1', **shared, 'creators': creators})
 

@@ -321,6 +321,11 @@ async function checkPaperProfiles() {
   assert(!html.includes('id="features-thresholds"'));
   assert(!descendants(nodes['features-paper']).some(node=>/mediana età/.test(node.textContent)));
   assert.equal(JSON.stringify(raw),before);
+  assert(descendants(nodes['features-paper']).some(node=>/revisioni diverse dal grafo SQL/.test(node.textContent)));
+  vm.runInContext("data.metadata.measures_rule='creation_quality_creators_v2';paperProfiles()",context);
+  assert(descendants(nodes['features-paper']).some(node=>/La copertura esclude revisioni diverse/.test(node.textContent)));
+  vm.runInContext("data.metadata.measures_rule='creation_quality_creators_v3';paperProfiles()",context);
+  assert.equal(JSON.stringify(raw),before);
   raw.pages[0].topic_status='predicted';raw.pages[0].topic_labels=['Culture.Media.Music','Culture.Media.Films','Culture.Biography.Women','STEM.Physics'];
   raw.pages[1].topic_status='predicted';raw.pages[1].topic_labels=[];
   raw.pages[3].topic_status='predicted';raw.pages[3].topic_labels=['Culture.Media.Music','Geography.Geographical'];

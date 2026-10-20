@@ -43,7 +43,8 @@ def export_result(result, output, update_manifest=True, announce=True):
                    'page_created_at', 'first_public_revision_at', 'creation_date_source', 'creation_date_status',
                    'creator_account_type_at_creation', 'creator_is_bot_now',
                    'creator_languages_created', 'creator_languages_before', 'creation_tags',
-                   'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status', 'quality_score', 'quality_status']
+                   'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status',
+                   'quality_score', 'quality_status', 'content_revision_id', 'quality_revision_relation']
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         pages = result['pages']

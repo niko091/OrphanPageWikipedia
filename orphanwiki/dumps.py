@@ -334,7 +334,9 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
     if spec != approved:
         raise ValueError('Modello qualità non approvato')
     graph_hash = _hash(raw_path, 'sha256')
+    from .core import QUALITY_REVISION_RULE
     identity = {'input_file_sha256': graph_hash, 'manifest_sha256': _hash(manifest_path, 'sha256'), 'model': spec,
+                'quality_revision_rule': QUALITY_REVISION_RULE,
                 'dump_manifest_sha256': graph.get('dump_manifest_sha256'), 'graph_finished_at': graph.get('finished_at')}
     stage_dir = Path(work_dir)
     sql_path = stage_dir / f'{database}-{graph["sql_release"]}.sqlite'
@@ -435,11 +437,18 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
                 percentile = 0
             maxima.append(max(minimum, percentile))
         valid = db.execute('''SELECT COUNT(*) FROM quality_census c JOIN quality_pages p ON c.id=p.id
-                              WHERE c.revision=p.revision AND p.features IS NOT NULL''').fetchone()[0]
+                              WHERE p.features IS NOT NULL''').fetchone()[0]
+        same, different, unavailable = db.execute('''SELECT
+            SUM(CASE WHEN p.revision=c.revision THEN 1 ELSE 0 END),
+            SUM(CASE WHEN p.revision IS NOT NULL AND p.revision!=c.revision THEN 1 ELSE 0 END),
+            SUM(CASE WHEN p.revision IS NULL THEN 1 ELSE 0 END)
+            FROM quality_census c LEFT JOIN quality_pages p ON p.id=c.id''').fetchone()
         metadata = {**identity, 'language': graph['language'], 'database': database,
                     'source': 'Johnson V2 / mediawiki_content_current', 'sql_release': graph['sql_release'],
                     'content_release': manifest['content_release'], 'complete': True,
                     'census_page_count': census, 'scored_pages': valid, 'missing_pages': census - valid,
+                    'same_revision_pages': same, 'different_revision_pages': different,
+                    'unavailable_revision_pages': unavailable,
                     'normalizers': maxima, 'content_files': {name: r['sha256_local'] for name, r in manifest['files'].items()}}
         def pages():
             cursor = db.execute('''SELECT c.id,c.revision,p.revision,p.features FROM quality_census c
@@ -447,9 +456,11 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
             while rows := cursor.fetchmany(512):
                 scores = quality_scores([json.loads(features) if features else [0] * 6 for _, _, _, features in rows], maxima)
                 for (pid, revision, actual, features), score in zip(rows, scores):
-                    status = ('missing_current_page' if actual is None else 'revision_mismatch' if revision != actual
-                              else 'missing_wikitext' if features is None else 'scored')
+                    relation = 'unavailable' if actual is None else 'same' if revision == actual else 'different'
+                    status = ('missing_current_page' if actual is None else
+                              'missing_wikitext' if features is None else 'scored')
                     yield {'page_id': pid, 'revision_id': revision, 'content_revision_id': actual,
+                           'quality_revision_relation': relation,
                            'quality_score': score if status == 'scored' else None, 'quality_status': status}
         write_json(output, {'metadata': metadata, 'pages': []}, arrays={'pages': pages()})
     return metadata
@@ -1305,6 +1316,7 @@ def _quality_stage(path, connection, graph_metadata, expected_count, raw_checksu
     metadata = quality_metadata(_read_first_metadata(path), graph_metadata, expected_count, raw_checksum)
     connection.execute('CREATE TABLE quality(id INTEGER PRIMARY KEY, data TEXT NOT NULL)')
     count = scored = 0
+    relations = {'same': 0, 'different': 0, 'unavailable': 0}
     digest = hashlib.sha256()
     encoder = json.JSONEncoder(ensure_ascii=True, sort_keys=True, allow_nan=False)
     original = {key: value for key, value in metadata.items() if key != 'status'}
@@ -1325,6 +1337,10 @@ def _quality_stage(path, connection, graph_metadata, expected_count, raw_checksu
                 digest.update(chunk.encode())
             count += 1
             scored += record.get('quality_status') == 'scored'
+            relation = record.get('quality_revision_relation')
+            if relation not in relations:
+                raise ValueError('Relazione delle revisioni qualità non valida')
+            relations[relation] += 1
             batch.append((record['page_id'], json.dumps(record)))
             if len(batch) == 512:
                 with connection:
@@ -1336,7 +1352,10 @@ def _quality_stage(path, connection, graph_metadata, expected_count, raw_checksu
     finally:
         events.close()
     digest.update(b']}')
-    if count != expected_count or scored != metadata['scored_pages']:
+    if (count != expected_count or scored != metadata['scored_pages'] or
+            any(relations[relation] != metadata[key] for relation, key in
+                (('same', 'same_revision_pages'), ('different', 'different_revision_pages'),
+                 ('unavailable', 'unavailable_revision_pages')))):
         raise ValueError('Censimento qualità incompleto')
     return {**metadata, 'input_sha256': digest.hexdigest()}
 
@@ -1348,7 +1367,8 @@ def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
     New dated outputs are prepared separately; the manifest is published last.
     """
     from .core import (iter_export_sections, _StagedPages, _StagedCandidates, _join_history_rows,
-                       _join_quality_rows, initialize_creator_rows, MEASURES_RULE, write_dashboard_exports)
+                       _join_quality_rows, initialize_creator_rows, MEASURES_RULE,
+                       QUALITY_REVISION_RULE, write_dashboard_exports)
     from ._native import article_ages
     from .__main__ import export_result, comparison_filename, manifest_entry, _publish_prepared
     data_dir = Path(data_dir)
@@ -1419,7 +1439,12 @@ def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
                 with db:
                     db.executemany('UPDATE pages SET data=? WHERE id=?',
                                    ((json.dumps(row, ensure_ascii=False), row['page_id']) for row in rows))
-            metadata.update(history=history_meta, age_rule=HISTORY_RULE, measures_rule=MEASURES_RULE)
+            previous_quality = metadata.get('quality')
+            measures_rule = (metadata.get('measures_rule', 'creation_quality_creators_v2')
+                             if quality_meta is None and isinstance(previous_quality, dict)
+                             and previous_quality.get('quality_revision_rule') != QUALITY_REVISION_RULE
+                             else MEASURES_RULE)
+            metadata.update(history=history_meta, age_rule=HISTORY_RULE, measures_rule=measures_rule)
             metadata['article_features'] = {**metadata.get('article_features', {}),
                                             'age': 'MediaWiki History / page_creation_timestamp'}
             if quality_meta:

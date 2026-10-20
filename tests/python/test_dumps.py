@@ -2,6 +2,7 @@
 
 import gzip
 import bz2
+import copy
 import hashlib
 import io
 import json
@@ -699,8 +700,8 @@ class DumpTests(unittest.TestCase):
                 tag = '<text deleted="deleted"/>' if text is None else '<text>' + escape(text) + '</text>'
                 return f'<page><title>P{pid}</title><ns>0</ns><id>{pid}</id><revision><id>{rid}</id><model>wikitext</model>{tag}</revision></page>'
             content_files = {}
-            for number, body in enumerate([page(1, 1, 'è<ref>x</ref>\n==A==') + page(2, 2, ''),
-                                           page(3, 33, 'x') + page(4, 4, None)]):
+            for number, body in enumerate([page(1, 1, 'è<ref>x</ref>\n==A==') + page(2, 22, ''),
+                                           page(3, 33, 'x') + page(4, 44, None)]):
                 path = root / f'vecwiki-2026-10-01-p{number}.xml.bz2'
                 path.write_bytes(bz2.compress(('<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/"><siteinfo><dbname>vecwiki</dbname></siteinfo>' + body + '</mediawiki>').encode()))
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -723,9 +724,16 @@ class DumpTests(unittest.TestCase):
                 self.assertEqual(reader.call_count, 1)  # completed partition reused
             quality = json.loads(output.read_text())
             self.assertEqual([p['quality_status'] for p in quality['pages']],
-                             ['scored', 'scored', 'revision_mismatch', 'missing_wikitext', 'missing_current_page'])
+                             ['scored', 'scored', 'scored', 'missing_wikitext', 'missing_current_page'])
+            self.assertEqual([p['quality_revision_relation'] for p in quality['pages']],
+                             ['same', 'different', 'different', 'different', 'unavailable'])
+            self.assertEqual(quality['metadata']['same_revision_pages'], 1)
+            self.assertEqual(quality['metadata']['different_revision_pages'], 3)
+            self.assertEqual(quality['pages'][2]['content_revision_id'], 33)
+            self.assertIsNotNone(quality['pages'][2]['quality_score'])
             self.assertEqual(quality['pages'][1]['quality_score'], 0)
-            self.assertEqual(quality['metadata']['scored_pages'], 2)
+            self.assertIsNone(quality['pages'][3]['quality_score'])
+            self.assertEqual(quality['metadata']['scored_pages'], 3)
             memory = analyze(raw, quality=quality)
             bounded_path = root / 'analysis' / 'vec.json'
             analyze_imported_dump(raw_path, None, bounded_path, {}, stage, quality_path=output)
@@ -764,7 +772,7 @@ class DumpTests(unittest.TestCase):
             summary = json.loads(summary_path.read_text())
             self.assertEqual(summary['reports']['numeric']['age_days']['known'], 5)
             self.assertEqual(summary['reports']['numeric']['creator_tenure_days']['known'], 5)
-            self.assertEqual(summary['reports']['profiles']['features']['rows'][2]['known'], 2)
+            self.assertEqual(summary['reports']['profiles']['features']['rows'][2]['known'], 3)
             summary_path.unlink()  # rebuild transports without replacing canonical observations
             self.assertEqual(refresh_measures(raw_path, history_path, bounded_path.parent, output), name)
             self.assertTrue(summary_path.exists())
@@ -779,9 +787,31 @@ class DumpTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Checksum'):
                 infer_quality(raw_path, content, output, stage)
             self.assertEqual(output.read_bytes(), previous)
+            legacy = copy.deepcopy(quality)
+            legacy['metadata'].pop('quality_revision_rule')
+            with self.assertRaisesRegex(ValueError, 'Qualità'):
+                attach_quality(memory['pages'], raw['metadata'], legacy)
             quality['pages'][0]['revision_id'] = 99
             with self.assertRaisesRegex(ValueError, 'revisione'):
                 attach_quality(memory['pages'], raw['metadata'], quality)
+            legacy_export = copy.deepcopy(updated)
+            legacy_export['metadata']['measures_rule'] = 'creation_quality_creators_v2'
+            legacy_export['metadata']['quality'].pop('quality_revision_rule')
+            for page_record in legacy_export['pages']:
+                page_record.pop('content_revision_id', None)
+                page_record.pop('quality_revision_relation', None)
+            legacy_path = bounded_path.parent / 'legacy.json'
+            write_json(legacy_path, legacy_export)
+            manifest_path = bounded_path.parent / 'manifest.json'
+            published = json.loads(manifest_path.read_text())
+            published.append({'language': 'vec', 'file': legacy_path.name,
+                              'date': raw['metadata']['finished_at'],
+                              'published_at': '9999-01-01T00:00:00+00:00'})
+            write_json(manifest_path, published)
+            retained_name = refresh_measures(raw_path, history_path, bounded_path.parent)
+            retained = json.loads((bounded_path.parent / retained_name).read_text())
+            self.assertEqual(retained['metadata']['measures_rule'], 'creation_quality_creators_v2')
+            self.assertNotIn('quality_revision_relation', retained['pages'][0])
 
 
 if __name__ == '__main__':

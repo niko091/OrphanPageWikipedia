@@ -177,6 +177,19 @@ class CategoryTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_legacy_quality_summary_keeps_its_measure_identity(self):
+        result = analyze(demo())
+        result['metadata']['measures_rule'] = 'creation_quality_creators_v2'
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'legacy.json'
+            transports = export_result(result, source, update_manifest=False, announce=False)
+            summary = json.loads((Path(folder) / transports['summary_file']).read_text())
+            self.assertEqual(summary['measures_rule'], 'creation_quality_creators_v2')
+            self.assertTrue(prepared_summaries_match(
+                Path(folder) / transports['summary_file'],
+                Path(folder) / transports['creator_index_file'],
+                result['metadata'], summary['sources'], len(result['pages'])))
+
     def test_streamed_pages_and_candidate_objects_preserve_unicode_and_missing_values(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'output.json'

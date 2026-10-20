@@ -23,7 +23,7 @@ interface CreatorMetadata {
 }
 interface HistoryMetadata { status: string; language?: string; matched_pages?: number; }
 interface DatasetMetadata {
-  language: string; complete?: boolean; demo?: boolean; kind?: string; age_rule?: string;
+  language: string; complete?: boolean; demo?: boolean; kind?: string; age_rule?: string; measures_rule?: string;
   started_at: string; finished_at: string; languages?: string[]; creators?: CreatorMetadata;
   history?: HistoryMetadata; comparison_coverage?: 'complete' | 'partial';
   topics?: {status?: string};
@@ -254,6 +254,8 @@ const translations: Record<string, string> = {
   "Qualità strutturale alta (Johnson V2, ≥ mediana)": "High structural quality (Johnson V2, ≥ median)",
   "Qualità strutturale bassa (Johnson V2, < mediana)": "Low structural quality (Johnson V2, < median)",
   "Qualità strutturale stimata con Johnson V2 dal wikitesto. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura esclude revisioni diverse dal grafo e contenuti mancanti.": "Structural quality estimated with Johnson V2 from wikitext. Split at each edition’s median; scores are not an absolute scale across languages. Coverage excludes revisions different from the graph and missing content.",
+  "Qualità strutturale stimata con Johnson V2 dal wikitesto dell'export XML ufficiale selezionato. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura include revisioni diverse dal grafo SQL quando il testo è disponibile; le due revisioni restano distinte.": "Structural quality estimated with Johnson V2 from the selected official XML export's wikitext. Split at each edition's median; scores are not an absolute scale across languages. Coverage includes revisions different from the SQL graph when text is available; both revision identities remain distinct.",
+  "Qualità strutturale Johnson V2: le edizioni incluse usano regole di revisione diverse. Consultare la provenienza di ciascuna edizione prima di confrontare la copertura.": "Johnson V2 structural quality: included editions use different revision rules. Check each edition's provenance before comparing coverage.",
   "Anzianità locale alla creazione ricostruita": "Local account age at reconstructed page creation",
   "Bot (data del dump)": "Bot (dump date)",
   "Senza flag bot (data del dump)": "No bot flag (dump date)",
@@ -871,7 +873,13 @@ function paperProfiles() {
   };
   for(const row of report.features.rows)row.label=t(featureLabels[row.label]);
   featureBars('features-paper',report.features);
-  $('features-paper')!.append(element('p',t('Qualità strutturale stimata con Johnson V2 dal wikitesto. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura esclude revisioni diverse dal grafo e contenuti mancanti.')));
+  const measureRule=precomputed?.measures_rule??data.metadata.measures_rule;
+  const qualityNote=measureRule==='mixed_per_language'
+    ?'Qualità strutturale Johnson V2: le edizioni incluse usano regole di revisione diverse. Consultare la provenienza di ciascuna edizione prima di confrontare la copertura.'
+    :measureRule==='creation_quality_creators_v3'
+    ?"Qualità strutturale stimata con Johnson V2 dal wikitesto dell'export XML ufficiale selezionato. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura include revisioni diverse dal grafo SQL quando il testo è disponibile; le due revisioni restano distinte."
+    :'Qualità strutturale stimata con Johnson V2 dal wikitesto. Soglia alla mediana della singola edizione; i punteggi non sono una scala assoluta tra lingue. La copertura esclude revisioni diverse dal grafo e contenuti mancanti.';
+  $('features-paper')!.append(element('p',t(qualityNote)));
 }
 function categories() {
   const ordered=precomputed?.reports.categories??calculateReport<CategoryReportRow[]>('categories',data.pages.map(page=>[label(page),page.orphan]));
@@ -1572,7 +1580,7 @@ async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> 
   const response=await fetch('data/'+filename,{cache:'no-store'});
   if(!response.ok)throw new Error('Riepilogo non disponibile');
   const summary=await response.json() as DashboardSummaryData;
-  if(summary?.format!=='dashboard_summary_v1'||summary.measures_rule!=='creation_quality_creators_v2'||summary.metadata?.language!==entry.language||
+  if(summary?.format!=='dashboard_summary_v1'||!['creation_quality_creators_v2','creation_quality_creators_v3','mixed_per_language'].includes(summary.measures_rule)||summary.metadata?.language!==entry.language||
     summary.metadata.finished_at!==entry.date||summary.metadata.complete!==true||
     Boolean(summary.metadata.demo)!==Boolean(entry.demo)||
     !Number.isSafeInteger(summary.census_page_count)||summary.census_page_count<0||

@@ -41,7 +41,7 @@ def sidecars(directory, filename, sources):
                      'mtime_ns': (directory / source).stat().st_mtime_ns} for source in sources]
     stem = filename.removesuffix('.json')
     (directory / (stem + '-summary.json')).write_text(json.dumps({
-        'format': 'dashboard_summary_v1', 'histogram_rule': 'shared_p2_p98_tails_v1', 'measures_rule': 'creation_quality_creators_v2',
+        'format': 'dashboard_summary_v1', 'histogram_rule': 'shared_p2_p98_tails_v1', 'measures_rule': 'creation_quality_creators_v3',
         'metadata': metadata, 'sources': fingerprints, 'census_page_count': 0,
         'reports': {'overview': {'orphans': 0}}, 'article_preview': []}))
     (directory / (stem + '-creators.json')).write_text(json.dumps({
@@ -125,7 +125,8 @@ elif command == 'quality':
             'source':'Johnson V2 / mediawiki_content_current','complete':True,'content_release':release,
             'input_file_sha256':hashlib.sha256(graph.read_bytes()).hexdigest(),
             'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            'model':json.loads(Path('config/quality.json').read_text())}
+            'model':json.loads(Path('config/quality.json').read_text()),
+            'quality_revision_rule':'selected_official_xml_revision_v1'}
     (Path(option('--output-dir')) / (language + '-quality.json')).write_text(json.dumps({'metadata':meta,'pages':[]}))
 elif command == 'topics':
     codes = options[options.index('--languages') + 1:options.index('--model')]
@@ -147,7 +148,7 @@ elif command == 'analyze':
     meta = dict(graph_meta)
     meta['historical_age_rule'] = 'mediawiki_history_first_observed_revision_v1'
     meta['age_rule'] = 'mediawiki_history_page_creation_v2'
-    meta['measures_rule'] = 'creation_quality_creators_v2'
+    meta['measures_rule'] = 'creation_quality_creators_v3'
     meta['history'] = json.loads(Path(options[0]).with_name(language + '-history.json').read_text())['metadata']
     if (Path(options[0]).with_name(language + '-topics.json')).exists():
         meta['topics'] = {'status': 'predicted', 'model': json.loads(
@@ -183,7 +184,7 @@ elif command == 'compare':
         meta = json.loads(graph.read_text())['metadata']
         meta['historical_age_rule'] = 'mediawiki_history_first_observed_revision_v1'
         meta['age_rule'] = 'mediawiki_history_page_creation_v2'
-        meta['measures_rule'] = 'creation_quality_creators_v2'
+        meta['measures_rule'] = 'creation_quality_creators_v3'
         meta['history'] = json.loads(graph.with_name(language + '-history.json').read_text())['metadata']
         meta['comparison'] = {'status': 'compared',
                               'reference_languages': [code for code in languages if code != language]}
@@ -230,7 +231,7 @@ elif command == 'refresh-measures':
             if quality.exists():
                 document['metadata']['quality'] = json.loads(quality.read_text())['metadata']
             document['metadata']['age_rule'] = 'mediawiki_history_page_creation_v2'
-            document['metadata']['measures_rule'] = 'creation_quality_creators_v2'
+            document['metadata']['measures_rule'] = 'creation_quality_creators_v3'
             (output / filename).write_text(json.dumps(document))
             sidecars(output, filename, [filename])
             (output / entry['connections_dir']).mkdir(exist_ok=True)

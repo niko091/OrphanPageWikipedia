@@ -228,7 +228,7 @@ def collected_metadata_matches(meta, language, database, manifest_hash, topic_sp
             and meta.get('source') == 'Wikimedia SQL dumps / ' + database
             and meta.get('dump_manifest_sha256') == manifest_hash
             and meta.get('age_rule') == 'mediawiki_history_page_creation_v2'
-            and meta.get('measures_rule') == 'creation_quality_creators_v2'
+            and meta.get('measures_rule') == 'creation_quality_creators_v3'
             and (measures is None or all(all(meta.get(section, {}).get(key) == value for key, value in expected.items())
                 for section, expected in measures.items()))
             and isinstance(topics, dict) and topics.get('status') == 'predicted'
@@ -750,7 +750,8 @@ def run_pipeline(args, log, benchmark=None):
         manifest = dump_root / database / f'content-{args.content_release}.json'
         quality = import_dir / f'{language}-quality.json'
         inputs = {'graph_sha256': checksum(graph), 'manifest_sha256': checksum(manifest),
-                  'model_sha256': checksum(PROJECT_ROOT / 'config/quality.json')}
+                  'model_sha256': checksum(PROJECT_ROOT / 'config/quality.json'),
+                  'quality_revision_rule': 'selected_official_xml_revision_v1'}
         if not state.matches(f'quality:{language}', inputs, [quality]):
             step(f'qualità {language}', [*base, 'quality', '--languages-file', str(project_path(args.languages_file)),
                 '--languages', language, '--content-release', args.content_release, '--root', str(dump_root),
