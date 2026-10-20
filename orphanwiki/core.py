@@ -16,6 +16,7 @@ MEASURES_RULE = 'creation_quality_creators_v3'
 QUALITY_REVISION_RULE = 'selected_official_xml_revision_v1'
 ARTICLE_PREVIEW_LIMIT = 25
 TOPIC_LOOKUP_SHARD_SIZE = 1024
+TRANSPORT_RULE = 'dashboard_transports_v2'
 SUMMARY_FIELDS = (
     'page_id', 'title', 'orphan', 'category', 'topic_status', 'topic_labels',
     'page_created_at', 'age_days', 'length_bytes', 'quality_score', 'quality_status',
@@ -942,19 +943,19 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                          bool(metadata.get('demo')) != bool(expected.get('demo')) or
                          metadata.get('finished_at') != expected['date']):
             raise ValueError('Manifest e raccolta non corrispondenti')
-        generation = json_sha256([metadata, initial.st_size, initial.st_mtime_ns])[:12]
-        stem = source.stem + ('-' + transport_generation if transport_generation else '')
-        directory = stem + '-connections-' + generation
+        generation = json_sha256([TRANSPORT_RULE, metadata, initial.st_size, initial.st_mtime_ns])[:12]
+        stem = source.stem + '-' + (transport_generation or generation)
+        directory = stem + '-connections'
         card_identity = json_sha256(['orphan_cards_v2', metadata, initial.st_size,
                                      initial.st_mtime_ns, transport_generation])
-        card_directory = stem + '-cards-' + card_identity[:12]
+        card_directory = stem + '-cards'
         filenames = {'observations_file': stem + '-observations.json',
                      'articles_file': stem + '-articles.json',
                      'summary_file': stem + '-summary.json',
                      'creator_index_file': stem + '-creators.json',
                      'cards_file': stem + '-cards-v2.json', 'cards_dir': card_directory,
                      'connections_dir': directory}
-        topic_directory = stem + '-profile-topics-' + generation
+        topic_directory = stem + '-profile-topics'
         filenames['profile_topics_dir'] = topic_directory
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
             raise ValueError('I trasporti devono essere distinti dal dataset originale')

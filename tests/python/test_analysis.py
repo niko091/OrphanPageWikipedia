@@ -2,6 +2,7 @@ import copy
 import csv
 import hashlib
 import json
+import os
 import random
 import tempfile
 import unittest
@@ -328,9 +329,9 @@ class ExportTests(unittest.TestCase):
                              'links': [], 'categories': []} for index in range(300))
         result = analyze(raw)
         with tempfile.TemporaryDirectory() as folder:
-            export_result(result, Path(folder) / 'large.json')
-            summary = json.loads((Path(folder) / 'large-summary.json').read_text())
-            creators = json.loads((Path(folder) / 'large-creators.json').read_text())
+            transports = export_result(result, Path(folder) / 'large.json')
+            summary = json.loads((Path(folder) / transports['summary_file']).read_text())
+            creators = json.loads((Path(folder) / transports['creator_index_file']).read_text())
         self.assertEqual(summary['census_page_count'], 540)
         self.assertEqual(creators['census_page_count'], 540)
         self.assertEqual(summary['reports']['overview']['orphans'],
@@ -344,9 +345,9 @@ class ExportTests(unittest.TestCase):
         result = analyze(demo())
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / 'wiki.json'
-            export_result(result, source)
-            summary_path = source.with_name('wiki-summary.json')
-            creator_path = source.with_name('wiki-creators.json')
+            transports = export_result(result, source)
+            summary_path = Path(folder) / transports['summary_file']
+            creator_path = Path(folder) / transports['creator_index_file']
             summary = json.loads(summary_path.read_text())
             expected = (summary_path, creator_path, result['metadata'], summary['sources'], len(result['pages']))
             self.assertTrue(prepared_summaries_match(*expected))
@@ -377,6 +378,33 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(compact['link_candidates'], {key: {'status': value['status'], 'candidate_count': value['candidate_count']}
                                                      for key, value in result['link_candidates'].items()})
 
+    def test_default_transport_generation_preserves_prior_records_after_source_stat_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'wiki.json'
+            previous = export_result(analyze(demo()), source)
+            original = source.read_bytes()
+            old_files = {}
+            for name in previous.values():
+                path = root / name
+                items = path.rglob('*') if path.is_dir() else [path]
+                for item in items:
+                    if item.is_file():
+                        old_files[item.relative_to(root)] = item.read_bytes()
+            info = source.stat()
+            os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+            current = write_dashboard_exports(source, root)
+            self.assertTrue(set(previous.values()).isdisjoint(current.values()))
+            self.assertEqual(source.read_bytes(), original)
+            for relative, contents in old_files.items():
+                self.assertEqual((root / relative).read_bytes(), contents)
+            old_index = json.loads((root / previous['cards_file']).read_text())
+            new_index = json.loads((root / current['cards_file']).read_text())
+            self.assertNotEqual(old_index['card_identity'], new_index['card_identity'])
+            identifier = old_index['rows'][0][old_index['columns'].index('page_id')]
+            old_card = json.loads((root / previous['cards_dir'] / f'{identifier}.json').read_text())
+            self.assertEqual(old_card['card_identity'], old_index['card_identity'])
+
     def test_existing_dashboard_conversion_streams_and_preserves_complete_files(self):
         result = analyze(demo())
         orphan = next(p for p in result['pages'] if p['orphan'])
@@ -385,10 +413,10 @@ class ExportTests(unittest.TestCase):
         original = copy.deepcopy(result)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'fixture.json'
-            export_result(result, path)
+            transports = export_result(result, path)
             complete = path.read_bytes()
             csv_bytes = path.with_suffix('.csv').read_bytes()
-            compact = path.with_name('fixture-observations.json')
+            compact = Path(folder) / transports['observations_file']
             expected = compact.read_bytes()
             self.assertEqual(list(iter_export_sections(path)), [('metadata', None, result['metadata'])] +
                              [('pages', None, p) for p in result['pages']] +

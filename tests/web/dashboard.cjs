@@ -19,6 +19,10 @@ const fixtureFile=path.join(fixtureDir,'fixture.json');
 const generated=spawnSync(process.env.ORPHANWIKI_PYTHON||'.venv/bin/python',['tests/python/fixtures.py','--output',fixtureFile],{encoding:'utf8'});
 if(generated.status!==0){fs.rmSync(fixtureDir,{recursive:true});throw new Error(generated.stderr||generated.error||'Fixture export failed');}
 const fixture=()=>JSON.parse(fs.readFileSync(fixtureFile));
+function fixtureTransport(key,file='fixture.json') {
+  const entry=JSON.parse(fs.readFileSync(path.join(fixtureDir,'manifest.json'))).find(entry=>entry.file===file);
+  return JSON.parse(fs.readFileSync(path.join(fixtureDir,entry[key])));
+}
 class Element {
   constructor(tag) {this.tag=tag;this.children=[];this.style={};this.listeners={};this.value='';this.textContent='';}
   append(...nodes) {this.children.push(...nodes);if(this.tag==='select' && !this.value && this.children.length)this.value=this.children[0].value;}
@@ -1774,8 +1778,8 @@ async function checkCreatorHistory() {
   console.log('Historical creators: prior continuity and multilabel groups are rendered separately from current bot status.');
 }
 async function checkPreparedSummaries() {
-  const raw=fixture(),summary=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-summary.json')));
-  const creatorIndex=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-creators.json')));
+  const raw=fixture(),summary=fixtureTransport('summary_file');
+  const creatorIndex=fixtureTransport('creator_index_file');
   raw.metadata.demo=false;summary.metadata.demo=false;creatorIndex.metadata.demo=false;
   const entry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,
     summary_file:'fixture-summary.json',creator_index_file:'fixture-creators.json'};
@@ -1809,9 +1813,9 @@ async function checkPreparedSummaries() {
   await checkArticleIndex();
 }
 async function checkArticleIndex() {
-  const raw=fixture(),summary=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-summary.json')));
-  const observations=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-observations.json')));
-  const articleIndex=JSON.parse(fs.readFileSync(path.join(fixtureDir,'fixture-articles.json')));
+  const raw=fixture(),summary=fixtureTransport('summary_file');
+  const observations=fixtureTransport('observations_file');
+  const articleIndex=fixtureTransport('articles_file');
   for(const document of [raw,summary,observations,articleIndex])document.metadata.demo=false;
   for(const [position,page] of raw.pages.entries()) {
     page.topic_status=position%3?'predicted':'missing';
@@ -1879,7 +1883,7 @@ async function checkArticleIndex() {
     result.nodes['article-more'].listeners.click();await new Promise(resolve=>setImmediate(resolve));
     assert.match(result.nodes['article-info'].textContent,/non valid/);
   }
-  const lmo=JSON.parse(fs.readFileSync(path.join(fixtureDir,'lmo-demo-articles.json')));lmo.metadata.demo=false;
+  const lmo=fixtureTransport('articles_file','lmo-demo.json');lmo.metadata.demo=false;
   const lmoEntry={language:'lmo',file:'lmo-demo.json',date:lmo.metadata.finished_at,demo:false,articles_file:'lmo-demo-articles.json'};
   const aggregate={metadata:{...raw.metadata,language:'all',kind:'aggregate',languages:['vec','lmo']},pages:[],
     members:[{language:'vec',file:entry.file,page_count:raw.pages.length,metadata:raw.metadata},
