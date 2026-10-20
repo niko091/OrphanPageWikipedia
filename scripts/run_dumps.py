@@ -68,10 +68,20 @@ class StepState:
             self.steps = {}
 
     def matches(self, key, inputs, outputs):
+        return self.reason(key, inputs, outputs) == 'verified_reuse'
+
+    def reason(self, key, inputs, outputs):
         saved = self.steps.get(key)
-        return (saved is not None and saved.get('inputs') == inputs and
-                saved.get('outputs') == {str(path): signature(path) for path in outputs} and
-                all(signature(path) is not None for path in outputs))
+        if saved is None:
+            return 'missing_checkpoint'
+        if saved.get('inputs') != inputs:
+            return 'source_mismatch'
+        current = {str(path): signature(path) for path in outputs}
+        if any(value is None for value in current.values()):
+            return 'missing_output'
+        if saved.get('outputs') != current:
+            return 'output_mismatch'
+        return 'verified_reuse'
 
     def save(self, key, inputs, outputs):
         if not all(signature(path) is not None for path in outputs):
@@ -104,8 +114,14 @@ def fetched_files(record):
 
 def imported_files_match(graph, history, stage, manifest_path, manifest, history_required=True):
     """Reuse an import only when source identities and staging agree."""
+    return imported_files_reason(graph, history, stage, manifest_path, manifest,
+                                 history_required) == 'verified_reuse'
+
+
+def imported_files_reason(graph, history, stage, manifest_path, manifest, history_required=True):
+    """Report why verified SQL/History staging can or cannot be reused."""
     if not all(complete_json(path) for path in ((graph, history) if history_required else (graph,))) or signature(stage) is None:
-        return False
+        return 'missing_output'
     try:
         from orphanwiki.dumps import SQL_TABLES, _read_first_metadata, HISTORY_RULE
         graph_meta = _read_first_metadata(graph)
@@ -115,36 +131,40 @@ def imported_files_match(graph, history, stage, manifest_path, manifest, history
                 or graph_meta.get('sql_release') != manifest['sql_release']
                 or graph_meta.get('complete') is not True
                 or graph_meta.get('dump_manifest_sha256') != checksum(manifest_path)):
-            return False
+            return 'source_mismatch'
         with sqlite3.connect(stage.resolve().as_uri() + '?mode=ro', uri=True) as connection:
             sql = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
             if any(sql.get(name) != manifest['files'][name]['sha256_local'] for name in SQL_TABLES):
-                return False
+                return 'stage_table_mismatch'
             if not history_required:
-                return True
+                return 'verified_reuse'
         if (history_meta.get('source') != 'MediaWiki History dumps / ' + manifest['database']
                 or history_meta.get('language') != manifest['language']
                 or history_meta.get('sql_release') != manifest['sql_release']
                 or history_meta.get('history_release') != manifest['history_release']
-                or history_meta.get('complete') is not True
-                or history_meta.get('creation_rule') != HISTORY_RULE):
-            return False
+                or history_meta.get('complete') is not True):
+            return 'source_mismatch'
+        if history_meta.get('creation_rule') != HISTORY_RULE:
+            return 'definition_mismatch'
         history_files = {name: item['sha256_local'] for name, item in manifest['files'].items()
                          if name.endswith('.tsv.bz2')}
         if history_meta.get('history_files') != history_files:
-            return False
+            return 'source_mismatch'
         with sqlite3.connect(f'file:{stage}?mode=ro', uri=True) as connection:
             sql = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
             scanned = {(name, phase): digest for name, phase, digest in
                        connection.execute('SELECT file,phase,sha256 FROM history_imported')}
-        return (all(sql.get(name) == manifest['files'][name]['sha256_local'] for name in SQL_TABLES)
-                and all(scanned.get((name, phase)) == digest + ':' + HISTORY_RULE
-                        for name, digest in history_files.items()
-                        for phase in ('initial',))
-                and all(scanned.get((name, 'activity'), '').startswith(digest + ':')
-                        for name, digest in history_files.items()))
+        if any(sql.get(name) != manifest['files'][name]['sha256_local'] for name in SQL_TABLES):
+            return 'stage_table_mismatch'
+        if any(scanned.get((name, 'initial')) != digest + ':' + HISTORY_RULE
+               for name, digest in history_files.items()):
+            return 'definition_mismatch'
+        if any(not scanned.get((name, 'activity'), '').startswith(digest + ':')
+               for name, digest in history_files.items()):
+            return 'stage_table_mismatch'
+        return 'verified_reuse'
     except (OSError, ValueError, KeyError, sqlite3.Error):
-        return False
+        return 'stage_table_mismatch'
 
 
 def topics_match(path, graph, graph_checksum, language, model_spec, census_pages):
@@ -651,7 +671,10 @@ def run_pipeline(args, log, benchmark=None):
                      and old_inputs.get('dump_root') == str(dump_root)
                      and [language, database] in old_inputs.get('languages', [])
                      and outputs and all(old_outputs.get(str(path)) == signature(path) for path in outputs))
-        if not args.force and outputs and (state.matches(f'fetch:{language}', inputs, outputs) or inherited):
+        fetch_reason = state.reason(f'fetch:{language}', inputs, outputs)
+        log_line(log, f'CHECKPOINT download {language}: '
+                 f'{"forced" if args.force else "verified_reuse" if inherited else fetch_reason}')
+        if not args.force and outputs and (fetch_reason == 'verified_reuse' or inherited):
             log_line(log, f'SALTA download {language}: file verificati e invariati')
             state.save(f'fetch:{language}', inputs, outputs)
         else:
@@ -680,16 +703,24 @@ def run_pipeline(args, log, benchmark=None):
         import_inputs = {'manifest_sha256': manifest_hashes[language],
                          'graph': str(graph), 'history': str(history), 'stage': str(stage), 'history_rule': HISTORY_RULE}
         outputs = [graph, history, stage]
-        if not args.force and (state.matches(f'import:{language}', import_inputs, outputs) or imported_files_match(
-                graph, history, stage, manifest, metadata)):
+        state_reason = state.reason(f'import:{language}', import_inputs, outputs)
+        import_reason = (imported_files_reason(graph, history, stage, manifest, metadata)
+                         if not args.force and state_reason != 'verified_reuse' else state_reason)
+        log_line(log, f'CHECKPOINT importazione {language}: '
+                 f'{"forced" if args.force else import_reason}; stato={state_reason}')
+        if not args.force and import_reason == 'verified_reuse':
             log_line(log, f'SALTA importazione {language}: grafo, cronologia e checkpoint già completi')
             state.save(f'import:{language}', import_inputs, outputs)
         elif not args.force and imported_files_match(graph, history, stage, manifest, metadata, history_required=False):
+            log_line(log, f'CHECKPOINT grafo {language}: verified_reuse; cronologia={import_reason}')
             step(f'aggiornamento cronologia {language}',
                      [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
                       '--work-dir', str(work_dir), *history_options])
             state.save(f'import:{language}', import_inputs, outputs)
         else:
+            if not args.force:
+                log_line(log, f'CHECKPOINT grafo {language}: '
+                         f'{imported_files_reason(graph, history, stage, manifest, metadata, history_required=False)}')
             step(f'importazione {language}',
                      [*base, 'import-dumps', '--manifest', str(manifest),
                       '--output', str(graph), '--history-output', str(history),

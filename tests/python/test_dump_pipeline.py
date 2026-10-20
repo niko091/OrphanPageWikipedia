@@ -239,6 +239,22 @@ elif command == 'refresh-measures':
 
 
 class DumpPipelineTests(unittest.TestCase):
+    def test_step_state_reports_reuse_and_invalidation_reasons(self):
+        state_class = runpy.run_path(str(SCRIPT))['StepState']
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / 'graph.json'
+            state = state_class(root / 'state.json')
+            self.assertEqual(state.reason('import:vec', {'release': 'one'}, [output]), 'missing_checkpoint')
+            output.write_text('{}')
+            state.save('import:vec', {'release': 'one'}, [output])
+            self.assertEqual(state.reason('import:vec', {'release': 'one'}, [output]), 'verified_reuse')
+            self.assertEqual(state.reason('import:vec', {'release': 'two'}, [output]), 'source_mismatch')
+            output.write_text('{"pages":[]}')
+            self.assertEqual(state.reason('import:vec', {'release': 'one'}, [output]), 'output_mismatch')
+            output.unlink()
+            self.assertEqual(state.reason('import:vec', {'release': 'one'}, [output]), 'missing_output')
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
@@ -560,6 +576,8 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual([line.split(':', 1)[0] for line in self.calls.read_text().splitlines()],
                          ['fetch-dumps', 'import-history', 'topics', 'fetch-content', 'quality', 'analyze'])
         self.assertIn('aggiornamento cronologia it', result.stdout)
+        self.assertIn('CHECKPOINT importazione it: definition_mismatch', result.stdout)
+        self.assertIn('CHECKPOINT grafo it: verified_reuse', result.stdout)
         history_command = next(step['command'] for step in self.one_benchmark()['steps']
                                if step['command'][3] == 'import-history')
         self.assertEqual(history_command[history_command.index('--history-cache-mib') + 1], '256')
