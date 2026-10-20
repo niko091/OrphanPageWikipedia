@@ -369,7 +369,6 @@ class ExportTests(unittest.TestCase):
             csv_bytes = path.with_suffix('.csv').read_bytes()
             compact = path.with_name('fixture-observations.json')
             expected = compact.read_bytes()
-            compact.unlink()
             self.assertEqual(list(iter_export_sections(path)), [('metadata', None, result['metadata'])] +
                              [('pages', None, p) for p in result['pages']] +
                              [('link_candidates', str(orphan['page_id']), result['link_candidates'][str(orphan['page_id'])])])
@@ -379,7 +378,8 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), complete)
             self.assertEqual(path.with_suffix('.csv').read_bytes(), csv_bytes)
             entry = json.loads((Path(folder) / 'manifest.json').read_text())[0]
-            self.assertEqual(entry['observations_file'], compact.name)
+            self.assertNotEqual(entry['observations_file'], compact.name)
+            self.assertEqual((Path(folder) / entry['observations_file']).read_bytes(), expected)
             topic_directory = Path(folder) / entry['profile_topics_dir']
             topic_index = json.loads((topic_directory / 'index.json').read_text())
             self.assertEqual(topic_index['format'], 'profile_topics_index_v1')
@@ -455,6 +455,42 @@ class ExportTests(unittest.TestCase):
                 path = Path(folder) / 'bad.json';path.write_text(content)
                 with self.assertRaises(ValueError):
                     list(iter_export_sections(path))
+
+    def test_dashboard_rename_failure_preserves_manifest_and_prior_generation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            export_result(analyze(demo()), root / 'fixture.json')
+            old = {path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            old_entry = json.loads(old[Path('manifest.json')])[0]
+            original_replace = Path.replace
+            moved = 0
+
+            def fail_second_publication(path, target):
+                nonlocal moved
+                target = Path(target)
+                if target.is_relative_to(root):
+                    moved += 1
+                    if moved == 2:
+                        raise OSError('synthetic publication failure')
+                return original_replace(path, target)
+
+            with patch.object(Path, 'replace', fail_second_publication), \
+                    self.assertRaisesRegex(OSError, 'publication failure'):
+                rebuild_dashboard(root)
+            self.assertEqual(moved, 2)
+            for relative, contents in old.items():
+                self.assertEqual((root / relative).read_bytes(), contents)
+            self.assertTrue({path.relative_to(root) for path in root.rglob('*') if path.is_file()} - old.keys())
+            rebuild_dashboard(root)
+            entry = json.loads((root / 'manifest.json').read_text())[0]
+            for key in ('observations_file', 'summary_file', 'creator_index_file',
+                        'cards_file', 'connections_dir', 'profile_topics_dir'):
+                self.assertNotEqual(entry[key], old_entry[key])
+                self.assertTrue((root / entry[key]).exists())
+                self.assertTrue((root / old_entry[key]).exists())
+            for relative, contents in old.items():
+                if relative != Path('manifest.json'):
+                    self.assertEqual((root / relative).read_bytes(), contents)
 
     def test_compact_projection_does_not_hide_external_enrichment(self):
         result = analyze(demo())

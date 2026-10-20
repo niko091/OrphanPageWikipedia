@@ -910,7 +910,7 @@ def write_observations(path, result):
     write_json(path, compact, arrays={'rows': rows()}, mappings={'link_candidates': counts()})
 
 
-def write_dashboard_exports(source, folder, expected=None):
+def write_dashboard_exports(source, folder, expected=None, *, transport_generation=None):
     """Project an ordered canonical export into bounded browser transports.
 
     Cards contain all orphans, exact counts and a small prompt shortlist. A
@@ -921,6 +921,8 @@ def write_dashboard_exports(source, folder, expected=None):
     ranking can choose its five without loading every reference edge.
     """
     source, folder = Path(source), Path(folder)
+    if transport_generation is not None and not re.fullmatch(r'[0-9a-f]{32}', transport_generation):
+        raise ValueError('Generazione dei trasporti non valida')
     initial = source.stat()
     events = iter_export_sections(source)
     topic_staging = tempfile.TemporaryDirectory(prefix='orphanwiki-profile-')
@@ -935,12 +937,13 @@ def write_dashboard_exports(source, folder, expected=None):
                          metadata.get('finished_at') != expected['date']):
             raise ValueError('Manifest e raccolta non corrispondenti')
         generation = json_sha256([metadata, initial.st_size, initial.st_mtime_ns])[:12]
-        directory = source.stem + '-connections-' + generation
-        filenames = {'observations_file': source.stem + '-observations.json',
-                     'summary_file': source.stem + '-summary.json',
-                     'creator_index_file': source.stem + '-creators.json',
-                     'cards_file': source.stem + '-cards.json', 'connections_dir': directory}
-        topic_directory = source.stem + '-profile-topics-' + generation
+        stem = source.stem + ('-' + transport_generation if transport_generation else '')
+        directory = stem + '-connections-' + generation
+        filenames = {'observations_file': stem + '-observations.json',
+                     'summary_file': stem + '-summary.json',
+                     'creator_index_file': stem + '-creators.json',
+                     'cards_file': stem + '-cards.json', 'connections_dir': directory}
+        topic_directory = stem + '-profile-topics-' + generation
         filenames['profile_topics_dir'] = topic_directory
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
             raise ValueError('I trasporti devono essere distinti dal dataset originale')

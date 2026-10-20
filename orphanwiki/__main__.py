@@ -6,6 +6,7 @@ import math
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -235,8 +236,8 @@ def publish_available_aggregate(output_dir, prepared_report=None):
 def rebuild_dashboard(folder):
     """Derive observations, cards and per-orphan evidence without SQL.
 
-    Read one exported article/orphan record at a time. Prepare every sidecar
-    before publishing the new manifest; do not rewrite canonical JSON/CSV.
+    Read one exported article/orphan record at a time. Prepare a distinct
+    transport generation before switching the manifest; retain prior files.
     """
     folder = Path(folder)
     manifest = json.loads((folder / 'manifest.json').read_text())
@@ -250,18 +251,20 @@ def rebuild_dashboard(folder):
         files.add(name)
         if entry.get('kind') != 'aggregate':
             wiki_database(entry['language'])
-    targets = {entry['file'].removesuffix('.json') + suffix
-               for entry in manifest if entry.get('kind') != 'aggregate'
-               for suffix in ('-observations.json', '-summary.json', '-creators.json', '-cards.json')}
-    if targets & files or 'manifest.json' in targets:
-        raise ValueError('I file compatti devono essere distinti dai dataset originali')
+    generation = uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix='orphanwiki-dashboard-', dir=folder.parent) as temporary:
         prepared = Path(temporary)
         for entry in manifest:
             if entry.get('kind') == 'aggregate':
                 continue
             source = folder / entry['file']
-            entry.update(write_dashboard_exports(source, prepared, expected=entry))
+            transports = write_dashboard_exports(source, prepared, expected=entry,
+                                                 transport_generation=generation)
+            if set(transports.values()) & (files | {'manifest.json'}):
+                raise ValueError('I file compatti devono essere distinti dai dataset originali')
+            if any((folder / name).exists() for name in transports.values()):
+                raise ValueError('Generazione dei trasporti già presente')
+            entry.update(transports)
             filename = entry['cards_file']
             print(f"Dashboard: {entry['language']}; schede "
                   f"{(prepared / filename).stat().st_size / 2**20:.1f} MiB; evidenze separate per voce", flush=True)
