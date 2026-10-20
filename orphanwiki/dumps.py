@@ -124,15 +124,30 @@ def _hash(path, algorithm):
     return digest.hexdigest()
 
 
+def _verified_sha256(path, expected_sha1=None, expected_sha256=None):
+    sha1 = hashlib.sha1() if expected_sha1 is not None else None
+    sha256 = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            if sha1 is not None:
+                sha1.update(block)
+            sha256.update(block)
+    checksum = sha256.hexdigest()
+    if ((sha1 is not None and sha1.hexdigest() != expected_sha1)
+            or (expected_sha256 is not None and checksum != expected_sha256)):
+        return None
+    return checksum
+
+
 def _fetch(url, path, expected_size, expected_sha1=None, expected_sha256=None):
     if type(expected_size) is not int or expected_size <= 0:
         raise ValueError('Dimensione attesa non valida')
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size == expected_size:
-        if (expected_sha1 is None or _hash(path, 'sha1') == expected_sha1) and (
-                expected_sha256 is None or _hash(path, 'sha256') == expected_sha256):
-            return _hash(path, 'sha256')
+        checksum = _verified_sha256(path, expected_sha1, expected_sha256)
+        if checksum is not None:
+            return checksum
     partial = path.with_name(path.name + '.part')
     partial_identity = partial.with_suffix('.part-source.json')
     if expected_sha256 is not None:
@@ -142,9 +157,8 @@ def _fetch(url, path, expected_size, expected_sha1=None, expected_sha256=None):
             write_json(partial_identity, identity)
     offset = partial.stat().st_size if partial.exists() else 0
     if offset == expected_size:
-        if (expected_sha1 is None or _hash(partial, 'sha1') == expected_sha1) and (
-                expected_sha256 is None or _hash(partial, 'sha256') == expected_sha256):
-            checksum = _hash(partial, 'sha256')
+        checksum = _verified_sha256(partial, expected_sha1, expected_sha256)
+        if checksum is not None:
             partial.replace(path)
             partial_identity.unlink(missing_ok=True)
             return checksum
@@ -173,11 +187,8 @@ def _fetch(url, path, expected_size, expected_sha1=None, expected_sha256=None):
                 output.write(block)
     if partial.stat().st_size != expected_size:
         raise ValueError(f'Download incompleto: {path.name}')
-    if expected_sha1 is not None and _hash(partial, 'sha1') != expected_sha1:
-        partial.unlink()
-        raise ValueError(f'Checksum Wikimedia errato: {path.name}')
-    checksum = _hash(partial, 'sha256')
-    if expected_sha256 is not None and checksum != expected_sha256:
+    checksum = _verified_sha256(partial, expected_sha1, expected_sha256)
+    if checksum is None:
         partial.unlink()
         raise ValueError(f'Checksum Wikimedia errato: {path.name}')
     partial.replace(path)

@@ -321,6 +321,22 @@ class DumpTests(unittest.TestCase):
                     _fetch('https://dumps.wikimedia.org/sample.sql.gz', path,
                            len(payload), checksum)
 
+    def test_fetch_reuse_verifies_both_digests_in_one_file_read(self):
+        from orphanwiki.dumps import _verified_sha256
+        payload = b'official synthetic content' * 100
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'content.xml.bz2'
+            path.write_bytes(payload)
+            sha1 = hashlib.sha1(payload).hexdigest()
+            sha256 = hashlib.sha256(payload).hexdigest()
+            with patch('orphanwiki.dumps._open', side_effect=AssertionError('network forbidden')), \
+                    patch('orphanwiki.dumps._verified_sha256', wraps=_verified_sha256) as verify:
+                self.assertEqual(_fetch('https://dumps.wikimedia.org/synthetic', path,
+                                        len(payload), sha1, sha256), sha256)
+                self.assertEqual(verify.call_count, 1)
+            self.assertIsNone(_verified_sha256(path, sha1, '0' * 64))
+            self.assertIsNone(_verified_sha256(path, '0' * 40, sha256))
+
     def test_manifest_uses_complete_edition_and_database_override(self):
         from orphanwiki.dumps import SQL_TABLES
         release = '20261001'
