@@ -177,6 +177,22 @@ class CategoryTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_large_connection_detail_preserves_exact_json_encoding(self):
+        evidence = [{'language': 'lmo', 'source_title': 'È' * (8 * 1024 * 1024),
+                     'target_title': 'B'}]
+        evidence.extend({'language': 'vec', 'source_title': f'Source {i}',
+                         'target_title': 'B'} for i in range(512))
+        detail = {'format': 'connections_v1', 'metadata': {'language': 'vec'},
+                  'pages': [{'page_id': 1, 'title': 'È'}],
+                  'link_candidates': {'1': {'status': 'compared', 'candidate_count': 1,
+                    'counterparts': [], 'candidates': [{'page_id': 2, 'title': 'B',
+                                                       'evidence': evidence}]}}}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'detail.json'
+            write_json(path, detail)
+            self.assertEqual(path.read_bytes(), json.dumps(
+                detail, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+
     def test_legacy_quality_summary_keeps_its_measure_identity(self):
         result = analyze(demo())
         result['metadata']['measures_rule'] = 'creation_quality_creators_v2'

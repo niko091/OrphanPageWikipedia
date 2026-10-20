@@ -774,6 +774,53 @@ def _json_chunks(value, ensure_ascii=False, sort_keys=False):
         yield ''.join(buffered)
 
 
+def _json_record_chunks(value, encoder):
+    """Use the C encoder for bounded leaves, streaming candidate and evidence lists."""
+    large_key = ('candidates' if isinstance(value, dict) and isinstance(value.get('candidates'), list)
+                 else 'evidence' if isinstance(value, dict) and isinstance(value.get('evidence'), list)
+                 else None)
+    if large_key is None:
+        yield encoder.encode(value)
+        return
+    yield '{'
+    for position, (key, item) in enumerate(value.items()):
+        if position:
+            yield ', '
+        yield encoder.encode(key)
+        yield ': '
+        if key == large_key:
+            yield '['
+            for index, record in enumerate(item):
+                if index:
+                    yield ', '
+                yield from _json_record_chunks(record, encoder)
+            yield ']'
+        else:
+            yield encoder.encode(item)
+    yield '}'
+
+
+def _detail_chunks(value, encoder):
+    yield '{'
+    for position, (key, item) in enumerate(value.items()):
+        if position:
+            yield ', '
+        yield encoder.encode(key)
+        yield ': '
+        if key == 'link_candidates':
+            yield '{'
+            for index, (identifier, record) in enumerate(item.items()):
+                if index:
+                    yield ', '
+                yield encoder.encode(identifier)
+                yield ': '
+                yield from _json_record_chunks(record, encoder)
+            yield '}'
+        else:
+            yield encoder.encode(item)
+    yield '}'
+
+
 def json_sha256(value):
     """Hash sorted JSON in bounded chunks without allocating the complete document."""
     digest = hashlib.sha256()
@@ -1166,8 +1213,13 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
     try:
         with temporary.open('w', encoding='utf-8') as stream:
             created = True
+            record_encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
             if not arrays and not embedded_paths and not mappings:
-                stream.writelines(_json_chunks(value))
+                if (isinstance(value, dict) and value.get('format') == 'connections_v1'
+                        and isinstance(value.get('link_candidates'), dict)):
+                    stream.writelines(_detail_chunks(value, record_encoder))
+                else:
+                    stream.writelines(_json_chunks(value))
             else:
                 arrays, embedded_paths, mappings = arrays or {}, embedded_paths or {}, mappings or {}
                 sections = list(arrays) + list(embedded_paths) + list(mappings)
@@ -1184,7 +1236,7 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
                         for index, record in enumerate(arrays[key]):
                             if index:
                                 stream.write(',')
-                            stream.writelines(_json_chunks(record))
+                            stream.writelines(_json_record_chunks(record, record_encoder))
                         stream.write(']')
                     elif key in mappings:
                         stream.write('{')
@@ -1197,7 +1249,7 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
                                 stream.write(',')
                             stream.writelines(_json_chunks(identifier))
                             stream.write(':')
-                            stream.writelines(_json_chunks(record))
+                            stream.writelines(_json_record_chunks(record, record_encoder))
                         stream.write('}')
                     elif key in embedded_paths:
                         # Only embed a completed checkpoint produced by this collector.
