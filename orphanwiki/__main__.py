@@ -21,6 +21,7 @@ from .core import (
     wiki_database,
     write_dashboard_exports,
     write_aggregate_summary,
+    write_summary_files,
     write_json,
 )
 
@@ -104,7 +105,22 @@ def comparison_filename(language, result, languages):
     return f'{language}-{release}-{digest}.json'
 
 
-def publish_available_aggregate(output_dir):
+def _matching_aggregate_report(report, metadata, sources, count):
+    if not isinstance(report, dict) or report.get('sources') != sources or report.get('count') != count:
+        return None
+    previous = report.get('metadata')
+    if not isinstance(previous, dict):
+        return None
+    if ({key: value for key, value in previous.items()
+         if key not in ('creators', 'history', 'comparison_coverage')}
+            != {key: value for key, value in metadata.items() if key != 'comparison_coverage'}):
+        return None
+    if not isinstance(report.get('reports'), str) or not isinstance(report.get('article_preview'), list):
+        return None
+    return {**{key: value for key, value in previous.items() if key != 'comparison_coverage'}, **metadata}
+
+
+def publish_available_aggregate(output_dir, prepared_report=None):
     """Index the latest complete dump export per language without reading article arrays.
 
     Independently analyzed editions remain in the aggregate, but their absent
@@ -193,7 +209,15 @@ def publish_available_aggregate(output_dir):
         reuse = prepared_summaries_match(prior_summary, prior_creators, index['metadata'],
                                          fingerprints, sum(source['page_count'] for source in sources))
         if not reuse:
-            write_aggregate_summary(sources, prepared / summary_name, index['metadata'])
+            reused_metadata = _matching_aggregate_report(
+                prepared_report, index['metadata'], fingerprints,
+                sum(source['page_count'] for source in sources))
+            if reused_metadata is None:
+                write_aggregate_summary(sources, prepared / summary_name, index['metadata'])
+            else:
+                write_summary_files(prepared / summary_name, prepared / creator_name,
+                                    reused_metadata, prepared_report['count'], prepared_report['reports'],
+                                    fingerprints, prepared_report['article_preview'])
         manifest = [entry for entry in manifest if entry.get('file') != filename]
         manifest.append({**manifest_entry(index, filename), 'summary_file': summary_name,
                          'creator_index_file': creator_name})
@@ -280,9 +304,10 @@ def publish_comparison(results, output_dir):
         write_json(prepared / filename, index)
         summary_name = filename.removesuffix('.json') + '-summary.json'
         creator_name = filename.removesuffix('.json') + '-creators.json'
-        write_aggregate_summary([{'language': member['language'], 'path': prepared / member['file'],
-                                  'page_count': member['page_count'], 'metadata': member['metadata']}
-                                 for member in index['members']], prepared / summary_name, index['metadata'])
+        aggregate_report = write_aggregate_summary(
+            [{'language': member['language'], 'path': prepared / member['file'],
+              'page_count': member['page_count'], 'metadata': member['metadata']}
+             for member in index['members']], prepared / summary_name, index['metadata'])
         manifest = [entry for entry in manifest if entry.get('file') != filename]
         manifest.append({**manifest_entry(index, filename), 'summary_file': summary_name,
                          'creator_index_file': creator_name})
@@ -292,7 +317,7 @@ def publish_comparison(results, output_dir):
         print(f"Esportate {len(result['pages'])} voci: {output_dir / files[language]}", flush=True)
     if all(result['metadata'].get('source', '').startswith('Wikimedia SQL dumps / ')
            for result in results.values()):
-        publish_available_aggregate(output_dir)
+        publish_available_aggregate(output_dir, aggregate_report)
 
 
 def main():

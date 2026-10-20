@@ -15,6 +15,8 @@ from orphanwiki._native import graph_details
 from orphanwiki.core import analyze, compare_files, compare_languages
 from orphanwiki.core import _comparison_schema, _StagedPages, _StagedCandidates
 from orphanwiki.__main__ import export_result
+from orphanwiki.__main__ import _matching_aggregate_report, publish_comparison, publish_available_aggregate
+from orphanwiki.core import write_aggregate_summary
 
 
 def fixture(language, links):
@@ -34,6 +36,46 @@ def failed_comparison_worker(*args):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_identical_available_aggregate_reuses_prepared_reports(self):
+        results = {}
+        for language in ('vec', 'lmo'):
+            result = analyze(fixture(language, {2: [1]}))
+            result['metadata'].update(demo=False, database=language + 'wiki',
+                                      source='Wikimedia SQL dumps / ' + language + 'wiki',
+                                      sql_release='20261001')
+            results[language] = result
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch('orphanwiki.__main__.write_aggregate_summary', wraps=write_aggregate_summary) as calculate:
+                publish_comparison(results, root)
+                self.assertEqual(calculate.call_count, 1)
+            manifest = json.loads((root / 'manifest.json').read_text())
+            aggregates = [entry for entry in manifest if entry.get('kind') == 'aggregate']
+            self.assertEqual(len(aggregates), 2)
+            full = next(entry for entry in aggregates if '-available-' not in entry['file'])
+            available = next(entry for entry in aggregates if '-available-' in entry['file'])
+            full_summary = json.loads((root / full['summary_file']).read_text())
+            available_summary = json.loads((root / available['summary_file']).read_text())
+            self.assertEqual(full_summary['reports'], available_summary['reports'])
+            self.assertEqual(full_summary['article_preview'], available_summary['article_preview'])
+            self.assertEqual(json.loads((root / full['creator_index_file']).read_text())['creators'],
+                             json.loads((root / available['creator_index_file']).read_text())['creators'])
+            members = [entry for entry in manifest if entry.get('language') in results]
+            sources = [{'language': entry['language'], 'path': root / entry['file'],
+                        'page_count': len(results[entry['language']]['pages']),
+                        'metadata': results[entry['language']]['metadata']}
+                       for entry in sorted(members, key=lambda item: item['language'])]
+            oracle = write_aggregate_summary(sources, root / 'oracle-summary.json', full_summary['metadata'])
+            self.assertEqual(json.loads(oracle['reports'])['categories'][:20], full_summary['reports']['categories'])
+            self.assertEqual(json.loads(oracle['reports'])['creators'],
+                             json.loads((root / available['creator_index_file']).read_text())['creators'])
+            changed_rule = {**available_summary['metadata'], 'measures_rule': 'different-definition'}
+            self.assertIsNone(_matching_aggregate_report(oracle, changed_rule, oracle['sources'], oracle['count']))
+            (root / next(entry['file'] for entry in manifest if entry.get('language') == 'vec')).touch()
+            with patch('orphanwiki.__main__.write_aggregate_summary', wraps=write_aggregate_summary) as calculate:
+                publish_available_aggregate(root)
+                self.assertTrue(any(len(call.args[0]) == 2 for call in calculate.call_args_list))
+
     def test_csv_staging_uses_scalar_candidates_without_decoding_evidence(self):
         with tempfile.TemporaryDirectory() as folder:
             db = sqlite3.connect(':memory:')

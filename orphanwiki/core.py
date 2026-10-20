@@ -1116,6 +1116,9 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
         raise ValueError('Il file del riepilogo deve terminare con -summary.json')
     write_summary_files(output, creators_output, metadata, total, report_json, sources,
                         [page for _, page in article_preview])
+    if aggregate:
+        return {'metadata': metadata, 'count': total, 'reports': report_json,
+                'sources': sources, 'article_preview': [page for _, page in article_preview]}
 
 
 def iter_export_sections(path):
