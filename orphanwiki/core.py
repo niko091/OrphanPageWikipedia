@@ -343,25 +343,40 @@ def _stage_comparison(connection, result):
              for target, source in matchable_edges(len(pages), mapping, incoming)))
 
 
-def _comparison_candidates(connection, language, page_id, item):
-    status = 'compared'
-    if connection.execute('SELECT 1 FROM ambiguous WHERE language=? AND item=?', (language, item)).fetchone():
-        status = 'ambiguous_item'
-    elif not connection.execute('SELECT 1 FROM items WHERE language=? AND item=?', (language, item)).fetchone():
-        status = 'missing_item'
-    candidates, counterparts = [], []
+def _comparison_prefetch(connection, language, orphans):
+    """Resolve item status and counterpart metadata for one bounded orphan block."""
+    ids = [page_id for page_id, _ in orphans]
+    placeholders = ','.join('?' for _ in ids)
+    records = {}
+    for pid, unique_id, ambiguous in connection.execute(f'''
+            SELECT p.id,i.id,a.item FROM pages p
+            LEFT JOIN items i ON i.language=p.language AND i.item=p.item
+            LEFT JOIN ambiguous a ON a.language=p.language AND a.item=p.item
+            WHERE p.language=? AND p.id IN ({placeholders})''', (language, *ids)):
+        records[pid] = ('ambiguous_item' if ambiguous is not None else
+                        'missing_item' if unique_id is None else 'compared', [])
+    for pid, other, counterpart_id, title, incoming, ambiguous in connection.execute(f'''
+            SELECT p.id,w.language,cp.id,cp.title,cp.incoming,a.item FROM pages p
+            JOIN items local ON local.language=p.language AND local.item=p.item
+            CROSS JOIN wikis w
+            LEFT JOIN items i ON i.language=w.language AND i.item=p.item
+            LEFT JOIN pages cp ON cp.language=i.language AND cp.id=i.id
+            LEFT JOIN ambiguous a ON a.language=w.language AND a.item=p.item
+            WHERE p.language=? AND p.id IN ({placeholders}) AND w.language!=?
+            ORDER BY p.id,w.language''', (language, *ids, language)):
+        if counterpart_id is None:
+            counterpart = {'language': other, 'status': 'ambiguous_item' if ambiguous else 'missing_counterpart'}
+        else:
+            counterpart = {'language': other, 'status': 'orphan' if incoming == 0 else 'non_orphan',
+                           'page_id': counterpart_id, 'title': title, 'in_degree': incoming}
+        records[pid][1].append(counterpart)
+    return records
+
+
+def _comparison_candidates(connection, language, page_id, item, prepared):
+    status, counterparts = prepared
+    candidates = []
     if status == 'compared':
-        for other, pid, title, incoming, ambiguous in connection.execute('''
-            SELECT w.language,p.id,p.title,p.incoming,a.item FROM wikis w
-            LEFT JOIN items i ON i.language=w.language AND i.item=?
-            LEFT JOIN pages p ON p.language=i.language AND p.id=i.id
-            LEFT JOIN ambiguous a ON a.language=w.language AND a.item=?
-            WHERE w.language!=? ORDER BY w.language''', (item, item, language)):
-            if pid is None:
-                counterparts.append({'language': other, 'status': 'ambiguous_item' if ambiguous else 'missing_counterpart'})
-            else:
-                counterparts.append({'language': other, 'status': 'orphan' if incoming == 0 else 'non_orphan',
-                                     'page_id': pid, 'title': title, 'in_degree': incoming})
         # Keep the target-edge lookup ahead of source-item joins for each orphan.
         edges = connection.execute('''
             SELECT lp.id,lp.title,lp.outgoing,bt.language,bp.id,bp.title,bt.id,bt.title
@@ -429,7 +444,7 @@ class _StagedCandidates(Mapping):
 
 
 def _finish_comparison(connection):
-    """Same indexed matching for file and in-memory callers; one orphan at a time."""
+    """Batch scalar lookups, retaining the indexed edge stream for each orphan."""
     # The edge stream is appended while each wiki is analyzed. Build its
     # lookup index once, after all inserts, to avoid random B-tree writes for
     # hundreds of millions of links in a large SQL collection.
@@ -450,14 +465,18 @@ def _finish_comparison(connection):
     for language, meta, count in wikis:
         processed = 0
         with connection:
-            for pid, item in connection.execute('SELECT id,item FROM pages WHERE language=? AND incoming=0 ORDER BY id', (language,)):
-                record = _comparison_candidates(connection, language, pid, item)
-                connection.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
-                                   (language, pid, record['status'], record['candidate_count'],
-                                    json.dumps(record, ensure_ascii=False)))
-                processed += 1
-                if processed % 1000 == 0:
-                    print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)
+            orphans = connection.execute('SELECT id,item FROM pages WHERE language=? AND incoming=0 ORDER BY id',
+                                         (language,))
+            while block := orphans.fetchmany(512):
+                prepared = _comparison_prefetch(connection, language, block)
+                for pid, item in block:
+                    record = _comparison_candidates(connection, language, pid, item, prepared[pid])
+                    connection.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
+                                       (language, pid, record['status'], record['candidate_count'],
+                                        json.dumps(record, ensure_ascii=False)))
+                    processed += 1
+                    if processed % 1000 == 0:
+                        print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)
         meta['comparison'] = {'rule': 'cross_language_incoming_v1', 'status': 'compared',
             'reference_languages': [other for other, _, _ in wikis if other != language],
             'collections': provenance, 'matching_source': 'local page_props.wikibase_item from SQL dumps',

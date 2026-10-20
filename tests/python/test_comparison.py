@@ -13,7 +13,8 @@ import sqlite3
 
 from orphanwiki._native import graph_details
 from orphanwiki.core import analyze, compare_files, compare_languages
-from orphanwiki.core import _comparison_schema, _StagedPages, _StagedCandidates
+from orphanwiki.core import (_comparison_analysis, _comparison_schema, _stage_comparison,
+                             _finish_comparison, _StagedPages, _StagedCandidates)
 from orphanwiki.__main__ import export_result
 from orphanwiki.__main__ import _matching_aggregate_report, publish_comparison, publish_available_aggregate
 from orphanwiki.core import write_aggregate_summary
@@ -36,6 +37,27 @@ def failed_comparison_worker(*args):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_scalar_counterparts_are_looked_up_per_orphan_block(self):
+        connection = sqlite3.connect(':memory:')
+        try:
+            _comparison_schema(connection)
+            for language in ('vec', 'lmo'):
+                raw = fixture(language, {})
+                raw['pages'] = [{'page_id': pid, 'title': f'{language}-{pid}',
+                                 'wikibase_item': f'Q{pid}', 'links': []}
+                                for pid in range(1, 514)]
+                _stage_comparison(connection, _comparison_analysis(raw, {}, None))
+            selects = []
+            connection.set_trace_callback(lambda statement: selects.append(statement)
+                                          if statement.lstrip().upper().startswith('SELECT') else None)
+            results = _finish_comparison(connection)
+            connection.set_trace_callback(None)
+            self.assertEqual(sum(len(result['link_candidates']) for result in results.values()), 1026)
+            self.assertLess(len(selects), 1300)
+            self.assertEqual(results['vec']['link_candidates']['513']['candidate_count'], 0)
+        finally:
+            connection.close()
+
     def test_identical_available_aggregate_reuses_prepared_reports(self):
         results = {}
         for language in ('vec', 'lmo'):
