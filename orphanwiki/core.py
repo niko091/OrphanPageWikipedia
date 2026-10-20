@@ -15,6 +15,23 @@ HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
 MEASURES_RULE = 'creation_quality_creators_v2'
 ARTICLE_PREVIEW_LIMIT = 25
 TOPIC_LOOKUP_SHARD_SIZE = 1024
+SUMMARY_FIELDS = (
+    'page_id', 'title', 'orphan', 'category', 'topic_status', 'topic_labels',
+    'page_created_at', 'age_days', 'length_bytes', 'quality_score', 'quality_status',
+    'out_degree', 'origin', 'creator_key', 'creator_account_type',
+    'creator_articles_created_total', 'creator_languages_created', 'creator_is_bot_now',
+    'creator_prior_edits_main', 'creator_prior_edits_other', 'creator_prior_articles',
+    'creator_tenure_days', 'creator_orphans_current', 'history_creator_key',
+    'creator_prior_edits_main_history', 'creator_prior_edits_other_history',
+    'creator_continuity_months_before_creation', 'creator_groups_at_creation_history',
+)
+
+
+def _summary_page(record, language=None):
+    page = {key: record[key] for key in SUMMARY_FIELDS if key in record}
+    if language is not None:
+        page['language'] = language
+    return page
 
 
 def prepared_summaries_match(summary_path, creators_path, metadata, sources, page_count=None):
@@ -863,7 +880,7 @@ def write_dashboard_exports(source, folder, expected=None):
                     topic_database.execute('INSERT INTO topics VALUES (?, ?, ?)',
                         (pid, record.get('topic_status'), json.dumps(record.get('topic_labels'), ensure_ascii=False)))
                     add_article_preview(article_preview, record)
-                    summary_batch.append(record)
+                    summary_batch.append(_summary_page(record))
                     if len(summary_batch) == 512:
                         summary.add_batch(json.dumps(summary_batch, ensure_ascii=False))
                         summary_batch.clear()
@@ -1006,7 +1023,7 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
             for section, _, record in events:
                 if section != 'pages':
                     break
-                page = {**record, 'language': member['language']} if aggregate else record
+                page = _summary_page(record, member['language'] if aggregate else None)
                 add_article_preview(article_preview, record, member['language'] if aggregate else None)
                 batch.append(page)
                 count += 1
