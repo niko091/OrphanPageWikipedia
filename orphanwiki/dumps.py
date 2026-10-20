@@ -864,8 +864,10 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
     """Scan the entire partition, bounding buffers and exact duplicate evidence.
 
     Batches bound Python memory independently of transaction size. The small
-    positive cache only suppresses identical creation triples already buffered
-    or inserted in this scan; eviction merely repeats an INSERT OR IGNORE.
+    positive cache suppresses recent identical creation evidence. Censuses
+    larger than the cache use an unindexed temporary table and a sorted
+    DISTINCT stream to insert each creation triple exactly once. Small
+    censuses retain direct insertion to avoid unnecessary temporary disk work.
     Completed partition identities retain the existing scientific definition.
     """
     if type(commit_rows) is not int or not 1 <= commit_rows <= 10_000_000:
@@ -885,17 +887,20 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
         connection.execute('DELETE FROM history_creation WHERE file=?', (name,))
     connection.execute('DELETE FROM history_imported WHERE file=? AND phase=?', (name, phase))
     connection.commit()
+    creation_scratch = phase == 'initial' and len(page_ids) > HISTORY_CREATION_CACHE
     batch, events, creations = [], [], set()
     recent_creations = OrderedDict()
     count = scanned = pending = commits = cache_hits = 0
+    scratch_rows = creation_rows = scratch_bytes = max_buffer = 0
     sqlite_seconds = 0.0
     started = reported = time.monotonic()
 
     def flush():
-        nonlocal count, pending, commits, sqlite_seconds
+        nonlocal count, pending, commits, sqlite_seconds, scratch_rows, creation_rows, max_buffer
         rows = len(batch) + len(events) + len(creations)
         if not rows:
             return
+        max_buffer = max(max_buffer, rows)
         before = time.monotonic()
         if batch:
             query = ('INSERT INTO history_initial VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
@@ -907,7 +912,14 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
             connection.executemany('INSERT INTO history_page_event VALUES(?,?,?,?)', events)
             events.clear()
         if creations:
-            connection.executemany('INSERT OR IGNORE INTO history_creation VALUES(?,?,?)', sorted(creations))
+            if creation_scratch:
+                connection.executemany('INSERT INTO history_creation_pending VALUES(?,?)',
+                                       ((pid, created) for _, pid, created in creations))
+                scratch_rows += len(creations)
+            else:
+                before_changes = connection.total_changes
+                connection.executemany('INSERT OR IGNORE INTO history_creation VALUES(?,?,?)', sorted(creations))
+                creation_rows += connection.total_changes - before_changes
             creations.clear()
         pending += rows
         if pending >= commit_rows:
@@ -926,56 +938,93 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
               f'{scanned:,} righe lette; {count + len(batch):,} righe utili; '
               f'{cache_hits:,} creazioni duplicate in cache; {commits:,} commit; '
               f'{elapsed:.1f}s, SQLite {sqlite_seconds:.1f}s; '
-              f'{scanned / max(elapsed, 0.001):,.0f} righe/s' + ('; COMPLETATO' if done else ''), flush=True)
+              f'{scanned / max(elapsed, 0.001):,.0f} righe/s' +
+              (f'; {creation_rows:,} creazioni finali; {scratch_rows:,} append scratch; '
+               f'{scratch_bytes:,} byte scratch SQLite; buffer massimo {max_buffer:,}'
+               if done and phase == 'initial' else '') + ('; COMPLETATO' if done else ''), flush=True)
         reported = now
 
-    print(f'MediaWiki History {database}: {name} {phase}, INIZIO scansione', flush=True)
-    for scanned, row in enumerate(_history_rows(path, database), 1):
-        # Check progress even when none of the scanned rows are retained.
-        if scanned % 10000 == 0:
-            progress()
-        if phase == 'initial':
-            page_id = int(row[28]) if row[28].isdecimal() else None
-            if page_id not in page_ids:
-                continue
-            if row[2] in ('page', 'revision') and row[37]:
-                evidence = (page_id, row[37])
-                if evidence in recent_creations:
-                    recent_creations.move_to_end(evidence)
-                    cache_hits += 1
-                else:
-                    recent_creations[evidence] = None
-                    if len(recent_creations) > HISTORY_CREATION_CACHE:
-                        recent_creations.popitem(last=False)
-                    creations.add((name, *evidence))
-            if row[2] == 'page' and row[3] in ('create', 'import', 'merge'):
-                events.append((name, page_id, row[3], row[4]))
-            elif row[2] == 'revision' and row[3] == 'create' and row[61] == '0':
-                if not row[60].isdecimal():
-                    raise ValueError(f'Revisione iniziale priva di ID: {page_id}')
-                user_id = int(row[6]) if row[6].isdecimal() else None
-                deleted = {part.strip() for part in row[63].split(',')}
-                batch.append((name, page_id, int(row[60]), row[4], user_id,
-                              int('user' in deleted or 'user_is_deleted' in deleted),
-                              row[12] or None, row[77] or None, row[23] or None,
-                              row[37] or None, row[38] or None,
-                              int(row[76] == 'true')))
-        elif row[2] == 'revision' and row[3] == 'create' and row[6].isdecimal():
-            user_id = int(row[6])
-            if user_id in user_ids and row[60].isdecimal():
-                historical_ns = row[31] or row[33]
-                if historical_ns.lstrip('-').isdecimal():
-                    batch.append((name, int(row[60]), user_id, row[4], int(historical_ns)))
-        if len(batch) >= 5000 or len(events) >= 5000 or len(creations) >= 5000:
-            flush()
-            progress()
-    flush()
-    before = time.monotonic()
-    connection.execute('INSERT INTO history_imported VALUES(?,?,?)', (name, phase, identity))
-    connection.commit()
-    commits += 1
-    sqlite_seconds += time.monotonic() - before
-    progress(done=True)
+    if creation_scratch:
+        connection.execute('CREATE TEMP TABLE history_creation_pending(page_id INTEGER NOT NULL, created TEXT NOT NULL)')
+    try:
+        print(f'MediaWiki History {database}: {name} {phase}, INIZIO scansione', flush=True)
+        for scanned, row in enumerate(_history_rows(path, database), 1):
+            # Check progress even when none of the scanned rows are retained.
+            if scanned % 10000 == 0:
+                progress()
+            if phase == 'initial':
+                page_id = int(row[28]) if row[28].isdecimal() else None
+                if page_id not in page_ids:
+                    continue
+                if row[2] in ('page', 'revision') and row[37]:
+                    evidence = (page_id, row[37])
+                    if evidence in recent_creations:
+                        recent_creations.move_to_end(evidence)
+                        cache_hits += 1
+                    else:
+                        recent_creations[evidence] = None
+                        if len(recent_creations) > HISTORY_CREATION_CACHE:
+                            recent_creations.popitem(last=False)
+                        creations.add((name, *evidence))
+                if row[2] == 'page' and row[3] in ('create', 'import', 'merge'):
+                    events.append((name, page_id, row[3], row[4]))
+                elif row[2] == 'revision' and row[3] == 'create' and row[61] == '0':
+                    if not row[60].isdecimal():
+                        raise ValueError(f'Revisione iniziale priva di ID: {page_id}')
+                    user_id = int(row[6]) if row[6].isdecimal() else None
+                    deleted = {part.strip() for part in row[63].split(',')}
+                    batch.append((name, page_id, int(row[60]), row[4], user_id,
+                                  int('user' in deleted or 'user_is_deleted' in deleted),
+                                  row[12] or None, row[77] or None, row[23] or None,
+                                  row[37] or None, row[38] or None,
+                                  int(row[76] == 'true')))
+            elif row[2] == 'revision' and row[3] == 'create' and row[6].isdecimal():
+                user_id = int(row[6])
+                if user_id in user_ids and row[60].isdecimal():
+                    historical_ns = row[31] or row[33]
+                    if historical_ns.lstrip('-').isdecimal():
+                        batch.append((name, int(row[60]), user_id, row[4], int(historical_ns)))
+            if len(batch) >= 5000 or len(events) >= 5000 or len(creations) >= 5000:
+                flush()
+                progress()
+        flush()
+        if creation_scratch:
+            print(f'MediaWiki History {database}: {name} initial, INIZIO merge creazioni', flush=True)
+            before = time.monotonic()
+            connection.execute('CREATE TEMP TABLE history_creation_ordered AS '
+                               'SELECT DISTINCT page_id,created FROM history_creation_pending '
+                               'ORDER BY page_id,created')
+            scratch_bytes = (connection.execute('PRAGMA temp.page_count').fetchone()[0]
+                             * connection.execute('PRAGMA temp.page_size').fetchone()[0])
+            connection.execute('DROP TABLE history_creation_pending')
+            sqlite_seconds += time.monotonic() - before
+            first = 1
+            while True:
+                before = time.monotonic()
+                inserted = connection.execute(
+                    'INSERT INTO history_creation SELECT ?,page_id,created FROM history_creation_ordered '
+                    'WHERE rowid>=? AND rowid<? ORDER BY rowid', (name, first, first + 5000)).rowcount
+                creation_rows += inserted
+                pending += inserted
+                if pending >= commit_rows:
+                    connection.commit()
+                    commits += 1
+                    pending = 0
+                sqlite_seconds += time.monotonic() - before
+                if inserted < 5000:
+                    break
+                first += 5000
+                progress()
+        before = time.monotonic()
+        connection.execute('INSERT INTO history_imported VALUES(?,?,?)', (name, phase, identity))
+        connection.commit()
+        commits += 1
+        sqlite_seconds += time.monotonic() - before
+        progress(done=True)
+    finally:
+        if creation_scratch:
+            connection.execute('DROP TABLE IF EXISTS history_creation_pending')
+            connection.execute('DROP TABLE IF EXISTS history_creation_ordered')
 
 
 def _history_records(connection, page_ids, database):

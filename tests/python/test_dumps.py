@@ -98,11 +98,17 @@ class DumpTests(unittest.TestCase):
         for commit_rows, cache_size in ((1, 2), (250000, 100000)):
             with self.subTest(commit_rows=commit_rows), closing(sqlite3.connect(':memory:')) as db:
                 _history_schema(db)
-                creation_inserts = []
-                db.set_trace_callback(lambda sql: creation_inserts.append(1)
-                                      if sql.startswith('INSERT OR IGNORE INTO history_creation') else None)
+                creation_inserts, scratch_inserts = [], []
+                def trace(sql):
+                    if sql.startswith(('INSERT INTO history_creation SELECT',
+                                       'INSERT OR IGNORE INTO history_creation VALUES')):
+                        creation_inserts.append(1)
+                    elif sql.startswith('INSERT INTO history_creation_pending VALUES'):
+                        scratch_inserts.append(1)
+                db.set_trace_callback(trace)
+                log = io.StringIO()
                 with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows()), \
-                        patch('orphanwiki.dumps.HISTORY_CREATION_CACHE', cache_size), redirect_stdout(io.StringIO()):
+                        patch('orphanwiki.dumps.HISTORY_CREATION_CACHE', cache_size), redirect_stdout(log):
                     _history_scan(db, 'partition', None, 'digest', 'initial', 'vecwiki',
                                   set(range(1, 6002)), commit_rows=commit_rows)
                 snapshot = {table: db.execute(f'SELECT * FROM {table} ORDER BY 1,2,3').fetchall()
@@ -114,10 +120,12 @@ class DumpTests(unittest.TestCase):
                 self.assertEqual(records[0]['creation_date_status'], 'ambiguous_history_creation')
                 self.assertEqual(records[1]['creator_attribution'], 'history_hidden_or_unregistered_creator')
                 self.assertEqual(records[2]['creation_date_status'], 'ambiguous_history_creation')
+                self.assertEqual(len(creation_inserts), 6003 if cache_size == 100000 else 2)
+                self.assertIn('6,003 creazioni finali', log.getvalue())
                 if cache_size == 100000:
-                    self.assertEqual(len(creation_inserts), 6003)
+                    self.assertEqual(len(scratch_inserts), 0)
                 else:
-                    self.assertGreater(len(creation_inserts), 6003)
+                    self.assertGreater(len(scratch_inserts), 6003)
                 with patch('orphanwiki.dumps._history_rows', side_effect=AssertionError('must reuse checkpoint')), \
                         redirect_stdout(io.StringIO()):
                     _history_scan(db, 'partition', None, 'digest', 'initial', 'vecwiki',
@@ -157,6 +165,55 @@ class DumpTests(unittest.TestCase):
                     if phase == 'initial':
                         self.assertEqual(db.execute('SELECT COUNT(*) FROM history_creation WHERE file="partial"').fetchone()[0], 6001)
 
+    def test_history_creation_merge_and_checkpoint_failure_retry_only_incomplete_partition(self):
+        from orphanwiki.dumps import _history_schema, _history_scan
+
+        class CheckpointConnection(sqlite3.Connection):
+            fail_checkpoint = False
+
+            def commit(self):
+                if self.fail_checkpoint and self.execute(
+                        "SELECT 1 FROM history_imported WHERE file='partial'").fetchone():
+                    raise sqlite3.OperationalError('synthetic checkpoint commit')
+                return super().commit()
+
+        def rows(limit):
+            for pid in range(1, limit + 1):
+                row = [''] * 78
+                row[0], row[2:5] = 'vecwiki', ['revision', 'create', '2020-01-01 00:00:00.0']
+                row[6], row[28], row[37], row[60], row[61] = '42', str(pid), row[4], str(pid), '0'
+                yield row
+
+        for failure in ('merge', 'checkpoint'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder, \
+                    patch('orphanwiki.dumps.HISTORY_CREATION_CACHE', 2):
+                path = Path(folder) / 'stage.sqlite'
+                with closing(sqlite3.connect(path, factory=CheckpointConnection)) as db, redirect_stdout(io.StringIO()):
+                    _history_schema(db)
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(2)):
+                        _history_scan(db, 'complete', None, 'old', 'initial', 'vecwiki', {1, 2})
+                    if failure == 'merge':
+                        db.execute("""CREATE TEMP TRIGGER fail_merge BEFORE INSERT ON history_creation
+                                      WHEN NEW.file='partial' AND NEW.page_id>5000
+                                      BEGIN SELECT RAISE(ABORT,'synthetic final merge'); END""")
+                    else:
+                        db.fail_checkpoint = True
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(6001)), \
+                            self.assertRaisesRegex(sqlite3.Error, 'synthetic'):
+                        _history_scan(db, 'partial', None, 'new', 'initial', 'vecwiki',
+                                      set(range(1, 6002)), commit_rows=1)
+                    self.assertIsNone(db.execute("SELECT 1 FROM sqlite_temp_master WHERE name IN ('history_creation_pending','history_creation_ordered')").fetchone())
+                with closing(sqlite3.connect(path)) as db, redirect_stdout(io.StringIO()):
+                    self.assertIsNone(db.execute("SELECT 1 FROM history_imported WHERE file='partial'").fetchone())
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM history_creation WHERE file='partial'").fetchone()[0],
+                                     5000 if failure == 'merge' else 6001)
+                    with patch('orphanwiki.dumps._history_rows', side_effect=lambda *args: rows(6001)):
+                        _history_scan(db, 'partial', None, 'new', 'initial', 'vecwiki',
+                                      set(range(1, 6002)), commit_rows=250000)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM history_creation WHERE file='partial'").fetchone()[0], 6001)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM history_creation WHERE file='complete'").fetchone()[0], 2)
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM history_imported').fetchone()[0], 2)
+
     def test_history_progress_includes_scanned_rows_even_when_none_are_retained(self):
         from orphanwiki.dumps import _history_schema, _history_scan
         with closing(sqlite3.connect(':memory:')) as db:
@@ -165,7 +222,7 @@ class DumpTests(unittest.TestCase):
             row[28] = '999'
             log = io.StringIO()
             with patch('orphanwiki.dumps._history_rows', return_value=iter([row] * 10000)), \
-                    patch('orphanwiki.dumps.time.monotonic', side_effect=(0, 31, 32, 33, 34)), redirect_stdout(log):
+                    patch('orphanwiki.dumps.time.monotonic', side_effect=range(0, 10000, 31)), redirect_stdout(log):
                 _history_scan(db, 'empty', None, 'digest', 'initial', 'vecwiki', {1})
             messages = log.getvalue().splitlines()
             self.assertTrue(any('10,000 righe lette; 0 righe utili' in message and 'COMPLETATO' not in message
