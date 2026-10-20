@@ -383,6 +383,8 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
             with db:
                 db.execute('DELETE FROM quality_pages WHERE file=?', (name,))
             batch = []
+            xml_batch = []
+            xml_bytes = 0
             def flush():
                 rows = [r[3] for r in batch]
                 values = quality_transforms([r or [0] * 6 for r in rows])
@@ -391,11 +393,29 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
                         ((pid, rid, name, json.dumps(features) if features is not None else None, *x)
                          for (pid, rid, _, features), x in zip(batch, values)))
                 batch.clear()
+            def flush_xml():
+                nonlocal xml_bytes
+                if not xml_batch:
+                    return
+                identifiers = [record[0] for record in xml_batch]
+                selected = {row[0] for row in db.execute(
+                    f'SELECT id FROM quality_census WHERE id IN ({",".join("?" for _ in identifiers)})',
+                    identifiers)}
+                for pid, rid, text, namespaces in xml_batch:
+                    if pid in selected:
+                        batch.append((pid, rid, name, quality_features(
+                            text, graph['language'], spec, namespaces) if text is not None else None))
+                        if len(batch) == 512:
+                            flush()
+                xml_batch.clear()
+                xml_bytes = 0
             for pid, ns, redirect, rid, text, namespaces in _content_pages(path, database):
-                if ns == 0 and not redirect and db.execute('SELECT 1 FROM quality_census WHERE id=?', (pid,)).fetchone():
-                    batch.append((pid, rid, name, quality_features(text, graph['language'], spec, namespaces) if text is not None else None))
-                    if len(batch) == 512:
-                        flush()
+                if ns == 0 and not redirect:
+                    xml_batch.append((pid, rid, text, namespaces))
+                    xml_bytes += len(text.encode('utf-8')) if text is not None else 0
+                    if len(xml_batch) == 512 or xml_bytes >= 8 * 1024 * 1024:
+                        flush_xml()
+            flush_xml()
             if batch:
                 flush()
             if (path.stat().st_size, path.stat().st_mtime_ns) != (info.st_size, info.st_mtime_ns):
@@ -1736,6 +1756,8 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
                         next_history = next(history_cursor, None)
                         topic_cursor = iter(history_db.execute('SELECT id,data FROM topics ORDER BY id')) if topic_path else iter(())
                         next_topic = next(topic_cursor, None)
+                        quality_cursor = iter(history_db.execute('SELECT id,data FROM quality ORDER BY id')) if quality_path else iter(())
+                        next_quality = next(quality_cursor, None)
                         index = 0
                         for batch in _stage_page_batches(source, 512, include_links=False):
                             formatted = format_choices(
@@ -1763,8 +1785,10 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
                                                     topic_status=prediction['topic_status'],
                                                     topic_input_count=prediction['topic_input_count'])
                                 if quality_path:
-                                    quality_record = history_db.execute('SELECT data FROM quality WHERE id=?', (pid,)).fetchone()
-                                    _join_quality_rows([rows[-1]], {pid: json.loads(quality_record[0])} if quality_record else {})
+                                    quality_records, next_quality = _next_for_page(quality_cursor, next_quality, pid)
+                                    if len(quality_records) != 1:
+                                        raise ValueError('Qualità mancante o duplicata per la voce')
+                                    _join_quality_rows([rows[-1]], {pid: json.loads(quality_records[0])})
                                 index += 1
                             initialize_creator_rows(rows)
                             _join_history_rows(rows, by_id,
@@ -1778,7 +1802,7 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
                                 if after:
                                     row['creation_date_status'] = 'after_graph_collection'
                                 yield row
-                        if index != expected or next_history is not None or next_topic is not None:
+                        if index != expected or next_history is not None or next_topic is not None or next_quality is not None:
                             raise ValueError('Esportazione, cronologia o temi incompleti')
 
                 metadata = {**graph_meta, 'creators': creator_meta, 'history': history_meta,
