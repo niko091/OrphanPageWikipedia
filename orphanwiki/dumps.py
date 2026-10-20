@@ -1344,7 +1344,8 @@ def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
             db.execute('PRAGMA temp_store=FILE')
             db.execute('PRAGMA cache_size=-8192')
             db.executescript('''CREATE TABLE pages(language TEXT,id INTEGER,position INTEGER,data TEXT,
-                PRIMARY KEY(language,id)); CREATE TABLE candidates(language TEXT,id TEXT,data TEXT,
+                PRIMARY KEY(language,id)); CREATE TABLE candidates(language TEXT,id TEXT,status TEXT,
+                candidate_count INTEGER,data TEXT,
                 PRIMARY KEY(language,id));''')
             count = 0
             with db:
@@ -1354,8 +1355,9 @@ def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
                                    (graph['language'], record['page_id'], count, json.dumps(record)))
                         count += 1
                     elif section == 'link_candidates':
-                        db.execute('INSERT INTO candidates VALUES(?,?,?)',
-                                   (graph['language'], identifier, json.dumps(record)))
+                        db.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
+                                   (graph['language'], identifier, record.get('status'),
+                                    record.get('candidate_count'), json.dumps(record)))
             if not count:
                 raise ValueError('Censimento export vuoto')
             history_meta = _history_stage(history_path, db, graph, count)

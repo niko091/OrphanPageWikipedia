@@ -1,5 +1,6 @@
 from fixtures import graph_reference
 import copy
+import csv
 import json
 import os
 import random
@@ -8,9 +9,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+import sqlite3
 
 from orphanwiki._native import graph_details
 from orphanwiki.core import analyze, compare_files, compare_languages
+from orphanwiki.core import _comparison_schema, _StagedPages, _StagedCandidates
+from orphanwiki.__main__ import export_result
 
 
 def fixture(language, links):
@@ -30,6 +34,33 @@ def failed_comparison_worker(*args):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_csv_staging_uses_scalar_candidates_without_decoding_evidence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = sqlite3.connect(':memory:')
+            try:
+                _comparison_schema(db)
+                pages = [{'page_id': 3, 'title': 'Third'}, {'page_id': 1, 'title': 'First'},
+                         {'page_id': 2, 'title': 'Second'}]
+                db.executemany('INSERT INTO pages VALUES(?,?,?,?,?,?,?,?)',
+                               (('vec', p['page_id'], pos, None, p['title'], 0, 0, json.dumps(p))
+                                for pos, p in enumerate(pages)))
+                records = [(1, 'compared', 0), (3, 'missing_item', None)]
+                db.executemany('INSERT INTO candidates VALUES(?,?,?,?,?)',
+                               (('vec', pid, status, count, '{invalid evidence JSON}')
+                                for pid, status, count in records))
+                result = {'metadata': {'language': 'vec'}, 'pages': _StagedPages(db, 'vec', 3),
+                          'link_candidates': _StagedCandidates(db, 'vec')}
+                output = Path(folder) / 'rows.json'
+                with patch('orphanwiki.__main__.write_json'), \
+                        patch('orphanwiki.__main__.write_dashboard_exports', return_value={}):
+                    export_result(result, output, update_manifest=False, announce=False)
+                with output.with_suffix('.csv').open(newline='', encoding='utf-8') as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual([(r['page_id'], r['candidate_status'], r['candidate_count']) for r in rows],
+                                 [('3', 'missing_item', ''), ('1', 'compared', '0'), ('2', '', '')])
+            finally:
+                db.close()
+
     def test_abrupt_worker_death_is_reported_and_staging_is_cleaned(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

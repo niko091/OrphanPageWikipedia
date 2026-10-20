@@ -275,7 +275,7 @@ def _comparison_schema(connection):
         CREATE INDEX items_by_item ON items(item,language,id);
         CREATE TABLE ambiguous(language TEXT, item TEXT, PRIMARY KEY(language,item)) WITHOUT ROWID;
         CREATE TABLE edges(language TEXT, target INTEGER, source INTEGER);
-        CREATE TABLE candidates(language TEXT, id INTEGER, data TEXT,
+        CREATE TABLE candidates(language TEXT, id INTEGER, status TEXT, candidate_count INTEGER, data TEXT,
             PRIMARY KEY(language,id)) WITHOUT ROWID;''')
 
 
@@ -375,6 +375,15 @@ class _StagedPages:
         for row in self.connection.execute('SELECT data FROM pages WHERE language=? ORDER BY position', (self.language,)):
             yield json.loads(row[0])
 
+    def csv_rows(self, candidates):
+        if candidates.connection is not self.connection or candidates.language != self.language:
+            raise ValueError('Staging CSV e candidati non corrispondenti')
+        for encoded, status, count in self.connection.execute('''
+                SELECT p.data,c.status,c.candidate_count FROM pages p
+                LEFT JOIN candidates c ON c.language=p.language AND c.id=p.id
+                WHERE p.language=? ORDER BY p.position''', (self.language,)):
+            yield json.loads(encoded), {'status': status, 'candidate_count': count}
+
 
 class _StagedCandidates(Mapping):
     def __init__(self, connection, language):
@@ -422,7 +431,9 @@ def _finish_comparison(connection):
         with connection:
             for pid, item in connection.execute('SELECT id,item FROM pages WHERE language=? AND incoming=0 ORDER BY id', (language,)):
                 record = _comparison_candidates(connection, language, pid, item)
-                connection.execute('INSERT INTO candidates VALUES(?,?,?)', (language, pid, json.dumps(record, ensure_ascii=False)))
+                connection.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
+                                   (language, pid, record['status'], record['candidate_count'],
+                                    json.dumps(record, ensure_ascii=False)))
                 processed += 1
                 if processed % 1000 == 0:
                     print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)

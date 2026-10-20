@@ -46,8 +46,11 @@ def export_result(result, output, update_manifest=True, announce=True):
                    'import_log_observed', 'move_log_observed', 'creator_orphans_at_30_days_status', 'quality_score', 'quality_status']
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
-        for page in result['pages']:
-            candidates = result.get('link_candidates', {}).get(str(page['page_id']), {})
+        pages = result['pages']
+        candidate_map = result.get('link_candidates', {})
+        rows = (pages.csv_rows(candidate_map) if hasattr(pages, 'csv_rows') else
+                ((page, candidate_map.get(str(page['page_id']), {})) for page in pages))
+        for page, candidates in rows:
             writer.writerow({**page, 'candidate_count': candidates.get('candidate_count'),
                              'candidate_status': candidates.get('status')})
     transports = write_dashboard_exports(output, output.parent)
