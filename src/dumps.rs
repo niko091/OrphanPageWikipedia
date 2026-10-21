@@ -2143,31 +2143,34 @@ fn write_csv_row<'a>(
     Ok(())
 }
 
-/// Prepare the exact CSV projection of a complete ordered canonical export.
-/// The caller approves the canonical source; this function does not publish
-/// browser transports or a manifest. A private disk-backed SQLite join keeps
-/// page order and candidate summaries without retaining a census/evidence map
-/// in RAM. Errors preserve the previous CSV and never rewrite the source.
 #[cfg(feature = "cli")]
-pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpResult<usize> {
+struct CanonicalExport {
+    database: rusqlite::Connection,
+    metadata: serde_json::Value,
+    signature: (u64, i64),
+    count: usize,
+}
+
+#[cfg(feature = "cli")]
+fn stage_export(source: &std::path::Path) -> DumpResult<CanonicalExport> {
     use rusqlite::params;
-    use serde_json::{json, Value};
-    use std::io::{BufReader, BufWriter, Write};
-    if resolved_path(source)? == resolved_path(output)? {
-        return Err("Il CSV deve essere distinto dal dataset originale".into());
-    }
+    use serde_json::Value;
+    use std::io::BufReader;
     let signature = file_signature(source)?;
     let mut database = rusqlite::Connection::open("")?;
     database.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE")?;
     let transaction = database.transaction()?;
     transaction.execute_batch(
         "CREATE TABLE pages(id INTEGER PRIMARY KEY,position INTEGER NOT NULL UNIQUE,orphan INTEGER NOT NULL,data TEXT NOT NULL);
-         CREATE TABLE candidates(id INTEGER PRIMARY KEY,status TEXT,count INTEGER)",
+         CREATE TABLE candidates(id INTEGER PRIMARY KEY,status TEXT,count INTEGER,position INTEGER NOT NULL UNIQUE,data TEXT NOT NULL)",
     )?;
     let mut count = 0usize;
+    let mut candidate_count = 0i64;
+    let mut metadata = None;
     {
         let mut insert_page = transaction.prepare("INSERT INTO pages VALUES(?,?,?,?)")?;
-        let mut insert_candidates = transaction.prepare("INSERT INTO candidates VALUES(?,?,?)")?;
+        let mut insert_candidates =
+            transaction.prepare("INSERT INTO candidates VALUES(?,?,?,?,?)")?;
         let mut is_orphan = transaction.prepare("SELECT orphan FROM pages WHERE id=?")?;
         visit_ordered_json(
             BufReader::with_capacity(65536, std::fs::File::open(source)?),
@@ -2182,6 +2185,7 @@ pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpRes
                             record["language"].as_str().ok_or("Lingua mancante")?,
                             None,
                         )?;
+                        metadata = Some(record);
                     }
                     "pages" => {
                         let id = record["page_id"]
@@ -2226,9 +2230,16 @@ pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpRes
                                     .ok_or("Conteggio candidate non valido")?,
                             ),
                         };
-                        insert_candidates.execute(params![id, status, number])?;
+                        insert_candidates.execute(params![
+                            id,
+                            status,
+                            number,
+                            candidate_count,
+                            serde_json::to_string(&record)?
+                        ])?;
+                        candidate_count += 1;
                     }
-                    _ => return Err("Sezione CSV inattesa".into()),
+                    _ => return Err("Sezione export inattesa".into()),
                 }
                 Ok(())
             },
@@ -2238,12 +2249,33 @@ pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpRes
     if file_signature(source)? != signature {
         return Err("Esportazione modificata durante la lettura".into());
     }
+    Ok(CanonicalExport {
+        database,
+        metadata: metadata.ok_or("Metadati mancanti")?,
+        signature,
+        count,
+    })
+}
+
+/// Prepare the exact CSV projection of a complete ordered canonical export.
+/// The caller approves the canonical source; this function does not publish
+/// browser transports or a manifest. A private disk-backed SQLite join keeps
+/// page order and candidate summaries without retaining a census/evidence map
+/// in RAM. Errors preserve the previous CSV and never rewrite the source.
+#[cfg(feature = "cli")]
+pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpResult<usize> {
+    use serde_json::{json, Value};
+    use std::io::{BufWriter, Write};
+    if resolved_path(source)? == resolved_path(output)? {
+        return Err("Il CSV deve essere distinto dal dataset originale".into());
+    }
+    let staged = stage_export(source)?;
     let nonprintable = regex::Regex::new(r"[\p{C}\p{Z}]")?;
     write_atomic(output, |file| {
         let mut writer = BufWriter::with_capacity(65536, file);
         writer.write_all(CSV_COLUMNS.join(",").as_bytes())?;
         writer.write_all(b"\r\n")?;
-        let mut query = database.prepare("SELECT p.data,c.status,c.count FROM pages p LEFT JOIN candidates c ON c.id=p.id ORDER BY p.position")?;
+        let mut query = staged.database.prepare("SELECT p.data,c.status,c.count FROM pages p LEFT JOIN candidates c ON c.id=p.id ORDER BY p.position")?;
         let mut rows = query.query([])?;
         while let Some(row) = rows.next()? {
             let page: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
@@ -2260,12 +2292,364 @@ pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpRes
             )?;
         }
         writer.flush()?;
-        if file_signature(source)? != signature {
+        if file_signature(source)? != staged.signature {
             return Err("Esportazione modificata durante il CSV".into());
         }
         Ok(())
     })?;
-    Ok(count)
+    Ok(staged.count)
+}
+
+/// Complete display projection; column order is the observations_v1 contract.
+#[cfg(feature = "cli")]
+pub const OBSERVATION_COLUMNS: &[&str] = &[
+    "page_id",
+    "title",
+    "category",
+    "category_status",
+    "orphan",
+    "in_degree",
+    "out_degree",
+    "created_at",
+    "age_days",
+    "history_first_revision_age_days",
+    "length_bytes",
+    "origin",
+    "creator_key",
+    "creator_data_status",
+    "creator_account_type",
+    "creator_tenure_days",
+    "creator_prior_edits_main",
+    "creator_prior_edits_other",
+    "creator_prior_articles",
+    "creator_articles_created_total",
+    "creator_articles_in_census",
+    "creator_orphans_current",
+    "creator_orphans_current_share",
+    "creator_orphans_at_30_days",
+    "creator_attribution",
+    "creator_registered_at",
+    "creator_tenure_status",
+    "creator_experience_status",
+    "topic_labels",
+    "topic_status",
+    "topic_input_count",
+    "wikibase_item",
+    "page_created_at",
+    "first_public_revision_at",
+    "history_first_revision_at",
+    "creation_date_source",
+    "creation_date_status",
+    "creator_account_type_at_creation",
+    "creator_is_bot_now",
+    "creator_languages_created",
+    "creator_languages_before",
+    "creation_tags",
+    "import_log_observed",
+    "move_log_observed",
+    "creator_orphans_at_30_days_status",
+    "history_creator_key",
+    "history_creator_status",
+    "history_data_status",
+    "creator_groups_at_creation_history",
+    "creator_continuity_months_before_creation",
+    "creator_continuity_bucket_before_creation",
+    "creator_prior_edits_main_history",
+    "creator_prior_edits_other_history",
+    "quality_score",
+    "quality_status",
+    "content_revision_id",
+    "quality_revision_relation",
+];
+
+#[cfg(feature = "cli")]
+pub const ARTICLE_INDEX_COLUMNS: &[&str] = &[
+    "page_id",
+    "title",
+    "orphan",
+    "category",
+    "topic_status",
+    "topic_labels",
+    "length_bytes",
+    "created_at",
+    "in_degree",
+];
+
+#[cfg(feature = "cli")]
+const TRANSPORT_RULE: &str = "dashboard_transports_v3";
+
+#[cfg(feature = "cli")]
+struct PreparedDirectory {
+    path: std::path::PathBuf,
+    complete: bool,
+}
+
+#[cfg(feature = "cli")]
+impl PreparedDirectory {
+    fn new(path: &std::path::Path) -> DumpResult<Self> {
+        std::fs::create_dir_all(
+            path.parent()
+                .ok_or("Directory di preparazione non valida")?,
+        )?;
+        // Never adopt or remove a preexisting directory, including empty ones.
+        std::fs::create_dir(path)?;
+        Ok(Self {
+            path: path.into(),
+            complete: false,
+        })
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for PreparedDirectory {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+fn write_browser_projection(
+    path: &std::path::Path,
+    staged: &CanonicalExport,
+    format: &str,
+    columns: &[&str],
+    include_count: bool,
+) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::io::{BufWriter, Write};
+    write_atomic(path, |file| {
+        let mut writer = BufWriter::with_capacity(65536, file);
+        writer.write_all(b"{\"format\":")?;
+        serde_json::to_writer(&mut writer, format)?;
+        writer.write_all(b",\"metadata\":")?;
+        serde_json::to_writer(&mut writer, &staged.metadata)?;
+        if include_count {
+            writer.write_all(format!(",\"census_page_count\":{}", staged.count).as_bytes())?;
+        }
+        writer.write_all(b",\"columns\":")?;
+        serde_json::to_writer(&mut writer, columns)?;
+        writer.write_all(b",\"rows\":[")?;
+        let mut pages = staged
+            .database
+            .prepare("SELECT data FROM pages ORDER BY position")?;
+        let mut rows = pages.query([])?;
+        let mut position = 0;
+        while let Some(row) = rows.next()? {
+            let page: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if position != 0 {
+                writer.write_all(b",")?;
+            }
+            let projected = columns.iter().map(|key| &page[key]).collect::<Vec<_>>();
+            serde_json::to_writer(&mut writer, &projected)?;
+            position += 1;
+        }
+        if position != staged.count {
+            return Err("Proiezione del censimento incompleta".into());
+        }
+        writer.write_all(b"],\"link_candidates\":{")?;
+        let mut query = staged
+            .database
+            .prepare("SELECT id,status,count FROM candidates ORDER BY position")?;
+        let mut rows = query.query([])?;
+        let mut first = true;
+        while let Some(row) = rows.next()? {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut writer, &row.get::<_, i64>(0)?.to_string())?;
+            writer.write_all(b":")?;
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "status":row.get::<_, Option<String>>(1)?,
+                    "candidate_count":row.get::<_, Option<i64>>(2)?
+                }),
+            )?;
+        }
+        writer.write_all(b"}}")?;
+        writer.flush()?;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "cli")]
+fn write_profile_topics(directory: &std::path::Path, staged: &CanonicalExport) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::io::{BufWriter, Write};
+    std::fs::create_dir(directory)?;
+    let mut query = staged
+        .database
+        .prepare("SELECT id,data FROM pages ORDER BY id")?;
+    let mut records = query.query([])?;
+    let mut bucket = None;
+    let mut rows = Vec::new();
+    let write_shard = |bucket: Option<i64>, rows: &[Value]| -> DumpResult<()> {
+        if let Some(bucket) = bucket {
+            #[derive(serde::Serialize)]
+            struct Shard<'a> {
+                format: &'static str,
+                metadata: &'a Value,
+                bucket: i64,
+                rows: &'a [Value],
+            }
+            write_atomic(&directory.join(format!("{bucket}.json")), |file| {
+                let mut writer = BufWriter::with_capacity(65536, file);
+                serde_json::to_writer(
+                    &mut writer,
+                    &Shard {
+                        format: "profile_topics_shard_v1",
+                        metadata: &staged.metadata,
+                        bucket,
+                        rows,
+                    },
+                )?;
+                writer.flush()?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    };
+    while let Some(record) = records.next()? {
+        let id = record.get::<_, i64>(0)?;
+        let next = Some(id / 1024);
+        if next != bucket {
+            write_shard(bucket, &rows)?;
+            rows.clear();
+            bucket = next;
+        }
+        let page: Value = serde_json::from_str(&record.get::<_, String>(1)?)?;
+        rows.push(json!([id, page["topic_status"], page["topic_labels"]]));
+    }
+    write_shard(bucket, &rows)?;
+    write_atomic(&directory.join("index.json"), |file| {
+        let mut writer = BufWriter::with_capacity(65536, file);
+        writer.write_all(b"{\"format\":\"profile_topics_index_v1\",\"metadata\":")?;
+        serde_json::to_writer(&mut writer, &staged.metadata)?;
+        writer.write_all(
+            format!(
+                ",\"census_page_count\":{},\"shard_size\":1024,\"shards\":[",
+                staged.count
+            )
+            .as_bytes(),
+        )?;
+        let mut query = staged
+            .database
+            .prepare("SELECT DISTINCT id/1024 AS bucket FROM pages ORDER BY bucket")?;
+        let mut rows = query.query([])?;
+        let mut first = true;
+        while let Some(row) = rows.next()? {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut writer, &row.get::<_, i64>(0)?)?;
+        }
+        writer.write_all(b"]}")?;
+        writer.flush()?;
+        Ok(())
+    })
+}
+
+/// Prepare complete observation/article indices and profile-topic shards in a
+/// NEW private directory. These are partial export-stage products, not an
+/// approved publication: summaries, editorial transports and the manifest are
+/// prepared by subsequent stages. On error only the owned directory is removed.
+/// Source stat fingerprints and generation names follow the Python transport
+/// contract; previous generations and the canonical source are never rewritten.
+#[cfg(feature = "cli")]
+pub fn prepare_browser_indices(
+    source: &std::path::Path,
+    folder: &std::path::Path,
+    expected: Option<&serde_json::Value>,
+    transport_generation: Option<&str>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::json;
+    if folder.try_exists()? || resolved_path(source)?.starts_with(resolved_path(folder)?) {
+        return Err("Serve una nuova directory privata distinta dal dataset".into());
+    }
+    if transport_generation.is_some_and(|generation| {
+        generation.len() != 32
+            || !generation
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err("Generazione dei trasporti non valida".into());
+    }
+    let staged = stage_export(source)?;
+    let metadata = &staged.metadata;
+    let demo = |value: &serde_json::Value| -> DumpResult<bool> {
+        match value.get("demo") {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(value)) => Ok(*value),
+            _ => Err("Indicatore demo non valido".into()),
+        }
+    };
+    if let Some(expected) = expected {
+        if metadata["language"] != expected["language"]
+            || metadata["finished_at"] != expected["date"]
+            || demo(metadata)? != demo(expected)?
+        {
+            return Err("Manifest e raccolta non corrispondenti".into());
+        }
+    }
+    let fingerprint = canonical_json_sha256(&json!([
+        TRANSPORT_RULE,
+        metadata,
+        staged.signature.0,
+        staged.signature.1
+    ]))?;
+    let generation = transport_generation.unwrap_or(&fingerprint[..12]);
+    let stem = format!(
+        "{}-{generation}",
+        source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("Nome del dataset non valido")?
+    );
+    let names = json!({
+        "observations_file":format!("{stem}-observations.json"),
+        "articles_file":format!("{stem}-articles.json"),
+        "profile_topics_dir":format!("{stem}-profile-topics")
+    });
+    let mut prepared = PreparedDirectory::new(folder)?;
+    for (key, format, columns, count) in [
+        (
+            "observations_file",
+            "observations_v1",
+            OBSERVATION_COLUMNS,
+            false,
+        ),
+        (
+            "articles_file",
+            "article_index_v1",
+            ARTICLE_INDEX_COLUMNS,
+            true,
+        ),
+    ] {
+        write_browser_projection(
+            &folder.join(names[key].as_str().ok_or("Nome indice mancante")?),
+            &staged,
+            format,
+            columns,
+            count,
+        )?;
+    }
+    write_profile_topics(
+        &folder.join(
+            names["profile_topics_dir"]
+                .as_str()
+                .ok_or("Directory temi mancante")?,
+        ),
+        &staged,
+    )?;
+    if file_signature(source)? != staged.signature {
+        return Err("Esportazione modificata durante la conversione".into());
+    }
+    prepared.complete = true;
+    Ok(names)
 }
 
 /// The table and scientific validation rules for a complete SQL supplement.

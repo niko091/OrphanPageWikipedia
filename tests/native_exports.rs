@@ -1,5 +1,7 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{export_csv, CSV_COLUMNS};
+use _native::dumps::{
+    export_csv, prepare_browser_indices, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
+};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -235,6 +237,9 @@ fn malformed_sections_and_duplicate_or_foreign_ids_preserve_the_approved_csv() {
         fs::write(&source, &text).unwrap();
         fs::write(&output, "approved").unwrap();
         assert!(export_csv(&source, &output).is_err(), "accepted {text}");
+        let prepared = w.0.join("prepared");
+        assert!(prepare_browser_indices(&source, &prepared, None, None).is_err());
+        assert!(!prepared.exists());
         assert_eq!(fs::read_to_string(&output).unwrap(), "approved");
         assert_eq!(fs::read_to_string(&source).unwrap(), text);
         w.assert_files(&["canonical.json", "result.csv"]);
@@ -323,4 +328,248 @@ fn an_output_symlink_cannot_replace_the_canonical_source() {
     assert!(export_csv(&source, &alias).is_err());
     assert_eq!(fs::read(&source).unwrap(), before);
     assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+}
+
+fn read_json(path: impl AsRef<std::path::Path>) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn browser_indices_keep_every_display_value_candidate_count_and_topic_lookup() {
+    let w = Workspace::new();
+    let pages = (1..=2103).rev().map(|id| json!({
+        "page_id":id,"title":format!("È 🌙 {id}"),"orphan":id%3!=0,
+        "category":if id%4==0 {Some("Specific")} else {None},
+        "created_at":null,"page_created_at":null,"age_days":null,
+        "history_first_revision_at":"2000-01-01T00:00:00Z","history_first_revision_age_days":42.5,
+        "creator_is_bot_now":false,"length_bytes":0,"in_degree":if id%3==0 {1} else {0},
+        "topic_status":if id%3==0 {"missing"} else {"predicted"},
+        "topic_labels":if id%3==0 {Value::Null} else if id%3==1 {json!([])} else {json!(["Culture.Media.Music"])},
+        "quality_score":0.9859704508633369,"quality_revision_relation":"different",
+        "creator_groups_at_creation_history":["sysop","bot"],
+        "ignored":"not a display column"
+    })).collect::<Vec<_>>();
+    let candidates = json!({"2":{"status":"compared","candidate_count":0,"candidates":[]},
+    "5":{"status":"missing_item","candidate_count":null},
+    "1024":{"status":"compared","candidate_count":1,"candidates":[{
+        "page_id":1,"title":"huge".repeat(65000),"evidence":(0..6001).map(|i|json!({"source_page_id":i+1})).collect::<Vec<_>>()
+    }]}});
+    let source = w.source(&json!(pages), Some(&candidates));
+    let before = fs::read(&source).unwrap();
+    let folder = w.0.join("prepared");
+    let names = prepare_browser_indices(&source, &folder, None, None).unwrap();
+    assert_eq!(names.as_object().unwrap().len(), 3);
+    assert!(!folder.join("manifest.json").exists());
+    for (key, format, columns) in [
+        ("observations_file", "observations_v1", OBSERVATION_COLUMNS),
+        ("articles_file", "article_index_v1", ARTICLE_INDEX_COLUMNS),
+    ] {
+        let output = folder.join(names[key].as_str().unwrap());
+        let index = read_json(&output);
+        assert_eq!(index["format"], format);
+        assert_eq!(index["metadata"], read_json(&source)["metadata"]);
+        assert_eq!(index["columns"], json!(columns));
+        assert_eq!(index["rows"].as_array().unwrap().len(), pages.len());
+        for (page, row) in pages.iter().zip(index["rows"].as_array().unwrap()) {
+            assert_eq!(
+                *row,
+                json!(columns.iter().map(|key| &page[key]).collect::<Vec<_>>())
+            );
+        }
+        assert_eq!(
+            index["link_candidates"],
+            json!({"2":{"status":"compared","candidate_count":0},
+            "5":{"status":"missing_item","candidate_count":null},
+            "1024":{"status":"compared","candidate_count":1}})
+        );
+        assert!(!fs::read_to_string(&output)
+            .unwrap()
+            .contains("source_page_id"));
+        if key == "articles_file" {
+            assert_eq!(index["census_page_count"], pages.len());
+        } else {
+            assert!(index.get("census_page_count").is_none());
+        }
+    }
+    let directory = folder.join(names["profile_topics_dir"].as_str().unwrap());
+    let index = read_json(directory.join("index.json"));
+    assert_eq!(index["format"], "profile_topics_index_v1");
+    assert_eq!(index["shards"], json!([0, 1, 2]));
+    assert_eq!(index["shard_size"], 1024);
+    assert_eq!(index["census_page_count"], pages.len());
+    let mut seen = 0;
+    for (bucket, count) in [(0, 1023), (1, 1024), (2, 56)] {
+        let shard = read_json(directory.join(format!("{bucket}.json")));
+        assert_eq!(shard["format"], "profile_topics_shard_v1");
+        assert_eq!(shard["metadata"], index["metadata"]);
+        assert_eq!(shard["bucket"], bucket);
+        assert_eq!(shard["rows"].as_array().unwrap().len(), count);
+        for row in shard["rows"].as_array().unwrap() {
+            seen += 1;
+            let id = row[0].as_u64().unwrap() as usize;
+            assert_eq!(id, seen);
+            let page = &pages[pages.len() - id];
+            assert_eq!(
+                *row,
+                json!([id, page["topic_status"], page["topic_labels"]])
+            );
+        }
+    }
+    assert_eq!(seen, pages.len());
+    assert_eq!(fs::read(&source).unwrap(), before);
+}
+
+fn snapshot(folder: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(
+        root: &std::path::Path,
+        folder: &std::path::Path,
+        items: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(root, &path, items);
+            } else {
+                items.insert(
+                    path.strip_prefix(root).unwrap().into(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut items = std::collections::BTreeMap::new();
+    collect(folder, folder, &mut items);
+    items
+}
+
+#[test]
+fn source_fingerprints_and_explicit_generations_preserve_all_prior_index_shard_pairs() {
+    let w = Workspace::new();
+    let source=w.source(&json!([
+        {"page_id":9000,"title":"Known negative","orphan":true,"topic_status":"predicted","topic_labels":[]},
+        {"page_id":1024,"title":"Missing","orphan":true,"topic_status":"missing","topic_labels":null},
+        {"page_id":1,"title":"Known topic","orphan":false,"topic_status":"predicted","topic_labels":["Culture.Media.Music"]}
+    ]),None);
+    let first = w.0.join("first");
+    let old = prepare_browser_indices(&source, &first, None, None).unwrap();
+    let frozen = snapshot(&first);
+    let same = w.0.join("same");
+    assert_eq!(
+        prepare_browser_indices(&source, &same, None, None).unwrap(),
+        old
+    );
+    assert_eq!(snapshot(&same), frozen);
+    let modified =
+        fs::metadata(&source).unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let next = w.0.join("next");
+    let changed = prepare_browser_indices(&source, &next, None, None).unwrap();
+    for key in ["observations_file", "articles_file", "profile_topics_dir"] {
+        assert_ne!(old[key], changed[key]);
+    }
+    assert_eq!(snapshot(&first), frozen);
+    let explicit = w.0.join("explicit");
+    let names = prepare_browser_indices(
+        &source,
+        &explicit,
+        None,
+        Some("0123456789abcdef0123456789abcdef"),
+    )
+    .unwrap();
+    for name in names.as_object().unwrap().values() {
+        assert!(name
+            .as_str()
+            .unwrap()
+            .starts_with("canonical-0123456789abcdef0123456789abcdef-"));
+    }
+    let index = read_json(
+        explicit
+            .join(names["profile_topics_dir"].as_str().unwrap())
+            .join("index.json"),
+    );
+    assert_eq!(index["shards"], json!([0, 1, 8]));
+    assert_eq!(snapshot(&first), frozen);
+}
+
+#[test]
+fn manifest_mismatches_invalid_generations_and_existing_directories_do_not_write() {
+    let w = Workspace::new();
+    let source = w.source(&json!([]), None);
+    let prepared = w.0.join("prepared");
+    for expected in [
+        json!({"language":"lmo","date":null}),
+        json!({"language":"vec","date":"different"}),
+        json!({"language":"vec","date":null,"demo":true}),
+    ] {
+        assert!(prepare_browser_indices(&source, &prepared, Some(&expected), None).is_err());
+        assert!(!prepared.exists());
+    }
+    for generation in [
+        "",
+        "a",
+        "ABCDEF0123456789abcdef0123456789ab",
+        "../0123456789abcdef0123456789abcd",
+        "g123456789abcdef0123456789abcdef",
+    ] {
+        assert!(prepare_browser_indices(&source, &prepared, None, Some(generation)).is_err());
+        assert!(!prepared.exists());
+    }
+    fs::create_dir(&prepared).unwrap();
+    fs::write(prepared.join("approved"), "old").unwrap();
+    assert!(prepare_browser_indices(&source, &prepared, None, None).is_err());
+    assert_eq!(
+        fs::read_to_string(prepared.join("approved")).unwrap(),
+        "old"
+    );
+    assert!(prepare_browser_indices(&source, &source, None, None).is_err());
+    assert!(prepare_browser_indices(&source, &w.0, None, None).is_err());
+    fs::create_dir(w.0.join("empty")).unwrap();
+    assert!(prepare_browser_indices(&source, &w.0.join("empty"), None, None).is_err());
+    assert!(w.0.join("empty").is_dir());
+    let accepted = w.0.join("accepted");
+    assert!(prepare_browser_indices(
+        &source,
+        &accepted,
+        Some(&json!({"language":"vec","date":null,"demo":false})),
+        None
+    )
+    .is_ok());
+}
+
+#[test]
+fn empty_browser_indices_retain_the_census_and_a_complete_empty_topic_directory() {
+    let w = Workspace::new();
+    let source = w.source(&json!([]), Some(&json!({})));
+    let folder = w.0.join("prepared");
+    let names = prepare_browser_indices(&source, &folder, None, None).unwrap();
+    for key in ["observations_file", "articles_file"] {
+        let index = read_json(folder.join(names[key].as_str().unwrap()));
+        assert_eq!(index["rows"], json!([]));
+        assert_eq!(index["link_candidates"], json!({}));
+    }
+    let directory = folder.join(names["profile_topics_dir"].as_str().unwrap());
+    let index = read_json(directory.join("index.json"));
+    assert_eq!(index["census_page_count"], 0);
+    assert_eq!(index["shards"], json!([]));
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_index_writes_remove_only_the_owned_preparation_directory() {
+    let w = Workspace::new();
+    let source = w.source(&json!([{"page_id":1,"title":"A","orphan":true}]), None);
+    let long_source = w.0.join(format!("{}.json", "x".repeat(245)));
+    fs::rename(&source, &long_source).unwrap();
+    let before = fs::read(&long_source).unwrap();
+    let folder = w.0.join("prepared");
+    assert!(prepare_browser_indices(&long_source, &folder, None, None).is_err());
+    assert!(!folder.exists());
+    assert_eq!(fs::read(&long_source).unwrap(), before);
+    assert_eq!(fs::read_dir(&w.0).unwrap().count(), 1);
 }
