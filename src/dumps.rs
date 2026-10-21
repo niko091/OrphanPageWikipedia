@@ -1872,11 +1872,12 @@ pub fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
 fn visit_ordered_json(
     reader: impl std::io::Read,
     allow_candidates: bool,
+    pages_only: bool,
     visit: &mut impl FnMut(&str, Option<&str>, serde_json::Value) -> DumpResult<()>,
 ) -> DumpResult<()> {
     use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
-    struct Sections<'a, F>(&'a mut F, bool);
+    struct Sections<'a, F>(&'a mut F, bool, bool, &'a mut bool);
     struct Pages<'a, F>(&'a mut F);
     struct Candidates<'a, F>(&'a mut F);
     impl<'de, F> Visitor<'de> for Sections<'_, F>
@@ -1900,6 +1901,10 @@ fn visit_ordered_json(
                 return Err(M::Error::custom("Censimento JSON mancante"));
             }
             map.next_value_seed(Pages(self.0))?;
+            if self.2 {
+                *self.3 = true;
+                return Err(M::Error::custom("pages complete"));
+            }
             if let Some(key) = map.next_key::<String>()? {
                 if !self.1 || key != "link_candidates" {
                     return Err(M::Error::custom("Sezione JSON inattesa"));
@@ -1968,7 +1973,15 @@ fn visit_ordered_json(
         }
     }
     let mut d = serde_json::Deserializer::from_reader(reader);
-    serde::Deserializer::deserialize_map(&mut d, Sections(visit, allow_candidates))?;
+    let mut complete = false;
+    let result = serde::Deserializer::deserialize_map(
+        &mut d,
+        Sections(visit, allow_candidates, pages_only, &mut complete),
+    );
+    if pages_only && complete {
+        return Ok(());
+    }
+    result?;
     d.end()?;
     Ok(())
 }
@@ -2174,6 +2187,7 @@ fn stage_export(source: &std::path::Path) -> DumpResult<CanonicalExport> {
         visit_ordered_json(
             BufReader::with_capacity(65536, std::fs::File::open(source)?),
             true,
+            false,
             &mut |section, identifier, record| {
                 match section {
                     "metadata" => {
@@ -3162,6 +3176,55 @@ fn write_editorial_exports(
 }
 
 #[cfg(feature = "cli")]
+struct SummaryPreview {
+    title: String,
+    language: String,
+    id: i64,
+    fields: serde_json::Value,
+}
+
+#[cfg(feature = "cli")]
+fn add_article_preview(
+    preview: &mut Vec<SummaryPreview>,
+    page: &serde_json::Value,
+    language: Option<&str>,
+) -> DumpResult<()> {
+    if page["orphan"] != true {
+        return Ok(());
+    }
+    let title = page["title"].as_str().ok_or("Titolo mancante")?;
+    let id = page["page_id"].as_i64().ok_or("ID mancante")?;
+    let code = language.unwrap_or("");
+    let position = preview.partition_point(|old| {
+        focaccia::unicode_full_casecmp(&old.title, title)
+            .then_with(|| old.title.as_str().cmp(title))
+            .then_with(|| old.language.as_str().cmp(code))
+            .then_with(|| old.id.cmp(&id))
+            .is_lt()
+    });
+    if position < 25 {
+        let mut fields: serde_json::Map<String, serde_json::Value> = OBSERVATION_COLUMNS
+            .iter()
+            .map(|key| (String::from(*key), page[*key].clone()))
+            .collect();
+        if let Some(language) = language {
+            fields.insert("language".into(), serde_json::json!(language));
+        }
+        preview.insert(
+            position,
+            SummaryPreview {
+                title: title.into(),
+                language: code.into(),
+                id,
+                fields: fields.into(),
+            },
+        );
+        preview.truncate(25);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
 fn write_dashboard_summaries(
     source: &std::path::Path,
     folder: &std::path::Path,
@@ -3169,7 +3232,6 @@ fn write_dashboard_summaries(
     staged: &CanonicalExport,
 ) -> DumpResult<()> {
     use serde_json::{json, Value};
-    use std::io::{BufWriter, Write};
     let metadata = &staged.metadata;
     let collected =
         |status: &Value| matches!(status.as_str(), Some("collected" | "partially_collected"));
@@ -3181,12 +3243,7 @@ fn write_dashboard_summaries(
         false,
         !collected(&metadata["creators"]["status"]) && collected(&metadata["history"]["status"]),
     );
-    struct Preview {
-        title: String,
-        id: i64,
-        fields: Value,
-    }
-    let mut preview = Vec::<Preview>::with_capacity(26);
+    let mut preview = Vec::<SummaryPreview>::with_capacity(26);
     let mut query = staged
         .database
         .prepare("SELECT data FROM pages ORDER BY position")?;
@@ -3194,35 +3251,41 @@ fn write_dashboard_summaries(
     while let Some(row) = rows.next()? {
         let page: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
         summary.add_observation(&page, None)?;
-        if page["orphan"] != true {
-            continue;
-        }
-        let title = page["title"].as_str().ok_or("Titolo mancante")?;
-        let id = page["page_id"].as_i64().ok_or("ID mancante")?;
-        let position = preview.partition_point(|old| {
-            focaccia::unicode_full_casecmp(&old.title, title)
-                .then_with(|| old.title.as_str().cmp(title))
-                .then_with(|| old.id.cmp(&id))
-                .is_lt()
-        });
-        if position < 25 {
-            preview.insert(
-                position,
-                Preview {
-                    title: title.into(),
-                    id,
-                    fields: OBSERVATION_COLUMNS
-                        .iter()
-                        .map(|key| (String::from(*key), page[key].clone()))
-                        .collect(),
-                },
-            );
-            preview.truncate(25);
-        }
+        add_article_preview(&mut preview, &page, None)?;
     }
     if summary.len() != staged.count {
         return Err("Riepilogo del censimento incompleto".into());
     }
+    let sources = json!([{"language":metadata["language"],"file":source.file_name().and_then(|s|s.to_str()).ok_or("Nome raccolta non valido")?,
+        "size":staged.signature.0,"mtime_ns":staged.signature.1}]);
+    let article_preview = preview
+        .into_iter()
+        .map(|entry| entry.fields)
+        .collect::<Vec<_>>();
+    write_summary_files(
+        folder,
+        names,
+        metadata,
+        staged.count,
+        summary,
+        article_preview,
+        sources,
+    )
+}
+
+#[cfg(feature = "cli")]
+fn write_summary_files(
+    folder: &std::path::Path,
+    names: &serde_json::Value,
+    metadata: &serde_json::Value,
+    count: usize,
+    summary: crate::dashboard::SummaryAccumulator,
+    article_preview: Vec<serde_json::Value>,
+    sources: serde_json::Value,
+) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::io::{BufWriter, Write};
+    let default_rule = json!("creation_quality_creators_v3");
     let encoded = summary.finish()?;
     drop(summary);
     let mut reports: Value = serde_json::from_str(&encoded)?;
@@ -3236,13 +3299,6 @@ fn write_dashboard_summaries(
         .as_array_mut()
         .ok_or("Riepilogo categorie mancante")?
         .truncate(20);
-    let sources = json!([{"language":metadata["language"],"file":source.file_name().and_then(|s|s.to_str()).ok_or("Nome raccolta non valido")?,
-        "size":staged.signature.0,"mtime_ns":staged.signature.1}]);
-    let default_rule = json!("creation_quality_creators_v3");
-    let article_preview = preview
-        .into_iter()
-        .map(|entry| entry.fields)
-        .collect::<Vec<_>>();
     #[derive(serde::Serialize)]
     struct Summary<'a> {
         format: &'static str,
@@ -3270,7 +3326,7 @@ fn write_dashboard_summaries(
                     measures_rule: metadata.get("measures_rule").unwrap_or(&default_rule),
                     metadata,
                     sources: &sources,
-                    census_page_count: staged.count,
+                    census_page_count: count,
                     reports: &reports,
                     article_preview: &article_preview,
                 },
@@ -3301,7 +3357,7 @@ fn write_dashboard_summaries(
                     format: "creator_index_v1",
                     metadata,
                     sources: &sources,
-                    census_page_count: staged.count,
+                    census_page_count: count,
                     creators: &creators,
                 },
             )?;
@@ -3574,7 +3630,7 @@ pub fn stage_supplement(
     {
         let mut writer = BufWriter::with_capacity(65536, &mut digest);
         let mut insert = transaction.prepare(&format!("INSERT INTO {table} VALUES(?,?)"))?;
-        visit_ordered_json(reader, false, &mut |section, _, record| {
+        visit_ordered_json(reader, false, false, &mut |section, _, record| {
             if section == "metadata" {
                 let meta = supplement_metadata(
                     kind,
@@ -4692,6 +4748,7 @@ pub fn stage_comparison_graph(
     let mut metadata = None;
     visit_ordered_json(
         BufReader::new(std::fs::File::open(&canonical)?),
+        false,
         false,
         &mut |section, _, record| {
             if section == "metadata" {
@@ -5819,6 +5876,250 @@ pub fn seed_comparison_pairs(
     Ok(())
 }
 
+/// Describe complete independent edition censuses without duplicating pages.
+/// Each member retains its interval, source metadata and page denominator.
+#[cfg(feature = "cli")]
+pub fn aggregate_index(members: &[serde_json::Value]) -> DumpResult<serde_json::Value> {
+    use serde_json::{json, Value};
+    if members.is_empty() {
+        return Err("Aggregato senza membri".into());
+    }
+    let mut ordered = members.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a["language"].as_str().cmp(&b["language"].as_str()));
+    let mut census = Vec::with_capacity(members.len());
+    let mut intervals = Vec::with_capacity(members.len());
+    let mut languages = Vec::new();
+    let demo = ordered[0]["metadata"]["demo"] == true;
+    for member in ordered {
+        let meta = &member["metadata"];
+        let language = member["language"]
+            .as_str()
+            .ok_or("Lingua membro mancante")?;
+        crate::wiki_database(language, meta["database"].as_str())?;
+        dataset_filename(&member["file"])?;
+        if languages.last().is_some_and(|last| last == language)
+            || meta["language"] != language
+            || meta["complete"] != true
+            || (meta["demo"] == true) != demo
+            || member["page_count"].as_u64().is_none()
+        {
+            return Err(
+                "L'aggregato richiede un solo censimento completo per lingua e fonti omogenee"
+                    .into(),
+            );
+        }
+        intervals.push((
+            meta["started_at"]
+                .as_str()
+                .ok_or("Inizio censimento mancante")?
+                .to_owned(),
+            meta["finished_at"]
+                .as_str()
+                .ok_or("Fine censimento mancante")?
+                .to_owned(),
+        ));
+        languages.push(language.to_owned());
+        census.push(json!({"language":language,"file":member["file"],"page_count":member["page_count"],"metadata":meta}));
+    }
+    let (start, finish) = crate::collection_interval(&intervals)?;
+    let common = |key: &str| -> Value {
+        let value = &census[0]["metadata"][key];
+        if census.iter().all(|m| m["metadata"][key] == *value) {
+            value.clone()
+        } else {
+            json!("mixed_per_language")
+        }
+    };
+    Ok(
+        json!({"metadata":{"kind":"aggregate","language":"all","languages":languages,"complete":true,"demo":demo,
+        "source":if demo {"Synthetic complete graphs"}else{"Wikimedia SQL dumps (aggregate of source-specific releases)"},
+        "started_at":start,"finished_at":finish,"temporal_consistency":"independent_source_specific_intervals","observation_unit":"language_page",
+        "age_rule":common("age_rule"),"historical_age_rule":common("historical_age_rule"),"measures_rule":common("measures_rule"),"length_unit":"UTF-8 wikitext bytes"},"members":census}),
+    )
+}
+
+/// Prepare an aggregate summary and its separate creator index from approved
+/// canonical member page streams. Paths are operational inputs only and never
+/// enter the aggregate metadata or source fingerprints. Candidate evidence is
+/// not read a second time to calculate charts.
+#[cfg(feature = "cli")]
+pub fn write_aggregate_summary(
+    members: &[serde_json::Value],
+    output: &std::path::Path,
+    metadata: &serde_json::Value,
+    aggregate: bool,
+) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::io::BufReader;
+    if members.is_empty() || !metadata.is_object() {
+        return Err("Riepilogo aggregato senza membri".into());
+    }
+    let name = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Nome riepilogo mancante")?;
+    let stem = name
+        .strip_suffix("-summary.json")
+        .ok_or("Il nome deve terminare con -summary.json")?;
+    let creator_name = format!("{stem}-creators.json");
+    let folder = output.parent().ok_or("Directory riepilogo mancante")?;
+    let protected = [
+        resolved_path(output)?,
+        resolved_path(&folder.join(&creator_name))?,
+    ];
+    let mut meta = metadata.clone();
+    let collected =
+        |value: &Value| matches!(value.as_str(), Some("collected" | "partially_collected"));
+    let creators = members
+        .iter()
+        .filter(|m| collected(&m["metadata"]["creators"]["status"]))
+        .collect::<Vec<_>>();
+    let history = members
+        .iter()
+        .filter(|m| collected(&m["metadata"]["history"]["status"]))
+        .collect::<Vec<_>>();
+    let status = |count: usize| {
+        if count == members.len() {
+            "collected"
+        } else if count == 0 {
+            "not_collected"
+        } else {
+            "partially_collected"
+        }
+    };
+    if aggregate {
+        meta["creators"] = json!({"status":status(creators.len()),"languages_scanned":creators.iter().map(|m|&m["language"]).collect::<Vec<_>>(),"collected_languages":creators.len()});
+        let matched = history
+            .iter()
+            .try_fold(0u64, |total, m| {
+                total.checked_add(
+                    m["metadata"]["history"]
+                        .get("matched_pages")
+                        .map(|v| v.as_u64())
+                        .unwrap_or(Some(0))?,
+                )
+            })
+            .ok_or("Conteggio History non valido")?;
+        meta["history"] = json!({"status":status(history.len()),"matched_pages":matched});
+    }
+    let mut summary = crate::dashboard::SummaryAccumulator::new(
+        meta["language"]
+            .as_str()
+            .ok_or("Lingua riepilogo mancante")?
+            .into(),
+        aggregate,
+        creators.is_empty() && !history.is_empty(),
+    );
+    let mut preview = Vec::with_capacity(26);
+    let mut sources = Vec::with_capacity(members.len());
+    let mut expected_total = 0usize;
+    for member in members {
+        let language = member["language"]
+            .as_str()
+            .ok_or("Lingua membro mancante")?;
+        crate::wiki_database(language, member["metadata"]["database"].as_str())?;
+        let path = std::path::Path::new(member["path"].as_str().ok_or("Percorso membro mancante")?);
+        if member["metadata"]["complete"] != true || member["metadata"]["language"] != language {
+            return Err("Censimento membro non completo o incoerente".into());
+        }
+        if protected.contains(&resolved_path(path)?) {
+            return Err("Riepilogo sovrapposto a una sorgente".into());
+        }
+        let signature = file_signature(path)?;
+        sources.push(json!({"language":language,"file":path.file_name().and_then(|n|n.to_str()).ok_or("Nome membro non valido")?,"size":signature.0,"mtime_ns":signature.1}));
+        let expected = member["page_count"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or("Denominatore membro non valido")?;
+        let mut count = 0usize;
+        visit_ordered_json(
+            BufReader::new(std::fs::File::open(path)?),
+            true,
+            true,
+            &mut |section, _, record| {
+                if section == "metadata" {
+                    if record != member["metadata"] || record.get("biographies").is_some() {
+                        return Err("Metadati del riepilogo aggregato non corrispondenti".into());
+                    }
+                } else {
+                    if record.get("biography").is_some() || record.get("gender_group").is_some() {
+                        return Err("Arricchimento non autorizzato".into());
+                    }
+                    let code = aggregate.then_some(language);
+                    summary.add_observation(&record, code)?;
+                    add_article_preview(&mut preview, &record, code)?;
+                    count += 1;
+                }
+                Ok(())
+            },
+        )?;
+        if count != expected || file_signature(path)? != signature {
+            return Err("Censimento incompleto o modificato durante il riepilogo aggregato".into());
+        }
+        expected_total = expected_total
+            .checked_add(expected)
+            .ok_or("Aggregato troppo grande")?;
+    }
+    if summary.len() != expected_total {
+        return Err("Popolazione del riepilogo aggregato incompleta".into());
+    }
+    let names = json!({"summary_file":name,"creator_index_file":creator_name});
+    write_summary_files(
+        folder,
+        &names,
+        &meta,
+        expected_total,
+        summary,
+        preview.into_iter().map(|p| p.fields).collect(),
+        json!(sources),
+    )
+}
+
+/// Stable scientific comparison names include all reference collection source
+/// identities. UTF-8 sorted JSON here intentionally differs from the ASCII
+/// canonical graph checksum convention, matching the original filenames.
+#[cfg(feature = "cli")]
+pub fn comparison_filename(
+    language: &str,
+    metadata: &serde_json::Value,
+    languages: &[String],
+) -> DumpResult<String> {
+    use serde_json::json;
+    use sha2::Digest;
+    crate::wiki_database(language, metadata["database"].as_str())?;
+    let release = metadata["sql_release"].as_str();
+    let Some(release) = release.filter(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return Ok(format!(
+            "{language}{}.json",
+            if metadata["demo"] == true {
+                "-demo"
+            } else {
+                ""
+            }
+        ));
+    };
+    let references = metadata["comparison"]["collections"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .map(|a| json!(a))
+        .unwrap_or_else(|| {
+            let mut languages = languages.to_vec();
+            languages.sort();
+            json!(languages)
+        });
+    let identity = json!({"language":language,"release":release,"input":metadata["input_sha256"],"history":metadata["history"],"topics":metadata["topics"],"quality":metadata["quality"],"age_rule":metadata["age_rule"],"measures_rule":metadata["measures_rule"],"references":references});
+    let mut digest = CanonicalDigest::default();
+    {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(&mut digest);
+        write_sorted_json(&identity, &mut writer, false)?;
+        writer.flush()?;
+    }
+    let digest = format!("{:x}", digest.0.finalize());
+    Ok(format!("{language}-{release}-{}.json", &digest[..12]))
+}
+
 /// Inputs for the bounded canonical SQL analysis. This API prepares one member;
 /// CSV, browser transports and manifest publication belong to the export stage.
 #[cfg(feature = "cli")]
@@ -6547,8 +6848,21 @@ pub fn write_canonical_json(
     value: &serde_json::Value,
     writer: &mut impl std::io::Write,
 ) -> DumpResult<()> {
+    write_sorted_json(value, writer, true)
+}
+
+#[cfg(feature = "cli")]
+fn write_sorted_json(
+    value: &serde_json::Value,
+    writer: &mut impl std::io::Write,
+    ascii: bool,
+) -> DumpResult<()> {
     use serde_json::Value;
-    fn string(value: &str, writer: &mut impl std::io::Write) -> DumpResult<()> {
+    fn string(value: &str, writer: &mut impl std::io::Write, ascii: bool) -> DumpResult<()> {
+        if !ascii {
+            serde_json::to_writer(writer, value)?;
+            return Ok(());
+        }
         for c in serde_json::to_string(value)?.chars() {
             if c.is_ascii() && c != '\u{7f}' {
                 writer.write_all(&[c as u8])?;
@@ -6562,14 +6876,14 @@ pub fn write_canonical_json(
         Ok(())
     }
     match value {
-        Value::String(value) => string(value, writer)?,
+        Value::String(value) => string(value, writer, ascii)?,
         Value::Array(values) => {
             writer.write_all(b"[")?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
                     writer.write_all(b", ")?;
                 }
-                write_canonical_json(value, writer)?;
+                write_sorted_json(value, writer, ascii)?;
             }
             writer.write_all(b"]")?;
         }
@@ -6581,9 +6895,9 @@ pub fn write_canonical_json(
                 if index != 0 {
                     writer.write_all(b", ")?;
                 }
-                string(key, writer)?;
+                string(key, writer, ascii)?;
                 writer.write_all(b": ")?;
-                write_canonical_json(value, writer)?;
+                write_sorted_json(value, writer, ascii)?;
             }
             writer.write_all(b"}")?;
         }

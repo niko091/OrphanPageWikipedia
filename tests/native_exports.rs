@@ -1,7 +1,7 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    export_csv, prepare_dashboard_exports, rebuild_dashboard, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS,
-    OBSERVATION_COLUMNS,
+    aggregate_index, comparison_filename, export_csv, prepare_dashboard_exports, rebuild_dashboard,
+    write_aggregate_summary, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1011,4 +1011,104 @@ fn failed_index_writes_remove_only_the_owned_preparation_directory() {
     assert!(!folder.exists());
     assert_eq!(fs::read(&long_source).unwrap(), before);
     assert_eq!(fs::read_dir(&w.0).unwrap().count(), 1);
+}
+
+#[test]
+fn aggregate_indices_and_summaries_retain_member_denominators_intervals_and_scoped_creators() {
+    let w = Workspace::new();
+    let mut members = Vec::new();
+    for language in ["vec", "lmo"] {
+        let metadata = json!({"language":language,"complete":true,"demo":true,"started_at":if language=="vec" {"2026-01-01T01:00:00+01:00"}else{"2026-01-02T00:00:00Z"},"finished_at":if language=="vec" {"2026-01-03T00:00:00Z"}else{"2026-01-02T01:00:00+00:00"},"age_rule":if language=="vec" {"page_creation_event"}else{"mediawiki_history_page_creation_v2"},"creators":{"status":"not_collected"},"history":{"status":if language=="vec" {"collected"}else{"not_collected"},"matched_pages":1},"measures_rule":"creation_quality_creators_v3"});
+        let file = format!("{language}.json");
+        let path = w.0.join(&file);
+        let pages = json!([{"page_id":1,"title":"Same","orphan":true,"history_creator_key":"same","history_creator_status":"observed_surviving_history","history_data_status":"matched","age_days":0.0,"length_bytes":0,"quality_score":0.9859704508633369},{"page_id":2,"title":"ß","orphan":true,"history_creator_key":"same","history_creator_status":"observed_surviving_history","history_data_status":"matched","age_days":null,"length_bytes":null}]);
+        fs::write(
+            &path,
+            format!("{{\"metadata\":{metadata},\"pages\":{pages}}}"),
+        )
+        .unwrap();
+        members.push(
+            json!({"language":language,"file":file,"path":path,"page_count":2,"metadata":metadata}),
+        );
+    }
+    let index = aggregate_index(&members).unwrap();
+    assert_eq!(index["metadata"]["languages"], json!(["lmo", "vec"]));
+    assert_eq!(index["metadata"]["age_rule"], "mixed_per_language");
+    assert!(index["metadata"]["historical_age_rule"].is_null());
+    assert_eq!(index["metadata"]["started_at"], "2026-01-01T01:00:00+01:00");
+    assert_eq!(index["metadata"]["finished_at"], "2026-01-03T00:00:00Z");
+    assert!(index["members"][0].get("path").is_none());
+    members.sort_by(|a, b| a["language"].as_str().cmp(&b["language"].as_str()));
+    let output = w.0.join("all-summary.json");
+    write_aggregate_summary(&members, &output, &index["metadata"], true).unwrap();
+    let summary = read_json(&output);
+    let creators = read_json(w.0.join("all-creators.json"));
+    assert_eq!(summary["census_page_count"], 4);
+    assert_eq!(summary["reports"]["overview"]["total"], 4);
+    assert_eq!(
+        summary["metadata"]["history"],
+        json!({"status":"partially_collected","matched_pages":1})
+    );
+    assert_eq!(summary["metadata"]["creators"]["status"], "not_collected");
+    assert_eq!(summary["article_preview"][0]["title"], "Same");
+    assert_eq!(summary["article_preview"][0]["language"], "lmo");
+    assert_eq!(summary["article_preview"][1]["language"], "vec");
+    assert_eq!(summary["sources"], creators["sources"]);
+    assert!(summary["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| !s["file"].as_str().unwrap().contains('/')));
+    let keys = creators["creators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(keys.contains(&"lmo:same"));
+    assert!(keys.contains(&"vec:same"));
+    let approved = fs::read(&output).unwrap();
+    let approved_creators = fs::read(w.0.join("all-creators.json")).unwrap();
+    members[1]["page_count"] = json!(3);
+    assert!(write_aggregate_summary(&members, &output, &index["metadata"], true).is_err());
+    assert_eq!(fs::read(&output).unwrap(), approved);
+    assert_eq!(
+        fs::read(w.0.join("all-creators.json")).unwrap(),
+        approved_creators
+    );
+    assert!(write_aggregate_summary(
+        &members,
+        &w.0.join("invalid.json"),
+        &index["metadata"],
+        true
+    )
+    .is_err());
+    members[1]["page_count"] = json!(2);
+    members[1]["metadata"]["demo"] = json!(false);
+    assert!(aggregate_index(&members).is_err());
+    assert!(aggregate_index(&[]).is_err());
+    assert!(aggregate_index(&[members[0].clone(), members[0].clone()]).is_err());
+}
+
+#[test]
+fn comparison_names_keep_utf8_float_identity_and_every_reference_source() {
+    let mut metadata = json!({"language":"vec","complete":true,"sql_release":"20261001","input_sha256":"abc","history":{"note":"È 🌙 ß","value":0.9859704508633369},"measures_rule":"creation_quality_creators_v3"});
+    let languages = vec!["vec".into(), "lmo".into()];
+    assert_eq!(
+        comparison_filename("vec", &metadata, &languages).unwrap(),
+        "vec-20261001-7c4ed1ac784d.json"
+    );
+    metadata["comparison"] = json!({"collections":[{"language":"lmo","input_sha256":"old"}]});
+    let first = comparison_filename("vec", &metadata, &languages).unwrap();
+    metadata["comparison"]["collections"][0]["input_sha256"] = json!("new");
+    assert_ne!(
+        first,
+        comparison_filename("vec", &metadata, &languages).unwrap()
+    );
+    metadata["sql_release"] = Value::Null;
+    metadata["demo"] = json!(true);
+    assert_eq!(
+        comparison_filename("vec", &metadata, &languages).unwrap(),
+        "vec-demo.json"
+    );
 }
