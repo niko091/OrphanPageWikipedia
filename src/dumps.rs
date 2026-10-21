@@ -1867,24 +1867,26 @@ fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
     }
 }
 
-/// Scientific supplements have exactly two ordered sections. Deserialize one
-/// record at a time, including for records larger than the input buffer.
+/// Read the ordered metadata/pages contract, optionally followed by candidate
+/// records. Keep one record resident, including records larger than the buffer.
 #[cfg(feature = "cli")]
-fn visit_supplement(
+fn visit_ordered_json(
     reader: impl std::io::Read,
-    visit: &mut impl FnMut(&str, serde_json::Value) -> DumpResult<()>,
+    allow_candidates: bool,
+    visit: &mut impl FnMut(&str, Option<&str>, serde_json::Value) -> DumpResult<()>,
 ) -> DumpResult<()> {
     use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
-    struct Sections<'a, F>(&'a mut F);
+    struct Sections<'a, F>(&'a mut F, bool);
     struct Pages<'a, F>(&'a mut F);
+    struct Candidates<'a, F>(&'a mut F);
     impl<'de, F> Visitor<'de> for Sections<'_, F>
     where
-        F: FnMut(&str, Value) -> DumpResult<()>,
+        F: FnMut(&str, Option<&str>, Value) -> DumpResult<()>,
     {
         type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("ordered metadata and pages supplement")
+            f.write_str("ordered metadata, pages and optional link candidates")
         }
         fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
             if map.next_key::<String>()?.as_deref() != Some("metadata") {
@@ -1894,20 +1896,26 @@ fn visit_supplement(
             if !metadata.is_object() {
                 return Err(M::Error::custom("Metadati JSON non validi"));
             }
-            (self.0)("metadata", metadata).map_err(M::Error::custom)?;
+            (self.0)("metadata", None, metadata).map_err(M::Error::custom)?;
             if map.next_key::<String>()?.as_deref() != Some("pages") {
                 return Err(M::Error::custom("Censimento JSON mancante"));
             }
             map.next_value_seed(Pages(self.0))?;
-            if map.next_key::<String>()?.is_some() {
-                return Err(M::Error::custom("Sezione supplemento inattesa"));
+            if let Some(key) = map.next_key::<String>()? {
+                if !self.1 || key != "link_candidates" {
+                    return Err(M::Error::custom("Sezione JSON inattesa"));
+                }
+                map.next_value_seed(Candidates(self.0))?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(M::Error::custom("Sezione JSON inattesa"));
+                }
             }
             Ok(())
         }
     }
     impl<'de, F> DeserializeSeed<'de> for Pages<'_, F>
     where
-        F: FnMut(&str, Value) -> DumpResult<()>,
+        F: FnMut(&str, Option<&str>, Value) -> DumpResult<()>,
     {
         type Value = ();
         fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
@@ -1916,7 +1924,7 @@ fn visit_supplement(
     }
     impl<'de, F> Visitor<'de> for Pages<'_, F>
     where
-        F: FnMut(&str, Value) -> DumpResult<()>,
+        F: FnMut(&str, Option<&str>, Value) -> DumpResult<()>,
     {
         type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1927,15 +1935,337 @@ fn visit_supplement(
                 if !record.is_object() {
                     return Err(S::Error::custom("Record supplemento non valido"));
                 }
-                (self.0)("pages", record).map_err(S::Error::custom)?;
+                (self.0)("pages", None, record).map_err(S::Error::custom)?;
+            }
+            Ok(())
+        }
+    }
+    impl<'de, F> DeserializeSeed<'de> for Candidates<'_, F>
+    where
+        F: FnMut(&str, Option<&str>, Value) -> DumpResult<()>,
+    {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    impl<'de, F> Visitor<'de> for Candidates<'_, F>
+    where
+        F: FnMut(&str, Option<&str>, Value) -> DumpResult<()>,
+    {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("object of candidate records")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+            while let Some(identifier) = map.next_key::<String>()? {
+                let record = map.next_value::<Value>()?;
+                if !record.is_object() {
+                    return Err(M::Error::custom("Record candidate non valido"));
+                }
+                (self.0)("link_candidates", Some(&identifier), record).map_err(M::Error::custom)?;
             }
             Ok(())
         }
     }
     let mut d = serde_json::Deserializer::from_reader(reader);
-    serde::Deserializer::deserialize_map(&mut d, Sections(visit))?;
+    serde::Deserializer::deserialize_map(&mut d, Sections(visit, allow_candidates))?;
     d.end()?;
     Ok(())
+}
+
+/// The canonical CSV projection, in the same order as the Python exporter.
+/// The two candidate fields come from the separate matching records, never
+/// from similarly named fields in an observation.
+#[cfg(feature = "cli")]
+pub const CSV_COLUMNS: &[&str] = &[
+    "page_id",
+    "title",
+    "category",
+    "category_status",
+    "orphan",
+    "in_degree",
+    "out_degree",
+    "created_at",
+    "age_days",
+    "history_first_revision_at",
+    "history_first_revision_age_days",
+    "length_bytes",
+    "origin",
+    "creator_key",
+    "creator_data_status",
+    "creator_account_type",
+    "creator_tenure_days",
+    "creator_prior_edits_main",
+    "creator_prior_edits_other",
+    "creator_prior_articles",
+    "creator_articles_created_total",
+    "creator_articles_in_census",
+    "creator_orphans_current",
+    "creator_orphans_current_share",
+    "creator_orphans_at_30_days",
+    "history_creator_key",
+    "history_creator_status",
+    "history_data_status",
+    "creator_groups_at_creation_history",
+    "creator_continuity_months_before_creation",
+    "creator_continuity_bucket_before_creation",
+    "creator_prior_edits_main_history",
+    "creator_prior_edits_other_history",
+    "creator_attribution",
+    "creator_registered_at",
+    "creator_tenure_status",
+    "creator_experience_status",
+    "topic_labels",
+    "topic_status",
+    "topic_input_count",
+    "wikibase_item",
+    "candidate_count",
+    "candidate_status",
+    "page_created_at",
+    "first_public_revision_at",
+    "creation_date_source",
+    "creation_date_status",
+    "creator_account_type_at_creation",
+    "creator_is_bot_now",
+    "creator_languages_created",
+    "creator_languages_before",
+    "creation_tags",
+    "import_log_observed",
+    "move_log_observed",
+    "creator_orphans_at_30_days_status",
+    "quality_score",
+    "quality_status",
+    "content_revision_id",
+    "quality_revision_relation",
+];
+
+// Python csv.writer calls str() on non-string values: arrays therefore retain
+// Python's existing list representation, not JSON. Scientific CSV columns
+// contain scalars or arrays; objects are not valid values for these measures.
+#[cfg(feature = "cli")]
+fn csv_value(value: &serde_json::Value, nonprintable: &regex::Regex) -> DumpResult<String> {
+    use serde_json::Value;
+    fn repr(value: &Value, nonprintable: &regex::Regex, result: &mut String) -> DumpResult<()> {
+        use std::fmt::Write;
+        match value {
+            Value::Null => result.push_str("None"),
+            Value::Bool(value) => result.push_str(if *value { "True" } else { "False" }),
+            Value::Number(number) => result.push_str(&if number.is_f64() {
+                python_float(number)?
+            } else {
+                number.to_string()
+            }),
+            Value::String(value) => {
+                let quote = if value.contains('\'') && !value.contains('"') {
+                    '"'
+                } else {
+                    '\''
+                };
+                result.push(quote);
+                for c in value.chars() {
+                    match c {
+                        '\\' => result.push_str("\\\\"),
+                        '\t' => result.push_str("\\t"),
+                        '\n' => result.push_str("\\n"),
+                        '\r' => result.push_str("\\r"),
+                        c if c == quote => {
+                            result.push('\\');
+                            result.push(c);
+                        }
+                        c if c != ' ' && nonprintable.is_match(c.encode_utf8(&mut [0; 4])) => {
+                            let code = u32::from(c);
+                            if code <= 0xff {
+                                write!(result, "\\x{code:02x}")?;
+                            } else if code <= 0xffff {
+                                write!(result, "\\u{code:04x}")?;
+                            } else {
+                                write!(result, "\\U{code:08x}")?;
+                            }
+                        }
+                        _ => result.push(c),
+                    }
+                }
+                result.push(quote);
+            }
+            Value::Array(values) => {
+                result.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        result.push_str(", ");
+                    }
+                    repr(value, nonprintable, result)?;
+                }
+                result.push(']');
+            }
+            Value::Object(_) => return Err("Valore oggetto non valido in una misura CSV".into()),
+        }
+        Ok(())
+    }
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::String(value) => Ok(value.clone()),
+        _ => {
+            let mut result = String::new();
+            repr(value, nonprintable, &mut result)?;
+            Ok(result)
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+fn write_csv_row<'a>(
+    writer: &mut impl std::io::Write,
+    values: impl IntoIterator<Item = &'a serde_json::Value>,
+    nonprintable: &regex::Regex,
+) -> DumpResult<()> {
+    for (position, value) in values.into_iter().enumerate() {
+        if position != 0 {
+            writer.write_all(b",")?;
+        }
+        let value = csv_value(value, nonprintable)?;
+        if value.contains([',', '"', '\r', '\n']) {
+            writer.write_all(b"\"")?;
+            let mut parts = value.split('"');
+            if let Some(part) = parts.next() {
+                writer.write_all(part.as_bytes())?;
+            }
+            for part in parts {
+                writer.write_all(b"\"\"")?;
+                writer.write_all(part.as_bytes())?;
+            }
+            writer.write_all(b"\"")?;
+        } else {
+            writer.write_all(value.as_bytes())?;
+        }
+    }
+    writer.write_all(b"\r\n")?;
+    Ok(())
+}
+
+/// Prepare the exact CSV projection of a complete ordered canonical export.
+/// The caller approves the canonical source; this function does not publish
+/// browser transports or a manifest. A private disk-backed SQLite join keeps
+/// page order and candidate summaries without retaining a census/evidence map
+/// in RAM. Errors preserve the previous CSV and never rewrite the source.
+#[cfg(feature = "cli")]
+pub fn export_csv(source: &std::path::Path, output: &std::path::Path) -> DumpResult<usize> {
+    use rusqlite::params;
+    use serde_json::{json, Value};
+    use std::io::{BufReader, BufWriter, Write};
+    if resolved_path(source)? == resolved_path(output)? {
+        return Err("Il CSV deve essere distinto dal dataset originale".into());
+    }
+    let signature = file_signature(source)?;
+    let mut database = rusqlite::Connection::open("")?;
+    database.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE")?;
+    let transaction = database.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE pages(id INTEGER PRIMARY KEY,position INTEGER NOT NULL UNIQUE,orphan INTEGER NOT NULL,data TEXT NOT NULL);
+         CREATE TABLE candidates(id INTEGER PRIMARY KEY,status TEXT,count INTEGER)",
+    )?;
+    let mut count = 0usize;
+    {
+        let mut insert_page = transaction.prepare("INSERT INTO pages VALUES(?,?,?,?)")?;
+        let mut insert_candidates = transaction.prepare("INSERT INTO candidates VALUES(?,?,?)")?;
+        let mut is_orphan = transaction.prepare("SELECT orphan FROM pages WHERE id=?")?;
+        visit_ordered_json(
+            BufReader::with_capacity(65536, std::fs::File::open(source)?),
+            true,
+            &mut |section, identifier, record| {
+                match section {
+                    "metadata" => {
+                        if record["complete"] != true || record.get("biographies").is_some() {
+                            return Err("Serve un censimento completo senza arricchimenti".into());
+                        }
+                        crate::wiki_database(
+                            record["language"].as_str().ok_or("Lingua mancante")?,
+                            None,
+                        )?;
+                    }
+                    "pages" => {
+                        let id = record["page_id"]
+                            .as_i64()
+                            .filter(|id| *id > 0)
+                            .ok_or("ID osservazione non valido")?;
+                        let orphan = record["orphan"]
+                            .as_bool()
+                            .ok_or("Stato orfana non valido")?;
+                        if record.get("biography").is_some() || record.get("gender_group").is_some()
+                        {
+                            return Err("Dataset con arricchimento esterno non autorizzato".into());
+                        }
+                        insert_page.execute(params![
+                            id,
+                            i64::try_from(count)?,
+                            orphan,
+                            serde_json::to_string(&record)?
+                        ])?;
+                        count += 1;
+                    }
+                    "link_candidates" => {
+                        let identifier = identifier.ok_or("ID candidate mancante")?;
+                        let id = identifier.parse::<i64>()?;
+                        if id <= 0
+                            || id.to_string() != identifier
+                            || !is_orphan.query_row([id], |row| row.get::<_, bool>(0))?
+                        {
+                            return Err("Candidate non corrispondenti a una voce orfana".into());
+                        }
+                        let status = match &record["status"] {
+                            Value::Null => None,
+                            Value::String(value) => Some(value.as_str()),
+                            _ => return Err("Stato candidate non valido".into()),
+                        };
+                        let number = match &record["candidate_count"] {
+                            Value::Null => None,
+                            value => Some(
+                                value
+                                    .as_i64()
+                                    .filter(|n| *n >= 0)
+                                    .ok_or("Conteggio candidate non valido")?,
+                            ),
+                        };
+                        insert_candidates.execute(params![id, status, number])?;
+                    }
+                    _ => return Err("Sezione CSV inattesa".into()),
+                }
+                Ok(())
+            },
+        )?;
+    }
+    transaction.commit()?;
+    if file_signature(source)? != signature {
+        return Err("Esportazione modificata durante la lettura".into());
+    }
+    let nonprintable = regex::Regex::new(r"[\p{C}\p{Z}]")?;
+    write_atomic(output, |file| {
+        let mut writer = BufWriter::with_capacity(65536, file);
+        writer.write_all(CSV_COLUMNS.join(",").as_bytes())?;
+        writer.write_all(b"\r\n")?;
+        let mut query = database.prepare("SELECT p.data,c.status,c.count FROM pages p LEFT JOIN candidates c ON c.id=p.id ORDER BY p.position")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let page: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let status = json!(row.get::<_, Option<String>>(1)?);
+            let number = json!(row.get::<_, Option<i64>>(2)?);
+            write_csv_row(
+                &mut writer,
+                CSV_COLUMNS.iter().map(|column| match *column {
+                    "candidate_count" => &number,
+                    "candidate_status" => &status,
+                    _ => &page[column],
+                }),
+                &nonprintable,
+            )?;
+        }
+        writer.flush()?;
+        if file_signature(source)? != signature {
+            return Err("Esportazione modificata durante il CSV".into());
+        }
+        Ok(())
+    })?;
+    Ok(count)
 }
 
 /// The table and scientific validation rules for a complete SQL supplement.
@@ -2078,7 +2408,7 @@ pub fn stage_supplement(
     {
         let mut writer = BufWriter::with_capacity(65536, &mut digest);
         let mut insert = transaction.prepare(&format!("INSERT INTO {table} VALUES(?,?)"))?;
-        visit_supplement(reader, &mut |section, record| {
+        visit_ordered_json(reader, false, &mut |section, _, record| {
             if section == "metadata" {
                 let meta = supplement_metadata(
                     kind,
