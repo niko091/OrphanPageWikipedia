@@ -2529,7 +2529,7 @@ fn publish_prepared(
     prepared: &std::path::Path,
     destination: &std::path::Path,
     original_manifest: Option<&[u8]>,
-    reused: &[(std::path::PathBuf, String)],
+    reused: &[ReusedExport],
     mut rename: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> DumpResult<()> {
     let _lock = PublicationLock::acquire(destination)?;
@@ -2542,8 +2542,10 @@ fn publish_prepared(
     if current.as_deref() != original_manifest {
         return Err("Manifest modificato da un altro writer".into());
     }
-    for (path, checksum) in reused {
-        if file_sha256(path)? != *checksum {
+    for reused in reused {
+        if file_signature(&reused.path)? != reused.signature
+            || file_sha256(&reused.path)? != reused.checksum
+        {
             return Err("Export riutilizzato modificato da un altro writer".into());
         }
     }
@@ -2583,10 +2585,111 @@ fn dataset_filename(value: &serde_json::Value) -> DumpResult<&str> {
     Ok(name)
 }
 
-/// Publish a prepared canonical member, its CSV and all dashboard transports.
-/// Existing scientific files are reusable only when their exact bytes agree.
-/// Changed results require a distinct filename so every old manifest remains
-/// usable throughout preparation and interrupted publication.
+#[cfg(feature = "cli")]
+struct ReusedExport {
+    path: std::path::PathBuf,
+    checksum: String,
+    signature: (u64, i64),
+}
+
+#[cfg(feature = "cli")]
+fn reuse_export(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    reused: &mut Vec<ReusedExport>,
+) -> DumpResult<bool> {
+    if !target.try_exists()? {
+        return Ok(false);
+    }
+    let signature = file_signature(target)?;
+    let checksum = file_sha256(source)?;
+    if file_sha256(target)? != checksum || file_signature(target)? != signature {
+        return Err(format!("Export già esistente con contenuto diverso: {}. Usare un nome distinto per conservare la generazione approvata",target.display()).into());
+    }
+    reused.push(ReusedExport {
+        path: target.into(),
+        checksum,
+        signature,
+    });
+    std::fs::remove_file(source)?;
+    Ok(true)
+}
+
+#[cfg(feature = "cli")]
+fn manifest_entry(
+    metadata: &serde_json::Value,
+    name: &str,
+    transports: Option<&serde_json::Value>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::json;
+    dataset_filename(&json!(name))?;
+    let mut entry = json!({"file":name,"language":metadata["language"],"date":metadata["finished_at"],
+        "published_at":topic_time(),"demo":metadata.get("demo").cloned().unwrap_or(json!(false)),
+        "kind":metadata.get("kind").cloned().unwrap_or(json!("wiki"))});
+    if let Some(transports) = transports {
+        entry
+            .as_object_mut()
+            .ok_or("Voce manifest non valida")?
+            .extend(
+                transports
+                    .as_object()
+                    .ok_or("Trasporti non validi")?
+                    .clone(),
+            );
+    }
+    Ok(entry)
+}
+
+#[cfg(feature = "cli")]
+struct PreparedMember {
+    metadata: serde_json::Value,
+    entry: serde_json::Value,
+    reused: Vec<ReusedExport>,
+}
+
+/// Prepare a member using the final approved source's stat fingerprint when
+/// its canonical bytes are reused. A temporary copy has a different mtime and
+/// cannot identify the previously approved file in prepared summary checks.
+#[cfg(feature = "cli")]
+fn prepare_member(
+    prepared: &PreparedDirectory,
+    output: &std::path::Path,
+    generation: &str,
+) -> DumpResult<PreparedMember> {
+    use serde_json::json;
+    let name = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Nome output non valido")?;
+    dataset_filename(&json!(name))?;
+    let source = prepared.path.join(name);
+    let mut reused = Vec::new();
+    let canonical = if reuse_export(&source, output, &mut reused)? {
+        output
+    } else {
+        source.as_path()
+    };
+    let metadata = first_metadata(canonical)?;
+    let csv = source.with_extension("csv");
+    export_csv(canonical, &csv)?;
+    reuse_export(&csv, &output.with_extension("csv"), &mut reused)?;
+    let transports = prepared.path.join("transports");
+    let names = prepare_dashboard_exports(canonical, &transports, None, Some(generation))?;
+    for name in names.as_object().ok_or("Trasporti non validi")?.values() {
+        let name = name.as_str().ok_or("Nome trasporto mancante")?;
+        std::fs::rename(transports.join(name), prepared.path.join(name))?;
+    }
+    std::fs::remove_dir(transports)?;
+    Ok(PreparedMember {
+        entry: manifest_entry(&metadata, name, Some(&names))?,
+        metadata,
+        reused,
+    })
+}
+
+/// Publish a prepared member with its CSV and every dashboard transport. A
+/// changed scientific result requires a distinct filename; manifest approval
+/// follows all moves and rechecks both bytes and fingerprints of reused files.
 #[cfg(feature = "cli")]
 fn publish_member(
     prepared: &PreparedDirectory,
@@ -2595,34 +2698,6 @@ fn publish_member(
     original_manifest: Option<&[u8]>,
 ) -> DumpResult<serde_json::Value> {
     use serde_json::{json, Value};
-    let folder = output.parent().ok_or("Directory output mancante")?;
-    let name = output
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("Nome output non valido")?;
-    dataset_filename(&json!(name))?;
-    let source = prepared.path.join(name);
-    let meta = first_metadata(&source)?;
-    let csv = source.with_extension("csv");
-    export_csv(&source, &csv)?;
-    let transports = prepared.path.join("transports");
-    let names = prepare_dashboard_exports(&source, &transports, None, Some(generation))?;
-    for name in names.as_object().ok_or("Trasporti non validi")?.values() {
-        let name = name.as_str().ok_or("Nome trasporto mancante")?;
-        std::fs::rename(transports.join(name), prepared.path.join(name))?;
-    }
-    std::fs::remove_dir(transports)?;
-    let mut reused = Vec::new();
-    for path in [&source, &csv] {
-        let target = folder.join(path.file_name().ok_or("Nome export mancante")?);
-        if target.try_exists()? {
-            if file_sha256(path)? != file_sha256(&target)? {
-                return Err(format!("Export già esistente con contenuto diverso: {}. Usare un nome distinto per conservare la generazione approvata",target.display()).into());
-            }
-            reused.push((target, file_sha256(path)?));
-            std::fs::remove_file(path)?;
-        }
-    }
     let mut manifest: Vec<Value> = original_manifest
         .map(serde_json::from_slice)
         .transpose()?
@@ -2633,28 +2708,24 @@ fn publish_member(
             return Err("Dataset duplicato nel manifest".into());
         }
     }
-    manifest
-        .retain(|entry| entry["file"] != name && (meta["demo"] == true || entry["demo"] != true));
-    let mut entry = json!({"file":name,"language":meta["language"],"date":meta["finished_at"],
-        "published_at":topic_time(),"demo":meta.get("demo").cloned().unwrap_or(json!(false)),
-        "kind":meta.get("kind").cloned().unwrap_or(json!("wiki"))});
-    entry
-        .as_object_mut()
-        .ok_or("Voce manifest non valida")?
-        .extend(names.as_object().ok_or("Trasporti non validi")?.clone());
-    manifest.push(entry);
+    let member = prepare_member(prepared, output, generation)?;
+    manifest.retain(|entry| {
+        entry["file"] != member.entry["file"]
+            && (member.metadata["demo"] == true || entry["demo"] != true)
+    });
+    manifest.push(member.entry);
     DumpClient::<WikimediaHttp>::write_json(
         &prepared.path.join("manifest.json"),
         &json!(manifest),
     )?;
     publish_prepared(
         &prepared.path,
-        folder,
+        output.parent().ok_or("Directory output mancante")?,
         original_manifest,
-        &reused,
+        &member.reused,
         |from, to| std::fs::rename(from, to),
     )?;
-    Ok(meta)
+    Ok(member.metadata)
 }
 
 /// Analyze a frozen input and publish one complete member without Python.
@@ -8345,6 +8416,46 @@ mod tests {
         let second = super::PublicationLock::acquire_file(&path).unwrap();
         drop(second);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn publication_rechecks_stat_fingerprints_of_identical_reused_files() {
+        let (root, _) = super::export_directory(&std::env::temp_dir()).unwrap();
+        let prepared = root.path.join("prepared");
+        let live = root.path.join("live");
+        std::fs::create_dir(&prepared).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(prepared.join("canonical.json"), b"approved").unwrap();
+        std::fs::write(live.join("canonical.json"), b"approved").unwrap();
+        std::fs::write(prepared.join("manifest.json"), b"new").unwrap();
+        std::fs::write(live.join("manifest.json"), b"old").unwrap();
+        let mut reused = Vec::new();
+        assert!(super::reuse_export(
+            &prepared.join("canonical.json"),
+            &live.join("canonical.json"),
+            &mut reused
+        )
+        .unwrap());
+        std::fs::File::open(live.join("canonical.json"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000)),
+            )
+            .unwrap();
+        assert!(
+            super::publish_prepared(&prepared, &live, Some(b"old"), &reused, |a, b| {
+                std::fs::rename(a, b)
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(live.join("manifest.json")).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(live.join("canonical.json")).unwrap(),
+            b"approved"
+        );
+        assert!(prepared.join("manifest.json").exists());
     }
 
     #[cfg(feature = "cli")]

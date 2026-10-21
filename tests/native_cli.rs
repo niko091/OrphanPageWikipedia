@@ -173,8 +173,24 @@ fn standalone_analysis_publishes_every_output_and_preserves_previous_generations
     assert_eq!(rows["pages"][0]["out_degree"], 1);
     assert_eq!(rows["pages"][1]["in_degree"], 1);
     assert_eq!(rows["pages"][2]["orphan"], true);
+    // Give the approved canonical file a reproducible old mtime. Its newly
+    // prepared temporary copy must never become the summary's fingerprint.
+    std::fs::File::open(w.0.join("exports/vec.json"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000)),
+        )
+        .unwrap();
     run();
     let next = read("exports/manifest.json");
+    for key in ["summary_file", "creator_index_file"] {
+        let summary = read(&format!("exports/{}", next[0][key].as_str().unwrap()));
+        assert_eq!(summary["sources"][0]["mtime_ns"], 1_000_000_000_000u64);
+        assert_eq!(summary["sources"][0]["size"], canonical.len());
+        assert_eq!(summary["sources"][0]["file"], "vec.json");
+    }
+
     assert_ne!(first[0]["articles_file"], next[0]["articles_file"]);
     for manifest in [&first, &next] {
         for (key, value) in manifest[0].as_object().unwrap() {
