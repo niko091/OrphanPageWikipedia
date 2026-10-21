@@ -17,4 +17,3 @@ web/assets/
 .DS_Store
 *.md
 !README.md
-!rust.md
