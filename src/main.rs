@@ -300,6 +300,28 @@ impl Invocation {
             }
             return Ok(());
         }
+        if self.name == "quality" {
+            let release = self
+                .args
+                .get_one::<String>("content-release")
+                .ok_or("Release XML mancante")?;
+            for (language, database) in &self.editions {
+                _native::dumps::infer_quality(
+                    &self.path("input-dir")?.join(format!("{language}-raw.json")),
+                    &self
+                        .path("root")?
+                        .join(database)
+                        .join(format!("content-{release}.json")),
+                    &self
+                        .path("output-dir")?
+                        .join(format!("{language}-quality.json")),
+                    &self.path("work-dir")?,
+                    &self.root.join("config/quality.json"),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
         Err(format!("Il backend Rust del comando {} non è ancora migrato; usare il percorso Python verificato. Nessun output pubblicato.", self.name))
     }
 }
