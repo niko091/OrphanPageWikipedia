@@ -2502,24 +2502,24 @@ fn predict_topic_batch(
 }
 
 #[cfg(feature = "cli")]
-struct TopicSpool(std::path::PathBuf);
+struct RecordSpool(std::path::PathBuf);
 
 #[cfg(feature = "cli")]
-impl Drop for TopicSpool {
+impl Drop for RecordSpool {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
 #[cfg(feature = "cli")]
-impl TopicSpool {
+impl RecordSpool {
     fn new(output: &std::path::Path) -> DumpResult<(Self, std::fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = output.parent().ok_or("Directory dei temi mancante")?;
+        let parent = output.parent().ok_or("Directory dei record mancante")?;
         std::fs::create_dir_all(parent)?;
         let path = parent.join(format!(
-            ".orphanwiki-topics-{}-{}.jsonl",
+            ".orphanwiki-records-{}-{}.jsonl",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2553,6 +2553,553 @@ impl TopicSpool {
     }
 }
 
+#[cfg(feature = "cli")]
+fn file_sha256(path: &std::path::Path) -> DumpResult<String> {
+    DumpClient::<WikimediaHttp>::verified_sha256(path, None, None)?
+        .ok_or_else(|| "Input mancante".into())
+}
+
+#[cfg(feature = "cli")]
+struct ImportedGraph {
+    metadata: serde_json::Value,
+    manifest: serde_json::Value,
+    manifest_path: std::path::PathBuf,
+    stage_path: std::path::PathBuf,
+    source: rusqlite::Connection,
+    expected: usize,
+    raw_signature: (u64, i64),
+}
+
+#[cfg(feature = "cli")]
+impl ImportedGraph {
+    fn open(
+        raw: &std::path::Path,
+        work: Option<&std::path::Path>,
+        items: bool,
+    ) -> DumpResult<Self> {
+        use serde_json::{json, Value};
+        use std::{collections::HashMap, path::Path};
+        let raw_signature = file_signature(raw)?;
+        let metadata = first_metadata(raw)?;
+        let language = metadata["language"]
+            .as_str()
+            .ok_or("Lingua del grafo mancante")?;
+        let database = crate::wiki_database(language, metadata["database"].as_str())?;
+        let release = metadata["sql_release"]
+            .as_str()
+            .ok_or("Release SQL mancante")?;
+        if metadata["complete"] != true
+            || metadata["source"] != format!("Wikimedia SQL dumps / {database}")
+            || metadata["finished_at"].as_str().is_none()
+            || (items
+                && metadata["item_mapping"]
+                    != json!({"source":"page_props.wikibase_item","complete":true}))
+            || release.len() != 8
+            || !release.bytes().all(|c| c.is_ascii_digit())
+        {
+            return Err("Serve un grafo SQL importato e completo".into());
+        }
+        let manifest_path = Path::new(
+            metadata["dump_manifest"]
+                .as_str()
+                .ok_or("Manifest SQL mancante")?,
+        )
+        .to_owned();
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        if file_sha256(&manifest_path)? != metadata["dump_manifest_sha256"]
+            || manifest["language"] != language
+            || manifest["database"] != database
+            || manifest["sql_release"] != release
+        {
+            return Err("Manifest SQL non corrispondente al grafo importato".into());
+        }
+        let parent = manifest_path.parent().unwrap_or(Path::new("."));
+        let default_work = parent.parent().unwrap_or(parent).join("staging");
+        let stage_path = work
+            .unwrap_or(&default_work)
+            .join(format!("{database}-{release}.sqlite"));
+        if !stage_path.is_file() {
+            return Err("Staging SQL mancante".into());
+        }
+        let source = rusqlite::Connection::open_with_flags(
+            &stage_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        source.execute_batch("BEGIN")?;
+        let imported = source
+            .prepare("SELECT table_name,sha256 FROM imported")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        if SQL_TABLES.iter().any(
+            |table| match manifest["files"][table]["sha256_local"].as_str() {
+                Some(expected) => imported.get(*table).map(String::as_str) != Some(expected),
+                None => true,
+            },
+        ) {
+            return Err("Staging SQL incompleto o non corrispondente al manifest".into());
+        }
+        let expected = source.query_row(
+            "SELECT COUNT(*) FROM dump_page WHERE ns=0 AND redirect=0",
+            [],
+            |r| r.get::<_, usize>(0),
+        )?;
+        if expected == 0
+            || source.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get::<_, usize>(0))?
+                != expected
+        {
+            return Err("Popolazione dello staging SQL incompleta".into());
+        }
+        Ok(Self {
+            metadata,
+            manifest,
+            manifest_path,
+            stage_path,
+            source,
+            expected,
+            raw_signature,
+        })
+    }
+
+    fn check_output(
+        &self,
+        raw: &std::path::Path,
+        output: &std::path::Path,
+        supplements: &[&std::path::Path],
+    ) -> DumpResult<()> {
+        use std::path::Path;
+        let output = resolved_path(output)?;
+        for input in [raw, self.stage_path.as_path(), self.manifest_path.as_path()]
+            .into_iter()
+            .chain(supplements.iter().copied())
+            .chain(
+                self.manifest["files"]
+                    .as_object()
+                    .ok_or("File SQL mancanti")?
+                    .values()
+                    .filter_map(|r| r["path"].as_str().map(Path::new)),
+            )
+        {
+            if resolved_path(input)? == output {
+                return Err("Output sovrapposto agli input".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cli")]
+fn sql_redirects(
+    source: &rusqlite::Connection,
+) -> DumpResult<std::collections::HashMap<String, String>> {
+    Ok(source.prepare("SELECT p.title,r.title FROM dump_redirect r JOIN dump_page p ON p.id=r.page_id WHERE p.ns=0 AND p.redirect=1 AND r.ns=0 AND COALESCE(r.interwiki,'')=''")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<_,_>>()?)
+}
+
+#[cfg(feature = "cli")]
+fn sql_category_parents(
+    source: &rusqlite::Connection,
+) -> DumpResult<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut parents = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut query = source.prepare("SELECT p.title,COALESCE(t.title,c.title) FROM dump_category c JOIN dump_page p ON p.id=c.source_id LEFT JOIN dump_target t ON t.id=c.target_id WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        parents.entry(row.get(0)?).or_default().push(row.get(1)?);
+    }
+    Ok(parents)
+}
+
+#[cfg(feature = "cli")]
+struct StagePage {
+    id: i64,
+    data: serde_json::Value,
+    links: Vec<String>,
+    categories: Vec<String>,
+}
+
+#[cfg(feature = "cli")]
+fn stage_page_batches(
+    source: &rusqlite::Connection,
+    batch_size: usize,
+    include_links: bool,
+    mut visit: impl FnMut(Vec<StagePage>) -> DumpResult<()>,
+) -> DumpResult<()> {
+    let mut pages_query = source.prepare("SELECT id,data FROM pages ORDER BY id")?;
+    let mut cats_query = source.prepare("SELECT id,target FROM categories ORDER BY id,rowid")?;
+    let mut links_query = source.prepare("SELECT id,target FROM links ORDER BY id,rowid")?;
+    let mut pages = pages_query.query([])?;
+    let mut cats = cats_query.query([])?;
+    let mut links = if include_links {
+        Some(links_query.query([])?)
+    } else {
+        None
+    };
+    let mut cat = next_relation(&mut cats)?;
+    let mut link = links.as_mut().map(next_relation).transpose()?.flatten();
+    let mut batch = Vec::with_capacity(batch_size);
+    while let Some(row) = pages.next()? {
+        let id = row.get::<_, i64>(0)?;
+        if cat.as_ref().is_some_and(|(source, _)| *source < id)
+            || link.as_ref().is_some_and(|(source, _)| *source < id)
+        {
+            return Err("Staging con relazione senza la voce sorgente".into());
+        }
+        let mut labels = Vec::new();
+        while cat.as_ref().is_some_and(|(source, _)| *source == id) {
+            if let Some((_, label)) = cat.take() {
+                labels.push(label);
+            }
+            cat = next_relation(&mut cats)?;
+        }
+        let mut targets = Vec::new();
+        while link.as_ref().is_some_and(|(source, _)| *source == id) {
+            if let Some((_, title)) = link.take() {
+                targets.push(title);
+            }
+            link = links.as_mut().map(next_relation).transpose()?.flatten();
+        }
+        let data: serde_json::Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        if data["page_id"].as_i64() != Some(id) || !data.is_object() {
+            return Err("Identità delle pagine SQL non corrispondenti".into());
+        }
+        batch.push(StagePage {
+            id,
+            data,
+            links: targets,
+            categories: labels,
+        });
+        if batch.len() == batch_size {
+            visit(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(batch_size),
+            ))?;
+        }
+    }
+    if link.is_some() || cat.is_some() {
+        return Err("Relazioni SQL non associate a voci".into());
+    }
+    if !batch.is_empty() {
+        visit(batch)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+struct StagedRecords<'a> {
+    rows: rusqlite::Rows<'a>,
+    next: Option<(i64, String)>,
+}
+
+#[cfg(feature = "cli")]
+impl<'a> StagedRecords<'a> {
+    fn new(query: &'a mut rusqlite::Statement<'_>) -> DumpResult<Self> {
+        let mut rows = query.query([])?;
+        let next = next_relation(&mut rows)?;
+        Ok(Self { rows, next })
+    }
+    fn take(&mut self, id: i64) -> DumpResult<serde_json::Value> {
+        if self.next.as_ref().map(|(next, _)| *next) != Some(id) {
+            return Err("Supplemento con ID mancanti o estranei al censimento".into());
+        }
+        let (_, encoded) = self.next.take().ok_or("Record supplemento mancante")?;
+        self.next = next_relation(&mut self.rows)?;
+        Ok(serde_json::from_str(&encoded)?)
+    }
+    fn finish(&self) -> DumpResult<()> {
+        if self.next.is_some() {
+            return Err("Record supplemento oltre il censimento".into());
+        }
+        Ok(())
+    }
+}
+
+/// Inputs for the bounded canonical SQL analysis. This API prepares one member;
+/// CSV, browser transports and manifest publication belong to the export stage.
+#[cfg(feature = "cli")]
+pub struct AnalysisOptions<'a> {
+    pub rules: &'a serde_json::Value,
+    pub work_dir: Option<&'a std::path::Path>,
+    pub history: Option<&'a std::path::Path>,
+    pub quality: Option<&'a std::path::Path>,
+    pub topics: Option<&'a std::path::Path>,
+    pub batch_size: usize,
+}
+
+/// Analyze the complete verified SQL census, retaining only title/redirect and
+/// category indices, degree arrays and bounded observation/supplement batches.
+/// A failed census or join cannot replace an approved canonical output.
+#[cfg(feature = "cli")]
+pub fn analyze_imported_graph(
+    raw_path: &std::path::Path,
+    output: &std::path::Path,
+    options: &AnalysisOptions<'_>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::{json, Value};
+    use std::{collections::HashMap, io::Write};
+    if !(1..=512).contains(&options.batch_size) || !options.rules.is_object() {
+        return Err("Regole o dimensione del blocco di analisi non valide".into());
+    }
+    let imported = ImportedGraph::open(raw_path, options.work_dir, false)?;
+    let supplements = [options.history, options.quality, options.topics]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    imported.check_output(raw_path, output, &supplements)?;
+    let ImportedGraph {
+        metadata: graph_metadata,
+        manifest_path,
+        source,
+        expected,
+        raw_signature,
+        ..
+    } = imported;
+    let rules = options.rules;
+    let native_rules: crate::CategoryRules = serde_json::from_value(json!([
+        rules.get("exclude_patterns").cloned().unwrap_or(json!([])),
+        rules
+            .get("exclude_categories")
+            .cloned()
+            .unwrap_or(json!([])),
+        rules.get("category_priority").cloned().unwrap_or(json!({})),
+        rules.get("page_overrides").cloned().unwrap_or(json!({})),
+        rules.get("min_support").cloned().unwrap_or(json!(5))
+    ]))?;
+    let mut ids = Vec::with_capacity(expected);
+    let mut titles = Vec::with_capacity(expected);
+    {
+        let mut query = source.prepare("SELECT d.id,d.title,p.data FROM dump_page d LEFT JOIN pages p ON p.id=d.id WHERE d.ns=0 AND d.redirect=0 ORDER BY d.id")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            let title = row.get::<_, String>(1)?;
+            let page: Value = serde_json::from_str(&row.get::<_, String>(2)?)?;
+            if page["page_id"].as_i64() != Some(id)
+                || page["title"] != title
+                || ids.last().is_some_and(|last| *last >= id)
+            {
+                return Err("Identità delle pagine SQL incomplete o incoerenti".into());
+            }
+            ids.push(id);
+            titles.push(title);
+        }
+    }
+    if ids.len() != expected {
+        return Err("Identità SQL incomplete".into());
+    }
+    let mut graph = crate::GraphAccumulator::new(titles, sql_redirects(&source)?, None)?;
+    let mut categories = crate::CategoryBatchClassifier::new(
+        expected,
+        sql_category_parents(&source)?.into_iter().collect(),
+        native_rules,
+    )?;
+    let mut position = 0;
+    stage_page_batches(&source, options.batch_size, true, |batch| {
+        let mut targets = Vec::with_capacity(batch.len());
+        let mut labels = Vec::with_capacity(batch.len());
+        for page in batch {
+            if ids.get(position) != Some(&page.id) {
+                return Err("Ordine delle pagine SQL incoerente".into());
+            }
+            targets.push(page.links);
+            labels.push(page.categories);
+            position += 1;
+        }
+        graph.add_batch(targets)?;
+        categories.add_support_batch(labels)?;
+        Ok(())
+    })?;
+    if position != expected {
+        return Err("Analisi SQL non completa".into());
+    }
+    let (incoming, outgoing, unresolved) = graph.finish()?;
+    drop(graph);
+    let raw_checksum = file_sha256(raw_path)?;
+    // An empty SQLite filename is a private disk-backed temporary database,
+    // deleted by SQLite when the owned connection closes, including on errors.
+    let mut stage = rusqlite::Connection::open("")?;
+    stage.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE")?;
+    let mut history_meta = json!({"status":"not_collected","matched_pages":0});
+    let mut quality_meta = None;
+    let mut topic_meta = None;
+    for (path, kind) in [
+        (options.history, SupplementKind::History),
+        (options.quality, SupplementKind::Quality),
+        (options.topics, SupplementKind::Topics),
+    ] {
+        if let Some(path) = path {
+            let meta = stage_supplement(
+                path,
+                &mut stage,
+                kind,
+                &graph_metadata,
+                expected,
+                Some(&raw_checksum),
+            )?;
+            match kind {
+                SupplementKind::History => history_meta = meta,
+                SupplementKind::Quality => quality_meta = Some(meta),
+                SupplementKind::Topics => topic_meta = Some(meta),
+            }
+        }
+    }
+    stage.execute_batch("CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS quality(id INTEGER PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY,data TEXT NOT NULL)")?;
+    let mut history_query = stage.prepare("SELECT id,data FROM history ORDER BY id")?;
+    let mut quality_query = stage.prepare("SELECT id,data FROM quality ORDER BY id")?;
+    let mut topic_query = stage.prepare("SELECT id,data FROM topics ORDER BY id")?;
+    let mut history = StagedRecords::new(&mut history_query)?;
+    let mut quality = StagedRecords::new(&mut quality_query)?;
+    let mut topics = StagedRecords::new(&mut topic_query)?;
+    let taxonomy = topic_meta
+        .as_ref()
+        .map(|meta| serde_json::from_value(meta["model"]["labels"].clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let (spool, file) = RecordSpool::new(output)?;
+    let mut writer = std::io::BufWriter::with_capacity(65536, file);
+    position = 0;
+    stage_page_batches(&source, options.batch_size, false, |batch| {
+        let choices = categories
+            .classify_batch(batch.iter().map(|p| (p.id, p.categories.clone())).collect())?;
+        let mut rows = Vec::with_capacity(batch.len());
+        for (mut page, choice) in batch.into_iter().zip(choices) {
+            if ids.get(position) != Some(&page.id) {
+                return Err("Ordine SQL cambiato durante l'export".into());
+            }
+            page.data["categories"] = json!(page.categories);
+            rows.push(crate::observation_row(
+                &page.data,
+                &choice,
+                incoming[position],
+                outgoing[position],
+                false,
+            )?);
+            position += 1;
+        }
+        crate::initialize_creator_rows(&mut rows)?;
+        for (enabled, kind, cursor) in [
+            (
+                options.history.is_some(),
+                SupplementKind::History,
+                &mut history,
+            ),
+            (
+                options.quality.is_some(),
+                SupplementKind::Quality,
+                &mut quality,
+            ),
+            (
+                options.topics.is_some(),
+                SupplementKind::Topics,
+                &mut topics,
+            ),
+        ] {
+            let mut records = HashMap::with_capacity(rows.len());
+            if enabled {
+                for row in &rows {
+                    let id = row["page_id"].as_i64().ok_or("ID osservazione mancante")?;
+                    records.insert(id, cursor.take(id)?);
+                }
+            }
+            match kind {
+                SupplementKind::History => {
+                    crate::join_history_rows(
+                        &mut rows,
+                        &records,
+                        if enabled {
+                            "missing_page"
+                        } else {
+                            "not_collected"
+                        },
+                    )?;
+                }
+                SupplementKind::Quality if enabled => {
+                    crate::join_quality_rows(&mut rows, &records)?
+                }
+                SupplementKind::Topics if enabled => {
+                    crate::join_topic_rows(&mut rows, &records, &taxonomy)?;
+                }
+                _ => {}
+            }
+        }
+        crate::observation_ages(
+            &mut rows,
+            graph_metadata["finished_at"]
+                .as_str()
+                .ok_or("Data SQL mancante")?,
+            true,
+        )?;
+        for row in rows {
+            serde_json::to_writer(&mut writer, &row)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })?;
+    history.finish()?;
+    quality.finish()?;
+    topics.finish()?;
+    if position != expected
+        || file_signature(raw_path)? != raw_signature
+        || file_sha256(&manifest_path)? != graph_metadata["dump_manifest_sha256"]
+    {
+        return Err("Censimento incompleto o input modificati durante l'analisi".into());
+    }
+    writer.flush()?;
+    drop(writer);
+    let mut meta = graph_metadata;
+    meta["creators"] = crate::initialize_creator_rows(&mut [])?;
+    meta["history"] = history_meta;
+    for (key, value) in [
+        ("unresolved_target_occurrences", json!(unresolved)),
+        ("category_rule", json!("structural_specificity_v1")),
+        ("category_rules", rules.clone()),
+        ("engine", json!("rust")),
+        ("age_rule", json!("unavailable_no_approved_creation_event")),
+        ("measures_rule", json!("creation_quality_creators_v3")),
+        (
+            "historical_age_rule",
+            json!(if options.history.is_some() {
+                "mediawiki_history_first_observed_revision_v1"
+            } else {
+                "not_collected"
+            }),
+        ),
+        ("length_unit", json!("UTF-8 wikitext bytes")),
+        ("input_sha256", json!(raw_checksum)),
+        ("input_checksum_format", json!("raw_file_bytes_v1")),
+        ("analysis_source", json!("verified_import_stage")),
+    ] {
+        meta[key] = value;
+    }
+    if meta["history"]["creation_rule"] == HISTORY_RULE {
+        meta["age_rule"] = json!(HISTORY_RULE);
+        if meta["article_features"].is_null() {
+            meta["article_features"] = json!({});
+        }
+        meta["article_features"]
+            .as_object_mut()
+            .ok_or("Metadati delle misure non validi")?
+            .insert(
+                "age".into(),
+                json!("MediaWiki History / page_creation_timestamp"),
+            );
+    }
+    for (key, supplement, feature) in [
+        ("quality", quality_meta, "johnson_v2_2022_01"),
+        ("topics", topic_meta, "local_model_predictions"),
+    ] {
+        if let Some(supplement) = supplement {
+            meta[key] = supplement;
+            if meta["article_features"].is_null() {
+                meta["article_features"] = json!({});
+            }
+            let features = meta["article_features"]
+                .as_object_mut()
+                .ok_or("Metadati delle misure non validi")?;
+            features.insert(key.into(), json!(feature));
+        }
+    }
+    spool.publish(output, &meta)?;
+    Ok(meta)
+}
+
 /// Infer a full SQL edition with the verified staging's three indexed streams.
 /// Only titles, QIDs, redirects, category hierarchy and one edge batch reside
 /// in memory; an expired budget never publishes a partial edition.
@@ -2566,105 +3113,30 @@ pub fn predict_imported_topics(
     deadline: Option<std::time::Instant>,
     work_dir: Option<&std::path::Path>,
 ) -> DumpResult<serde_json::Value> {
-    use rusqlite::OpenFlags;
     use serde_json::{json, Value};
     use sha2::Digest;
-    use std::{collections::HashMap, io::Write, path::Path, time::Instant};
+    use std::{io::Write, time::Instant};
     validate_topic_spec(spec)?;
     validate_topic_labels(&model.labels()?, spec)?;
     if !(1..=10000).contains(&batch_size) {
         return Err("Dimensione del blocco non valida".into());
     }
-    let metadata = first_metadata(raw_path)?;
-    if metadata.get("finished_at").is_none() {
-        return Err("Identità temporale del grafo mancante".into());
-    }
-    let language = metadata["language"]
-        .as_str()
-        .ok_or("Lingua del grafo mancante")?;
-    let database = crate::wiki_database(language, metadata["database"].as_str())?;
-    if metadata["complete"] != true
-        || metadata["item_mapping"] != json!({"source":"page_props.wikibase_item","complete":true})
-        || metadata["source"] != format!("Wikimedia SQL dumps / {database}")
-    {
-        return Err("Serve un grafo SQL verificato con QID completi".into());
-    }
-    let manifest_path = Path::new(
-        metadata["dump_manifest"]
-            .as_str()
-            .ok_or("Manifest SQL mancante")?,
-    );
-    let manifest: Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
-    let hash = |path: &Path| -> DumpResult<String> {
-        DumpClient::<WikimediaHttp>::verified_sha256(path, None, None)?
-            .ok_or_else(|| "Input dei temi mancante".into())
-    };
-    if hash(manifest_path)? != metadata["dump_manifest_sha256"]
-        || manifest["language"] != language
-        || manifest["database"] != database
-        || manifest["sql_release"] != metadata["sql_release"]
-    {
-        return Err("Manifest SQL non corrispondente al grafo importato".into());
-    }
-    let release = metadata["sql_release"]
-        .as_str()
-        .ok_or("Release SQL mancante")?;
-    if release.len() != 8 || !release.bytes().all(|c| c.is_ascii_digit()) {
-        return Err("Release SQL non valida".into());
-    }
-    let parent = manifest_path.parent().unwrap_or(Path::new("."));
-    let default_work = parent.parent().unwrap_or(parent).join("staging");
-    let stage = work_dir
-        .unwrap_or(&default_work)
-        .join(format!("{database}-{release}.sqlite"));
-    if !stage.is_file() {
-        return Err("Staging SQL mancante".into());
-    }
-    for input in [raw_path, stage.as_path(), manifest_path]
-        .into_iter()
-        .chain(
-            manifest["files"]
-                .as_object()
-                .ok_or("File SQL mancanti")?
-                .values()
-                .filter_map(|record| record["path"].as_str().map(Path::new)),
-        )
-    {
-        if resolved_path(input)? == resolved_path(output)? {
-            return Err("Output dei temi sovrapposto agli input".into());
-        }
-    }
     topic_deadline(deadline)?;
     let started = topic_time();
     let begin = Instant::now();
-    let raw_signature = file_signature(raw_path)?;
-    let source = rusqlite::Connection::open_with_flags(&stage, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // Keep all cursors and the identity index on one consistent snapshot.
-    source.execute_batch("BEGIN")?;
-    let imported = source
-        .prepare("SELECT table_name,sha256 FROM imported")?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    if SQL_TABLES.iter().any(
-        |table| match manifest["files"][table]["sha256_local"].as_str() {
-            Some(expected) => imported.get(*table).map(String::as_str) != Some(expected),
-            None => true,
-        },
-    ) {
-        return Err("Staging SQL incompleto o non corrispondente al manifest".into());
-    }
-    let expected = source.query_row(
-        "SELECT COUNT(*) FROM dump_page WHERE ns=0 AND redirect=0",
-        [],
-        |r| r.get::<_, usize>(0),
-    )?;
-    if expected == 0
-        || source.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get::<_, usize>(0))? != expected
-    {
-        return Err("Popolazione dello staging SQL incompleta".into());
-    }
+    let imported = ImportedGraph::open(raw_path, work_dir, true)?;
+    imported.check_output(raw_path, output, &[])?;
+    let ImportedGraph {
+        metadata,
+        manifest_path,
+        source,
+        expected,
+        raw_signature,
+        ..
+    } = imported;
+    let language = metadata["language"]
+        .as_str()
+        .ok_or("Lingua del grafo mancante")?;
     let mut identities = Vec::with_capacity(expected);
     let mut titles = Vec::with_capacity(expected);
     let mut items = Vec::with_capacity(expected);
@@ -2697,19 +3169,12 @@ pub fn predict_imported_topics(
             known.insert(item);
         }
     }
-    let redirects = source.prepare("SELECT p.title,r.title FROM dump_redirect r JOIN dump_page p ON p.id=r.page_id WHERE p.ns=0 AND p.redirect=1 AND r.ns=0 AND COALESCE(r.interwiki,'')=''")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<HashMap<_,_>,_>>()?;
-    let mut parents = std::collections::BTreeMap::<String, Vec<String>>::new();
-    {
-        let mut query = source.prepare("SELECT p.title,COALESCE(t.title,c.title) FROM dump_category c JOIN dump_page p ON p.id=c.source_id LEFT JOIN dump_target t ON t.id=c.target_id WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            parents.entry(row.get(0)?).or_default().push(row.get(1)?);
-        }
-    }
+    let redirects = sql_redirects(&source)?;
+    let parents = sql_category_parents(&source)?;
     let mut inputs = crate::TopicInputAccumulator::new(titles, items, redirects.clone(), known)?;
     let graph_seconds = begin.elapsed().as_secs_f64();
     topic_deadline(deadline)?;
-    let (spool, file) = TopicSpool::new(output)?;
+    let (spool, file) = RecordSpool::new(output)?;
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
     let mut digest = sha2::Sha256::new();
     digest.update(b"{\"category_parents\": ");
@@ -2802,9 +3267,9 @@ pub fn predict_imported_topics(
     digest.update(python_json(&json!(redirects))?.as_bytes());
     digest.update(b"}");
     topic_deadline(deadline)?;
-    let raw_checksum = hash(raw_path)?;
+    let raw_checksum = file_sha256(raw_path)?;
     if file_signature(raw_path)? != raw_signature
-        || hash(manifest_path)? != metadata["dump_manifest_sha256"]
+        || file_sha256(&manifest_path)? != metadata["dump_manifest_sha256"]
     {
         return Err("Input dei temi modificati durante l'inferenza".into());
     }

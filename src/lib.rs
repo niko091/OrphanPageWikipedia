@@ -244,6 +244,11 @@ struct IncrementalGraph {
 
 impl IncrementalGraph {
     fn resolve(&mut self, original: &str) -> Option<usize> {
+        // Article titles already have an index. Arbitrary dangling targets
+        // must not accumulate across batches: only redirect chains need cache.
+        if !self.redirects.contains_key(original) {
+            return self.index.get(original).copied();
+        }
         if let Some(found) = self.resolved.get(original) {
             return *found;
         }
@@ -265,7 +270,9 @@ impl IncrementalGraph {
             }
         };
         for item in path {
-            self.resolved.insert(item.to_owned(), found);
+            if self.redirects.contains_key(item) {
+                self.resolved.insert(item.to_owned(), found);
+            }
         }
         found
     }
@@ -1286,6 +1293,59 @@ pub fn observation_ages(
 mod tests {
     use super::*;
 
+    #[test]
+    fn unresolved_fanout_cannot_accumulate_in_cross_batch_redirect_caches() {
+        use super::{GraphAccumulator, TopicInputAccumulator};
+        use std::collections::{HashMap, HashSet};
+        let titles = vec!["A".into(), "B".into(), "C".into()];
+        let redirects: HashMap<String, String> = [
+            ("R", "R2"),
+            ("R2", "B"),
+            ("X", "Y"),
+            ("Y", "X"),
+            ("D", "missing"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect();
+        let mut graph = GraphAccumulator::new(titles.clone(), redirects.clone(), None).unwrap();
+        let mut topics = TopicInputAccumulator::new(
+            titles,
+            vec![Some("Q1".into()), Some("Q2".into()), Some("Q3".into())],
+            redirects.clone(),
+            HashSet::from(["Q2".into()]),
+        )
+        .unwrap();
+        let mut first = (0..60000)
+            .map(|i| format!("Unavailable {i}"))
+            .collect::<Vec<_>>();
+        first.extend(["R", "R2", "A", "D", "X"].map(str::to_owned));
+        graph.add_batch(vec![first.clone()]).unwrap();
+        assert_eq!(
+            topics.add_batch(vec![first]).unwrap(),
+            vec![("Q2".into(), 1, true)]
+        );
+        let mut second = (0..1000)
+            .map(|i| format!("Unavailable {i}"))
+            .collect::<Vec<_>>();
+        second.extend(["R", "X", "D"].map(str::to_owned));
+        graph
+            .add_batch(vec![second.clone(), vec!["R".into()]])
+            .unwrap();
+        assert_eq!(
+            topics.add_batch(vec![second, vec!["R".into()]]).unwrap(),
+            vec![("".into(), 0, false), ("Q2".into(), 1, true)]
+        );
+        assert_eq!(
+            graph.finish().unwrap(),
+            (vec![0, 2, 0], vec![1, 0, 1], 61004)
+        );
+        topics.finish().unwrap();
+        for cache in [&graph.inner.resolved, &topics.graph.resolved] {
+            assert!(cache.len() <= redirects.len());
+            assert!(cache.keys().all(|key| redirects.contains_key(key)));
+        }
+    }
     #[test]
     fn collection_bounds_use_instants_and_reject_invalid_intervals() {
         let start = "2026-01-01T01:00:00+02:00";
