@@ -204,6 +204,22 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "refresh-measures" {
+            let input = self.path("input-dir")?;
+            let output = self.path("data-dir")?;
+            for (language, _) in &self.editions {
+                let quality = input.join(format!("{language}-quality.json"));
+                _native::dumps::refresh_measures(
+                    &input.join(format!("{language}-raw.json")),
+                    &input.join(format!("{language}-history.json")),
+                    &output,
+                    quality.is_file().then_some(quality.as_path()),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            _native::dumps::publish_available_aggregate(&output).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if self.name == "compare" {
             let mut paths = if let Some(inputs) = self.args.get_many::<String>("inputs") {
                 inputs.map(|p| self.root.join(p)).collect::<Vec<_>>()

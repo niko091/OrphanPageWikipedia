@@ -1,7 +1,7 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
     analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, comparison_schema,
-    stage_comparison_graph, AnalysisOptions, SQL_TABLES,
+    refresh_measures, stage_comparison_graph, AnalysisOptions, SQL_TABLES,
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -451,4 +451,160 @@ fn large_sql_comparison_builds_complete_eligible_edges_from_verified_staging() {
     assert_eq!(meta["analysis_source"], "verified_import_stage");
     assert_eq!(meta["input_checksum_format"], "raw_file_bytes_v1");
     assert_eq!(meta["input_sha256"], hash(&fs::read(path).unwrap()));
+}
+
+#[test]
+fn refresh_retains_exact_graph_topics_and_reference_edges_with_bounded_new_measure_joins() {
+    let w = Workspace::new(523);
+    w.run(7, true).unwrap();
+    let mut result = w.read("result.json");
+    result["metadata"]["comparison"] = json!({"rule":"cross_language_incoming_v1","status":"compared","reference_languages":["lmo","fr"]});
+    let candidates = json!({"10":{"status":"compared","candidate_count":1,"counterparts":[],"candidates":[{"page_id":13,"title":"È 🌙 1","out_degree":0,"dead_end":true,"evidence":[{"language":"fr","source_page_id":103,"source_title":"Source fr","target_page_id":110,"target_title":"Target fr"},{"language":"lmo","source_page_id":203,"source_title":"Source lmo","target_page_id":210,"target_title":"Target lmo"}]}]}});
+    let output = w.0.join("exports");
+    fs::create_dir(&output).unwrap();
+    let source = output.join("approved.json");
+    fs::write(
+        &source,
+        format!(
+            "{{\"metadata\":{},\"pages\":{},\"link_candidates\":{candidates}}}",
+            result["metadata"], result["pages"]
+        ),
+    )
+    .unwrap();
+    fs::write(output.join("manifest.json"),json!([{"file":"approved.json","language":"vec","date":result["metadata"]["finished_at"],"published_at":"2000-01-01T00:00:00Z"}]).to_string()).unwrap();
+    let original = fs::read(&source).unwrap();
+    let raw_before = fs::read(w.0.join("raw.json")).unwrap();
+    let mut history = w.read("history.json");
+    history["pages"][0]["page_created_at"] = json!("2020-01-01T00:00:00Z");
+    history["pages"][0]["creator_tenure_days"] = json!(0.0);
+    history["pages"][0]["creator_prior_articles"] = json!(7);
+    w.write("history.json", &history);
+    let name = refresh_measures(
+        &w.0.join("raw.json"),
+        &w.0.join("history.json"),
+        &output,
+        Some(&w.0.join("quality.json")),
+    )
+    .unwrap();
+    let refreshed: Value = serde_json::from_slice(&fs::read(output.join(&name)).unwrap()).unwrap();
+    assert_ne!(name, "approved.json");
+    assert_eq!(refreshed["link_candidates"], candidates);
+    let before = result["pages"].as_array().unwrap();
+    let after = refreshed["pages"].as_array().unwrap();
+    assert_eq!(before.len(), after.len());
+    for (a, b) in before.iter().zip(after) {
+        for field in [
+            "page_id",
+            "title",
+            "revision_id",
+            "in_degree",
+            "out_degree",
+            "orphan",
+            "category",
+            "category_candidates",
+            "topic_labels",
+            "topic_status",
+            "topic_input_count",
+            "quality_score",
+            "content_revision_id",
+            "quality_revision_relation",
+        ] {
+            assert_eq!(a[field], b[field], "{field}");
+        }
+    }
+    assert!(after[0]["age_days"].as_f64().unwrap() > 2000.0);
+    assert_eq!(after[0]["creator_tenure_days"], 0.0);
+    assert_eq!(after[0]["creator_prior_articles"], 7);
+    assert!(after[1]["age_days"].is_null());
+    assert_eq!(after[1]["creation_date_status"], "after_graph_collection");
+    assert_eq!(
+        refreshed["metadata"]["history"]["creation_rule"],
+        "mediawiki_history_page_creation_v2"
+    );
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read(w.0.join("raw.json")).unwrap(), raw_before);
+    let approved = fs::read(output.join(&name)).unwrap();
+    let next = refresh_measures(
+        &w.0.join("raw.json"),
+        &w.0.join("history.json"),
+        &output,
+        Some(&w.0.join("quality.json")),
+    )
+    .unwrap();
+    assert_eq!(next, name);
+    assert_eq!(fs::read(output.join(&name)).unwrap(), approved);
+    let manifest = fs::read(output.join("manifest.json")).unwrap();
+    history["pages"][522]["page_id"] = json!(999999);
+    w.write("history.json", &history);
+    assert!(refresh_measures(
+        &w.0.join("raw.json"),
+        &w.0.join("history.json"),
+        &output,
+        Some(&w.0.join("quality.json"))
+    )
+    .is_err());
+    assert_eq!(fs::read(output.join("manifest.json")).unwrap(), manifest);
+    assert_eq!(fs::read(output.join(&name)).unwrap(), approved);
+}
+
+#[test]
+fn refresh_without_new_quality_retains_its_published_legacy_definition() {
+    let w = Workspace::new(6);
+    w.run(7, true).unwrap();
+    let mut result = w.read("result.json");
+    result["metadata"]["measures_rule"] = json!("creation_quality_creators_v2");
+    result["metadata"]["quality"]
+        .as_object_mut()
+        .unwrap()
+        .remove("quality_revision_rule");
+    for row in result["pages"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("content_revision_id");
+        row.as_object_mut()
+            .unwrap()
+            .remove("quality_revision_relation");
+    }
+    let output = w.0.join("exports");
+    fs::create_dir(&output).unwrap();
+    fs::write(
+        output.join("legacy.json"),
+        format!(
+            "{{\"metadata\":{},\"pages\":{}}}",
+            result["metadata"], result["pages"]
+        ),
+    )
+    .unwrap();
+    fs::write(
+        output.join("manifest.json"),
+        json!([{"language":"vec","file":"legacy.json","date":result["metadata"]["finished_at"]}])
+            .to_string(),
+    )
+    .unwrap();
+    let name = refresh_measures(
+        &w.0.join("raw.json"),
+        &w.0.join("history.json"),
+        &output,
+        None,
+    )
+    .unwrap();
+    let updated: Value = serde_json::from_slice(&fs::read(output.join(name)).unwrap()).unwrap();
+    assert_eq!(
+        updated["metadata"]["measures_rule"],
+        "creation_quality_creators_v2"
+    );
+    assert!(updated["pages"][0].get("content_revision_id").is_none());
+    assert!(updated["pages"][0]
+        .get("quality_revision_relation")
+        .is_none());
+    let manifest = fs::read(output.join("manifest.json")).unwrap();
+    let mut history = w.read("history.json");
+    history["metadata"]["creation_rule"] = json!("legacy");
+    w.write("history.json", &history);
+    assert!(refresh_measures(
+        &w.0.join("raw.json"),
+        &w.0.join("history.json"),
+        &output,
+        None
+    )
+    .is_err());
+    assert_eq!(fs::read(output.join("manifest.json")).unwrap(), manifest);
 }
