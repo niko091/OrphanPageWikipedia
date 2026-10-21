@@ -1,5 +1,5 @@
-//! Bounded MySQL dump row decoding. The caller supplies one INSERT statement
-//! at a time; this module never retains a table or reads files into memory.
+//! Bounded MySQL decoding and optional standalone verified dump acquisition,
+//! SQL graph import and MediaWiki History reconstruction.
 
 pub fn parse_insert(statement: &str) -> Result<Vec<Vec<Option<String>>>, String> {
     let offset = if statement.trim_start().starts_with('(') {
@@ -1166,9 +1166,16 @@ fn resolved_path(path: &std::path::Path) -> DumpResult<std::path::PathBuf> {
 fn history_timestamp(value: Option<&str>) -> Option<String> {
     use chrono::Timelike;
     let value = value?;
-    let pattern =
-        regex::Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
-            .ok()?;
+    static PATTERN: std::sync::OnceLock<Result<regex::Regex, regex::Error>> =
+        std::sync::OnceLock::new();
+    let pattern = PATTERN
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$",
+            )
+        })
+        .as_ref()
+        .ok()?;
     if !pattern.is_match(value) {
         return None;
     }
@@ -1406,6 +1413,959 @@ pub fn import_graph(
     })?;
     println!("Grafo da dump: {expected} voci; {}", output.display());
     Ok(expected)
+}
+
+/// Operational History controls do not change scientific checkpoint identities.
+#[cfg(feature = "cli")]
+#[derive(Clone, Copy)]
+pub struct HistoryOptions {
+    pub cache_mib: u32,
+    pub commit_rows: usize,
+    pub creation_cache: usize,
+}
+
+#[cfg(feature = "cli")]
+impl Default for HistoryOptions {
+    fn default() -> Self {
+        Self {
+            cache_mib: 256,
+            commit_rows: 250_000,
+            creation_cache: 100_000,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+const HISTORY_RULE: &str = "mediawiki_history_page_creation_v2";
+
+// Preserve partition order without requiring an ordered JSON-map dependency.
+#[cfg(feature = "cli")]
+#[derive(serde::Deserialize)]
+struct HistoryManifest {
+    language: String,
+    database: Option<String>,
+    sql_release: String,
+    history_release: String,
+    #[serde(deserialize_with = "history_files")]
+    files: Vec<(String, serde_json::Value)>,
+}
+
+#[cfg(feature = "cli")]
+fn history_files<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<(String, serde_json::Value)>, D::Error> {
+    struct Files;
+    impl<'de> serde::de::Visitor<'de> for Files {
+        type Value = Vec<(String, serde_json::Value)>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a dump file map")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut files = Vec::new();
+            while let Some(entry) = map.next_entry()? {
+                files.push(entry);
+            }
+            Ok(files)
+        }
+    }
+    deserializer.deserialize_map(Files)
+}
+
+#[cfg(feature = "cli")]
+struct HistoryScan<'a> {
+    database: &'a str,
+    pages: &'a std::collections::BTreeSet<i64>,
+    users: Option<&'a std::collections::BTreeSet<i64>>,
+    options: HistoryOptions,
+}
+
+#[cfg(feature = "cli")]
+#[derive(Default)]
+struct HistoryBuffer {
+    rows: Vec<Vec<rusqlite::types::Value>>,
+    events: Vec<Vec<rusqlite::types::Value>>,
+    creations: std::collections::BTreeSet<(i64, String)>,
+    scanned: usize,
+    retained: usize,
+    pending: usize,
+    commits: usize,
+    cache_hits: usize,
+    creation_rows: usize,
+    scratch_rows: usize,
+    scratch_bytes: u64,
+    max_buffer: usize,
+    sqlite_seconds: f64,
+}
+
+#[cfg(feature = "cli")]
+impl HistoryBuffer {
+    fn flush(
+        &mut self,
+        connection: &rusqlite::Connection,
+        name: &str,
+        initial: bool,
+        scratch: bool,
+        commit_rows: usize,
+    ) -> DumpResult<()> {
+        let count = self.rows.len() + self.events.len() + self.creations.len();
+        if count == 0 {
+            return Ok(());
+        }
+        self.max_buffer = self.max_buffer.max(count);
+        let before = std::time::Instant::now();
+        let query = if initial {
+            "INSERT INTO history_initial VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+        } else {
+            "INSERT INTO history_edit VALUES(?,?,?,?,?)"
+        };
+        let mut statement = connection.prepare_cached(query)?;
+        for row in &self.rows {
+            statement.execute(rusqlite::params_from_iter(row))?;
+        }
+        self.retained += self.rows.len();
+        self.rows.clear();
+        let mut statement =
+            connection.prepare_cached("INSERT INTO history_page_event VALUES(?,?,?,?)")?;
+        for row in &self.events {
+            statement.execute(rusqlite::params_from_iter(row))?;
+        }
+        self.events.clear();
+        let query = if scratch {
+            "INSERT INTO history_creation_pending VALUES(?,?)"
+        } else {
+            "INSERT OR IGNORE INTO history_creation VALUES(?,?,?)"
+        };
+        let mut statement = connection.prepare_cached(query)?;
+        for (page, created) in &self.creations {
+            if scratch {
+                statement.execute(rusqlite::params![page, created])?;
+                self.scratch_rows += 1;
+            } else {
+                self.creation_rows += statement.execute(rusqlite::params![name, page, created])?;
+            }
+        }
+        self.creations.clear();
+        self.pending += count;
+        self.maybe_commit(connection, commit_rows)?;
+        self.sqlite_seconds += before.elapsed().as_secs_f64();
+        Ok(())
+    }
+    fn maybe_commit(
+        &mut self,
+        connection: &rusqlite::Connection,
+        commit_rows: usize,
+    ) -> DumpResult<()> {
+        if self.pending >= commit_rows {
+            connection.execute_batch("COMMIT; BEGIN")?;
+            self.commits += 1;
+            self.pending = 0;
+        }
+        Ok(())
+    }
+    fn progress(&self, database: &str, name: &str, phase: &str, elapsed: f64, done: bool) {
+        eprintln!("MediaWiki History {database}: {name} {phase}, {} righe lette; {} righe utili; {} creazioni duplicate in cache; {} commit; {elapsed:.1}s, SQLite {:.1}s; {:.0} righe/s; {} creazioni finali; {} append scratch; {} byte scratch SQLite; buffer massimo {}{}",
+            self.scanned, self.retained + self.rows.len(), self.cache_hits, self.commits,
+            self.sqlite_seconds, self.scanned as f64 / elapsed.max(0.001), self.creation_rows, self.scratch_rows, self.scratch_bytes, self.max_buffer,
+            if done { "; COMPLETATO" } else { "" });
+    }
+}
+
+#[cfg(feature = "cli")]
+fn history_decimal(value: &str) -> DumpResult<Option<i64>> {
+    // Python str.isdecimal accepts Unicode Nd, but not superscripts or other
+    // numeric characters. Official IDs normally take the fast ASCII path.
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.is_ascii() {
+        return if value.bytes().all(|b| b.is_ascii_digit()) {
+            Ok(Some(value.parse()?))
+        } else {
+            Ok(None)
+        };
+    }
+    static DECIMAL: std::sync::OnceLock<Result<regex::Regex, regex::Error>> =
+        std::sync::OnceLock::new();
+    let decimal = DECIMAL
+        .get_or_init(|| regex::Regex::new(r"^\p{Nd}$"))
+        .as_ref()
+        .map_err(|e| e.to_string())?;
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            normalized.push(character);
+            continue;
+        }
+        if !decimal.is_match(&character.to_string()) {
+            return Ok(None);
+        }
+        // Decimal digit blocks contain complete, ordered runs of ten digits;
+        // adjoining mathematical styles can form a run of fifty.
+        let mut code = character as u32;
+        let mut digit = 0;
+        while let Some(previous) = code.checked_sub(1).and_then(char::from_u32) {
+            if !decimal.is_match(&previous.to_string()) {
+                break;
+            }
+            digit = (digit + 1) % 10;
+            code -= 1;
+        }
+        normalized.push(char::from(b'0' + digit));
+    }
+    Ok(Some(normalized.parse()?))
+}
+
+#[cfg(feature = "cli")]
+fn scan_history(
+    connection: &rusqlite::Connection,
+    name: &str,
+    data: &serde_json::Value,
+    scan: &HistoryScan<'_>,
+) -> DumpResult<()> {
+    use rusqlite::types::Value as Sql;
+    use rusqlite::{params, OptionalExtension};
+    use sha2::Digest;
+    use std::collections::{BTreeSet, HashMap};
+    use std::io::{BufRead, BufReader};
+    let initial = scan.users.is_none();
+    let phase = if initial { "initial" } else { "activity" };
+    let digest = data["sha256_local"]
+        .as_str()
+        .ok_or("Checksum History mancante")?;
+    let suffix = if let Some(users) = scan.users {
+        // Python's default JSON separators are part of the existing identity.
+        let json = format!(
+            "[{}]",
+            users
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        format!("{:x}", sha2::Sha256::digest(json.as_bytes()))
+    } else {
+        HISTORY_RULE.to_owned()
+    };
+    let identity = format!("{digest}:{suffix}");
+    let previous: Option<String> = connection
+        .query_row(
+            "SELECT sha256 FROM history_imported WHERE file=? AND phase=?",
+            params![name, phase],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if previous.as_deref() == Some(&identity) {
+        eprintln!(
+            "MediaWiki History {}: {name} {phase}, SALTA checkpoint completo",
+            scan.database
+        );
+        return Ok(());
+    }
+    let table = if initial {
+        "history_initial"
+    } else {
+        "history_edit"
+    };
+    connection.execute_batch("BEGIN")?;
+    connection.execute(&format!("DELETE FROM {table} WHERE file=?"), [name])?;
+    if initial {
+        connection.execute("DELETE FROM history_page_event WHERE file=?", [name])?;
+        connection.execute("DELETE FROM history_creation WHERE file=?", [name])?;
+    }
+    connection.execute(
+        "DELETE FROM history_imported WHERE file=? AND phase=?",
+        params![name, phase],
+    )?;
+    connection.execute_batch("COMMIT; BEGIN")?;
+    let scratch = initial && scan.pages.len() > scan.options.creation_cache;
+    if scratch {
+        connection.execute_batch("CREATE TEMP TABLE history_creation_pending(page_id INTEGER NOT NULL,created TEXT NOT NULL)")?;
+    }
+    let result = (|| -> DumpResult<()> {
+        let path = data["path"].as_str().ok_or("Percorso History mancante")?;
+        let mut reader =
+            BufReader::new(bzip2::read::MultiBzDecoder::new(std::fs::File::open(path)?));
+        let started = std::time::Instant::now();
+        let mut reported = started;
+        let mut buffer = HistoryBuffer::default();
+        // Exactly bounded LRU: one map and one ordered entry per identity,
+        // including repeated hits. Eviction never discards conflicting evidence.
+        let mut recent = HashMap::<(i64, String), usize>::new();
+        let mut order = BTreeSet::<(usize, (i64, String))>::new();
+        let mut line = String::new();
+        let text = |s: &str| Sql::Text(s.to_owned());
+        let optional = |s: &str| if s.is_empty() { Sql::Null } else { text(s) };
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            buffer.scanned += 1;
+            if buffer.scanned % 10_000 == 0 && reported.elapsed().as_secs() >= 30 {
+                buffer.progress(
+                    scan.database,
+                    name,
+                    phase,
+                    started.elapsed().as_secs_f64(),
+                    false,
+                );
+                reported = std::time::Instant::now();
+            }
+            let row = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+            if row.len() != 78 || row[0] != scan.database {
+                return Err(format!(
+                    "MediaWiki History: schema o wiki inattesi in {name}:{}",
+                    buffer.scanned
+                )
+                .into());
+            }
+            if initial {
+                let Some(page) = history_decimal(row[28]).ok().flatten() else {
+                    continue;
+                };
+                if !scan.pages.contains(&page) {
+                    continue;
+                }
+                if matches!(row[2], "page" | "revision") && !row[37].is_empty() {
+                    let key = (page, row[37].to_owned());
+                    if let Some(tick) = recent.insert(key.clone(), buffer.scanned) {
+                        order.remove(&(tick, key.clone()));
+                        buffer.cache_hits += 1;
+                    } else {
+                        buffer.creations.insert(key.clone());
+                    }
+                    order.insert((buffer.scanned, key));
+                    if recent.len() > scan.options.creation_cache {
+                        if let Some((_, key)) = order.pop_first() {
+                            recent.remove(&key);
+                        }
+                    }
+                }
+                if row[2] == "page" && matches!(row[3], "create" | "import" | "merge") {
+                    buffer.events.push(vec![
+                        text(name),
+                        Sql::Integer(page),
+                        text(row[3]),
+                        text(row[4]),
+                    ]);
+                } else if row[2] == "revision" && row[3] == "create" && row[61] == "0" {
+                    let revision = history_decimal(row[60])?
+                        .ok_or_else(|| format!("Revisione iniziale priva di ID: {page}"))?;
+                    let user = history_decimal(row[6])?
+                        .map(Sql::Integer)
+                        .unwrap_or(Sql::Null);
+                    let hidden = row[63]
+                        .split(',')
+                        .any(|part| matches!(part.trim(), "user" | "user_is_deleted"));
+                    buffer.rows.push(vec![
+                        text(name),
+                        Sql::Integer(page),
+                        Sql::Integer(revision),
+                        text(row[4]),
+                        user,
+                        Sql::Integer(i64::from(hidden)),
+                        optional(row[12]),
+                        optional(row[77]),
+                        optional(row[23]),
+                        optional(row[37]),
+                        optional(row[38]),
+                        Sql::Integer(i64::from(row[76] == "true")),
+                    ]);
+                }
+            } else if row[2] == "revision" && row[3] == "create" {
+                if let Some(user) = history_decimal(row[6]).ok().flatten() {
+                    if scan.users.is_some_and(|users| users.contains(&user)) {
+                        let Some(revision) = history_decimal(row[60])? else {
+                            continue;
+                        };
+                        let namespace = if row[31].is_empty() { row[33] } else { row[31] };
+                        if history_decimal(namespace.trim_start_matches('-'))?.is_some() {
+                            let namespace = namespace.parse::<i64>()?;
+                            buffer.rows.push(vec![
+                                text(name),
+                                Sql::Integer(revision),
+                                Sql::Integer(user),
+                                text(row[4]),
+                                Sql::Integer(namespace),
+                            ]);
+                        }
+                    }
+                }
+            }
+            if buffer.rows.len() >= 5000
+                || buffer.events.len() >= 5000
+                || buffer.creations.len() >= 5000
+            {
+                buffer.flush(connection, name, initial, scratch, scan.options.commit_rows)?;
+            }
+        }
+        buffer.flush(connection, name, initial, scratch, scan.options.commit_rows)?;
+        if scratch {
+            let before = std::time::Instant::now();
+            connection.execute_batch("CREATE TEMP TABLE history_creation_ordered AS SELECT DISTINCT page_id,created FROM history_creation_pending ORDER BY page_id,created")?;
+            buffer.scratch_bytes = connection
+                .query_row("PRAGMA temp.page_count", [], |r| r.get::<_, u64>(0))?
+                * connection.query_row("PRAGMA temp.page_size", [], |r| r.get::<_, u64>(0))?;
+            connection.execute_batch("DROP TABLE history_creation_pending")?;
+            buffer.sqlite_seconds += before.elapsed().as_secs_f64();
+            let mut first = 1;
+            loop {
+                let before = std::time::Instant::now();
+                let inserted = connection.execute("INSERT INTO history_creation SELECT ?,page_id,created FROM history_creation_ordered WHERE rowid>=? AND rowid<? ORDER BY rowid",params![name,first,first+5000])?;
+                buffer.creation_rows += inserted;
+                buffer.pending += inserted;
+                buffer.maybe_commit(connection, scan.options.commit_rows)?;
+                buffer.sqlite_seconds += before.elapsed().as_secs_f64();
+                if inserted < 5000 {
+                    break;
+                }
+                first += 5000;
+                if reported.elapsed().as_secs() >= 30 {
+                    buffer.progress(
+                        scan.database,
+                        name,
+                        phase,
+                        started.elapsed().as_secs_f64(),
+                        false,
+                    );
+                    reported = std::time::Instant::now();
+                }
+            }
+        }
+        let before = std::time::Instant::now();
+        connection.execute(
+            "INSERT INTO history_imported VALUES(?,?,?)",
+            params![name, phase, identity],
+        )?;
+        connection.execute_batch("COMMIT")?;
+        buffer.commits += 1;
+        buffer.sqlite_seconds += before.elapsed().as_secs_f64();
+        buffer.progress(
+            scan.database,
+            name,
+            phase,
+            started.elapsed().as_secs_f64(),
+            true,
+        );
+        Ok(())
+    })();
+    // Preserve committed incomplete rows for diagnostics, but never their marker.
+    if !connection.is_autocommit() {
+        connection.execute_batch("ROLLBACK")?;
+    }
+    if scratch {
+        connection.flush_prepared_statement_cache();
+        connection.execute_batch("DROP TABLE IF EXISTS history_creation_pending; DROP TABLE IF EXISTS history_creation_ordered")?;
+    }
+    result
+}
+
+#[cfg(feature = "cli")]
+fn history_records(
+    connection: &rusqlite::Connection,
+    pages: &std::collections::BTreeSet<i64>,
+    database: &str,
+) -> DumpResult<Vec<serde_json::Value>> {
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
+    #[derive(Default)]
+    struct Events {
+        creates: usize,
+        first: String,
+        imported: bool,
+    }
+    let mut dates = HashMap::<i64, HashSet<Option<String>>>::new();
+    let mut query = connection.prepare("SELECT DISTINCT page_id,created FROM history_creation")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(1)?;
+        dates
+            .entry(row.get(0)?)
+            .or_default()
+            .insert(history_timestamp(Some(&raw)));
+    }
+    let mut initial = HashMap::<i64, (usize, Value)>::new();
+    let mut query = connection.prepare("SELECT page_id,revision_id,at,user_id,hidden,groups,tags,registration,page_created,page_first,before_creation FROM history_initial ORDER BY page_id,at,revision_id")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let entry = initial.entry(row.get(0)?).or_insert((0, Value::Null));
+        entry.0 += 1;
+        if entry.0 == 1 {
+            entry.1 = json!({"revision":row.get::<_,i64>(1)?,"at":row.get::<_,String>(2)?,
+                "user":row.get::<_,Option<i64>>(3)?,"hidden":row.get::<_,i64>(4)? != 0,
+                "groups":row.get::<_,Option<String>>(5)?,"tags":row.get::<_,Option<String>>(6)?,
+                "registration":row.get::<_,Option<String>>(7)?,"created":row.get::<_,Option<String>>(8)?,
+                "first":row.get::<_,Option<String>>(9)?,"before":row.get::<_,i64>(10)? != 0});
+        }
+    }
+    let mut events = HashMap::<i64, Events>::new();
+    let mut query = connection.prepare("SELECT page_id,event,at FROM history_page_event")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let event: String = row.get(1)?;
+        let entry = events.entry(row.get(0)?).or_default();
+        if event == "create" {
+            entry.creates += 1;
+            if entry.creates == 1 {
+                entry.first = row.get(2)?;
+            }
+        }
+        entry.imported |= matches!(event.as_str(), "import" | "merge");
+    }
+    let mut records = Vec::with_capacity(pages.len());
+    for page in pages {
+        let dates = dates.remove(page).unwrap_or_default();
+        let created = if dates.len() == 1 {
+            dates.iter().next().cloned().flatten()
+        } else {
+            None
+        };
+        let date_status = if created.is_some() {
+            "reconstructed_history"
+        } else if dates.is_empty() {
+            "missing_history_creation"
+        } else {
+            "ambiguous_history_creation"
+        };
+        let mut record = json!({"page_id":page,"first_revision_id":null,"article_created_at":null,
+            "creator_key":null,"creator_user_id":null,"creator_attribution":"history_missing_initial_revision",
+            "creator_groups_at_creation":null,"creator_groups_status":"unknown",
+            "creator_continuity_months_before_creation":null,"creator_continuity_bucket_before_creation":null,
+            "creator_prior_edits_main_history":null,"creator_prior_edits_other_history":null,
+            "creator_history_status":"unavailable","page_created_at":created,"creation_date_status":date_status,
+            "creator_registered_at":null,"creator_tenure_days":null,"creator_prior_articles":null,
+            "creator_account_type":null,"creator_is_bot_now":null});
+        if let Some((count, revision)) = initial.remove(page) {
+            if count > 1 {
+                record["creator_attribution"] = json!("history_ambiguous_initial_revisions");
+            } else {
+                let at = revision["at"]
+                    .as_str()
+                    .ok_or("Timestamp History mancante")?;
+                record["first_revision_id"] = revision["revision"].clone();
+                record["article_created_at"] = json!(history_timestamp(Some(at)));
+                let event = events.remove(page).unwrap_or_default();
+                let mismatch = |key: &str| {
+                    revision[key]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s != at)
+                };
+                let attribution = if record["article_created_at"].is_null()
+                    || mismatch("created")
+                    || mismatch("first")
+                {
+                    "history_inconsistent_creation_dates"
+                } else if event.imported || revision["before"] == true || event.creates > 1 {
+                    "history_imported_or_ambiguous"
+                } else if event.creates > 0 && event.first != at {
+                    "history_create_event_mismatch"
+                } else if revision["hidden"] == true || revision["user"].is_null() {
+                    "history_hidden_or_unregistered_creator"
+                } else {
+                    "history_initial_revision_observed"
+                };
+                record["creator_attribution"] = json!(attribution);
+                if attribution == "history_initial_revision_observed" {
+                    let user = revision["user"]
+                        .as_i64()
+                        .ok_or("Identità History mancante")?;
+                    record["creator_user_id"] = json!(user);
+                    record["creator_key"] = json!(format!("{database}:history-user:{user}"));
+                    if let Some(groups) = revision["groups"].as_str().filter(|s| !s.is_empty()) {
+                        record["creator_groups_at_creation"] =
+                            json!(groups.split(',').collect::<Vec<_>>());
+                        record["creator_groups_status"] = json!("observed");
+                    }
+                    record["creator_history_status"] = json!("pending_activity");
+                    record["creator_registered_at"] =
+                        json!(history_timestamp(revision["registration"].as_str()));
+                    if let Some(tags) = revision["tags"].as_str().filter(|s| !s.is_empty()) {
+                        record["creation_tags_history"] =
+                            json!(tags.split(',').collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+#[cfg(feature = "cli")]
+fn history_creator_metrics(
+    connection: &rusqlite::Connection,
+    records: &mut [serde_json::Value],
+    users: &std::collections::BTreeSet<i64>,
+) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::collections::{BTreeMap, HashSet};
+    let mut by_user = BTreeMap::<i64, Vec<usize>>::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(user) = record["creator_user_id"].as_i64() {
+            by_user.entry(user).or_default().push(index);
+        }
+    }
+    let finish = |user: i64, edits: Vec<(String, i32)>, records: &mut [Value]| -> DumpResult<()> {
+        let indices = by_user
+            .get(&user)
+            .ok_or("Attività History priva di autore attribuito")?;
+        let mut group = Vec::new();
+        let mut dates = Vec::new();
+        for &index in indices {
+            let record = &mut records[index];
+            if let Some(date) = record["page_created_at"].as_str() {
+                group.push(index);
+                dates.push(date.replace('T', " ").trim_end_matches("+00:00").to_owned());
+            } else {
+                record["creator_history_status"] = json!("observed_surviving_history");
+            }
+        }
+        match history_activity(edits, dates) {
+            Ok(summaries) => {
+                for (index, (main, other, months, bucket)) in group.into_iter().zip(summaries) {
+                    let record = &mut records[index];
+                    record["creator_prior_edits_main_history"] = json!(main);
+                    record["creator_prior_edits_other_history"] = json!(other);
+                    record["creator_continuity_months_before_creation"] = json!(months);
+                    record["creator_continuity_bucket_before_creation"] = json!(bucket);
+                    record["creator_history_status"] = json!("observed_surviving_history");
+                }
+            }
+            Err(_) => {
+                for index in group {
+                    records[index]["creator_history_status"] = json!("invalid_history_timestamp");
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut query =
+        connection.prepare("SELECT user_id,at,namespace FROM history_edit ORDER BY user_id,at")?;
+    let mut rows = query.query([])?;
+    let mut previous = None;
+    let mut edits = Vec::new();
+    let mut finished = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let user = row.get::<_, i64>(0)?;
+        if let Some(previous) = previous.filter(|&previous| previous != user) {
+            finish(previous, std::mem::take(&mut edits), records)?;
+            finished.insert(previous);
+        }
+        previous = Some(user);
+        edits.push((row.get(1)?, row.get(2)?));
+    }
+    if let Some(previous) = previous {
+        finish(previous, edits, records)?;
+        finished.insert(previous);
+    }
+    for &user in users {
+        if !finished.contains(&user) {
+            finish(user, Vec::new(), records)?;
+        }
+    }
+    for indices in by_user.values() {
+        let mut dates = indices
+            .iter()
+            .filter_map(|&index| {
+                let record = &records[index];
+                (record["creator_history_status"] == "observed_surviving_history")
+                    .then(|| record["page_created_at"].as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        dates.sort();
+        for &index in indices {
+            let record = &mut records[index];
+            if record["creator_history_status"] == "observed_surviving_history" {
+                if let Some(date) = record["page_created_at"].as_str() {
+                    record["creator_prior_articles"] =
+                        json!(dates.partition_point(|prior| prior.as_str() < date));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reconstruct History supplements from verified partitions and existing SQL
+/// staging. No graph, topics or collected research input is regenerated.
+#[cfg(feature = "cli")]
+pub fn import_history(
+    manifest_path: &std::path::Path,
+    output: &std::path::Path,
+    work_dir: &std::path::Path,
+    options: HistoryOptions,
+) -> DumpResult<usize> {
+    use rusqlite::OptionalExtension;
+    use serde_json::json;
+    use std::collections::{BTreeSet, HashMap};
+    use std::io::Write;
+    if !(1..=65536).contains(&options.cache_mib) {
+        return Err("Cache History: usare da 1 a 65536 MiB".into());
+    }
+    if !(1..=10_000_000).contains(&options.commit_rows) {
+        return Err("Commit History: usare da 1 a 10000000 record".into());
+    }
+    if options.creation_cache == 0 {
+        return Err("Cache delle identità History vuota".into());
+    }
+    let manifest: HistoryManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+    let database = crate::wiki_database(&manifest.language, manifest.database.as_deref())?;
+    let stage = work_dir.join(format!("{database}-{}.sqlite", manifest.sql_release));
+    if !stage.is_file() {
+        return Err("Importare prima il grafo SQL della stessa wiki".into());
+    }
+    let files = manifest
+        .files
+        .iter()
+        .filter(|(name, _)| name.ends_with(".tsv.bz2"))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err("Manifest senza partizioni MediaWiki History".into());
+    }
+    let resolved_output = resolved_path(output)?;
+    if resolved_output == resolved_path(manifest_path)? || resolved_output == resolved_path(&stage)?
+    {
+        return Err("Output e input/staging devono essere distinti".into());
+    }
+    for (_, data) in &manifest.files {
+        if let Some(path) = data["path"].as_str() {
+            if resolved_output == resolved_path(std::path::Path::new(path))? {
+                return Err("Output e input/staging devono essere distinti".into());
+            }
+        }
+    }
+    let connection =
+        rusqlite::Connection::open_with_flags(&stage, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.execute_batch(&format!("PRAGMA temp_store=FILE; PRAGMA cache_size=-{};
+        CREATE TABLE IF NOT EXISTS history_imported(file TEXT NOT NULL,phase TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(file,phase));
+        CREATE TABLE IF NOT EXISTS history_initial(file TEXT NOT NULL,page_id INTEGER NOT NULL,revision_id INTEGER NOT NULL,at TEXT NOT NULL,user_id INTEGER,hidden INTEGER NOT NULL,groups TEXT,tags TEXT,registration TEXT,page_created TEXT,page_first TEXT,before_creation INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS history_page_event(file TEXT NOT NULL,page_id INTEGER NOT NULL,event TEXT NOT NULL,at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS history_edit(file TEXT NOT NULL,revision_id INTEGER NOT NULL,user_id INTEGER NOT NULL,at TEXT NOT NULL,namespace INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS history_creation(file TEXT NOT NULL,page_id INTEGER NOT NULL,created TEXT NOT NULL,PRIMARY KEY(file,page_id,created));", options.cache_mib*1024))?;
+    let file = |name: &str| {
+        manifest
+            .files
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, data)| data)
+    };
+    if SQL_TABLES.iter().all(|name| file(name).is_some()) {
+        for name in SQL_TABLES {
+            let digest: Option<String> = connection
+                .query_row(
+                    "SELECT sha256 FROM imported WHERE table_name=?",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if digest.as_deref() != file(name).and_then(|data| data["sha256_local"].as_str()) {
+                return Err("Staging SQL non verificato per la cronologia".into());
+            }
+        }
+    }
+    let pages = connection
+        .prepare("SELECT id FROM dump_page WHERE ns=0 AND redirect=0")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if pages.is_empty() {
+        return Err("Staging SQL incompleto".into());
+    }
+    eprintln!("MediaWiki History {database}: cache SQLite {} MiB; commit ogni circa {} record; batch Rust fino a 5000 per tipo",options.cache_mib,options.commit_rows);
+    for (name, data) in &files {
+        let path = std::path::Path::new(data["path"].as_str().ok_or("Percorso History mancante")?);
+        let digest = data["sha256_local"]
+            .as_str()
+            .ok_or("Checksum History mancante")?;
+        if !path.is_file()
+            || Some(path.metadata()?.len()) != data["bytes"].as_u64()
+            || DumpClient::<WikimediaHttp>::verified_sha256(path, None, Some(digest))?.is_none()
+        {
+            return Err(format!("Partizione MediaWiki History modificata: {name}").into());
+        }
+        scan_history(
+            &connection,
+            name,
+            data,
+            &HistoryScan {
+                database: &database,
+                pages: &pages,
+                users: None,
+                options,
+            },
+        )?;
+    }
+    let mut records = history_records(&connection, &pages, &database)?;
+    let snapshot =
+        history_timestamp(file("user_groups").and_then(|data| data["job_updated"].as_str()))
+            .map(Ok)
+            .unwrap_or_else(|| {
+                let date = chrono::NaiveDate::parse_from_str(&manifest.sql_release, "%Y%m%d")?;
+                Ok::<_, chrono::ParseError>(format!("{}T00:00:00+00:00", date.format("%Y-%m-%d")))
+            })?;
+    let mut bots = HashMap::<i64, Vec<Option<String>>>::new();
+    let has_imported = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name='imported'",
+            [],
+            |r| r.get::<_, i32>(0),
+        )
+        .optional()?
+        .is_some();
+    let has_bots = has_imported
+        && connection
+            .query_row(
+                "SELECT 1 FROM imported WHERE table_name='user_groups'",
+                [],
+                |r| r.get::<_, i32>(0),
+            )
+            .optional()?
+            .is_some();
+    if has_bots {
+        let mut query =
+            connection.prepare("SELECT user_id,expiry FROM dump_group WHERE name='bot'")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            bots.entry(row.get(0)?).or_default().push(row.get(1)?);
+        }
+    }
+    for record in &mut records {
+        if let Some(user) = record["creator_user_id"].as_i64().filter(|_| has_bots) {
+            let (mut bot, mut unknown) = (false, false);
+            for expiry in bots.get(&user).into_iter().flatten() {
+                if let Some(expiry) = expiry {
+                    let parsed = if expiry.len() == 14
+                        && expiry.bytes().all(|b| b.is_ascii_digit())
+                        && !expiry.starts_with("0000")
+                    {
+                        chrono::NaiveDateTime::parse_from_str(expiry, "%Y%m%d%H%M%S")
+                            .ok()
+                            .and_then(|dt| {
+                                history_timestamp(Some(&dt.format("%Y-%m-%d %H:%M:%S").to_string()))
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(expiry) = parsed {
+                        bot |= expiry > snapshot;
+                    } else {
+                        unknown = true;
+                    }
+                } else {
+                    bot = true;
+                }
+            }
+            if bot || !unknown {
+                record["creator_is_bot_now"] = json!(bot);
+                record["creator_account_type"] = json!(if bot { "bot" } else { "no_bot_flag" });
+            }
+        }
+        if let (Some(created), Some(registered)) = (
+            record["page_created_at"].as_str(),
+            record["creator_registered_at"].as_str(),
+        ) {
+            let parse = |date: &str| chrono::DateTime::parse_from_rfc3339(date);
+            let micros = (parse(created)? - parse(registered)?)
+                .num_microseconds()
+                .ok_or("Intervallo History fuori limite")?;
+            if micros >= 0 {
+                record["creator_tenure_days"] = json!(micros as f64 / 1_000_000.0 / 86400.0);
+            }
+        }
+    }
+    let users = records
+        .iter()
+        .filter_map(|r| r["creator_user_id"].as_i64())
+        .collect::<BTreeSet<_>>();
+    for (name, data) in &files {
+        scan_history(
+            &connection,
+            name,
+            data,
+            &HistoryScan {
+                database: &database,
+                pages: &pages,
+                users: Some(&users),
+                options,
+            },
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)",
+    )?;
+    history_creator_metrics(&connection, &mut records, &users)?;
+    let history_files = files
+        .iter()
+        .map(|(name, data)| ((*name).clone(), data["sha256_local"].clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let metadata = json!({"language":manifest.language,"database":database,"creation_rule":HISTORY_RULE,"creator_metrics_rule":HISTORY_RULE,
+        "account_type_snapshot_at":snapshot,"source":format!("MediaWiki History dumps / {database}"),
+        "sql_release":manifest.sql_release,"history_release":manifest.history_release,"complete":true,
+        "creator_definition":"single visible parent-zero revision in reconstructed history; not an observed creation event",
+        "experience_scope":"public surviving revisions strictly before reconstructed page creation; prior articles restricted to the census",
+        "continuity_rule":"consecutive completed precreation calendar months with at least five edits; Vital Signs stability adaptation",
+        "group_scope":"nonempty reconstructed historical group list at first revision; blank means unknown","history_files":history_files});
+    write_atomic(output, |file| {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+        writer.write_all(b"{\"metadata\":")?;
+        serde_json::to_writer(&mut writer, &metadata)?;
+        writer.write_all(b",\"pages\":[")?;
+        for (index, record) in records.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut writer, record)?;
+        }
+        writer.write_all(b"]}\n")?;
+        writer.flush()?;
+        Ok(())
+    })?;
+    eprintln!(
+        "Cronologia da dump: {} voci; {}",
+        records.len(),
+        output.display()
+    );
+    Ok(records.len())
+}
+
+/// Execute the combined CLI stage, rejecting output collisions before either
+/// export can replace an input or the other scientific supplement.
+#[cfg(feature = "cli")]
+pub fn import_dumps(
+    manifest_path: &std::path::Path,
+    graph_output: &std::path::Path,
+    history_output: &std::path::Path,
+    work_dir: &std::path::Path,
+    options: HistoryOptions,
+) -> DumpResult<(usize, usize)> {
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+    let language = manifest["language"]
+        .as_str()
+        .ok_or("Lingua del manifest mancante")?;
+    let database = crate::wiki_database(language, manifest["database"].as_str())?;
+    let release = manifest["sql_release"]
+        .as_str()
+        .ok_or("Release SQL mancante")?;
+    let stage = work_dir.join(format!("{database}-{release}.sqlite"));
+    let graph = resolved_path(graph_output)?;
+    let history = resolved_path(history_output)?;
+    let mut inputs = vec![resolved_path(manifest_path)?, resolved_path(&stage)?];
+    if let Some(files) = manifest["files"].as_object() {
+        for data in files.values() {
+            if let Some(path) = data["path"].as_str() {
+                inputs.push(resolved_path(std::path::Path::new(path))?);
+            }
+        }
+    }
+    if graph == history || inputs.contains(&graph) || inputs.contains(&history) {
+        return Err("Output e input/staging devono essere distinti".into());
+    }
+    let graph_count = import_graph(manifest_path, graph_output, work_dir)?;
+    let history_count = import_history(manifest_path, history_output, work_dir, options)?;
+    Ok((graph_count, history_count))
 }
 
 #[cfg(test)]

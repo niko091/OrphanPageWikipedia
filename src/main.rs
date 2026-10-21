@@ -227,6 +227,79 @@ impl Invocation {
             }
             return Ok(());
         }
+        if matches!(self.name.as_str(), "import-dumps" | "import-history") {
+            use _native::dumps::{import_dumps, import_history, HistoryOptions};
+            let options = HistoryOptions {
+                cache_mib: *self
+                    .args
+                    .get_one::<u32>("history-cache-mib")
+                    .ok_or("Cache History mancante")?,
+                commit_rows: *self
+                    .args
+                    .get_one::<u32>("history-commit-rows")
+                    .ok_or("Commit History mancante")? as usize,
+                ..HistoryOptions::default()
+            };
+            let work = self.path("work-dir")?;
+            if self.args.get_one::<String>("manifest").is_some() {
+                let manifest_path = self.path("manifest")?;
+                let manifest: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&manifest_path).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                let language = manifest["language"]
+                    .as_str()
+                    .ok_or("Lingua del manifest mancante")?;
+                _native::wiki_database(language, manifest["database"].as_str())?;
+                let history_argument = if self.name == "import-dumps" {
+                    "history-output"
+                } else {
+                    "output"
+                };
+                let output = self
+                    .args
+                    .get_one::<String>(history_argument)
+                    .map(|path| self.root.join(path))
+                    .unwrap_or_else(|| {
+                        self.root
+                            .join(format!("data/imported/{language}-history.json"))
+                    });
+                if self.name == "import-dumps" {
+                    let graph = self
+                        .args
+                        .get_one::<String>("output")
+                        .map(|path| self.root.join(path))
+                        .unwrap_or_else(|| {
+                            self.root.join(format!("data/imported/{language}-raw.json"))
+                        });
+                    import_dumps(&manifest_path, &graph, &output, &work, options)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    import_history(&manifest_path, &output, &work, options)
+                        .map_err(|e| e.to_string())?;
+                }
+            } else {
+                let sql = self
+                    .args
+                    .get_one::<String>("sql-release")
+                    .ok_or("Release SQL mancante")?;
+                let history = self
+                    .args
+                    .get_one::<String>("history-release")
+                    .ok_or("Release History mancante")?;
+                for (language, database) in &self.editions {
+                    let path = self
+                        .path("root")?
+                        .join(database)
+                        .join(format!("manifest-{sql}-{history}.json"));
+                    let output = self
+                        .path("output-dir")?
+                        .join(format!("{language}-history.json"));
+                    import_history(&path, &output, &work, options).map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(());
+        }
         Err(format!("Il backend Rust del comando {} non è ancora migrato; usare il percorso Python verificato. Nessun output pubblicato.", self.name))
     }
 }
@@ -253,6 +326,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Paths stored in Python manifests can be relative to the repository too.
+    if let Err(error) = std::env::set_current_dir(&root) {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     let Some((name, args)) = arguments.remove_subcommand() else {
         return ExitCode::from(2);
     };

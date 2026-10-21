@@ -171,6 +171,146 @@ impl Drop for Workspace {
 }
 
 #[test]
+fn standalone_combined_import_and_selected_history_reuse_existing_sql_stage() {
+    let workspace = Workspace::new();
+    let manifest_path = workspace.manifest(false);
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let mut row = vec![""; 78];
+    for (index, value) in [
+        (0, "vecwiki"),
+        (2, "revision"),
+        (3, "create"),
+        (4, "2020-01-01 00:00:00"),
+        (6, "42"),
+        (28, "1"),
+        (31, "0"),
+        (37, "2020-01-01 00:00:00"),
+        (38, "2020-01-01 00:00:00"),
+        (60, "100"),
+        (61, "0"),
+    ] {
+        row[index] = value;
+    }
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    encoder
+        .write_all((row.join("\t") + "\n").as_bytes())
+        .unwrap();
+    let bytes = encoder.finish().unwrap();
+    let history_path = workspace.0.join("all.tsv.bz2");
+    fs::write(&history_path, &bytes).unwrap();
+    manifest["files"]["all.tsv.bz2"] = json!({"path":"all.tsv.bz2","bytes":bytes.len(),"sha256_local":format!("{:x}",sha2::Sha256::digest(&bytes))});
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+            .arg("--repo-root")
+            .arg(&workspace.0)
+            .args(args)
+            .env_clear()
+            .current_dir(std::env::temp_dir())
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "import-dumps",
+        "--manifest",
+        "manifest.json",
+        "--work-dir",
+        "stage",
+        "--history-cache-mib",
+        "1",
+        "--history-commit-rows",
+        "1",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = workspace.0.join("data/imported/vec-raw.json");
+    let history = workspace.0.join("data/imported/vec-history.json");
+    let before_raw = fs::read(&raw).unwrap();
+    let before_history = fs::read(&history).unwrap();
+    let data: Value = serde_json::from_slice(&before_history).unwrap();
+    assert_eq!(data["pages"].as_array().unwrap().len(), 1101);
+    assert_eq!(data["pages"][0]["creator_account_type"], "bot");
+    // Reuse the published SQL stage without graph export or another edition.
+    fs::create_dir_all(workspace.0.join("config")).unwrap();
+    fs::write(
+        workspace.0.join("config/languages.json"),
+        r#"{"version":1,"languages":["vec","lmo"]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.0.join("dumps/vecwiki")).unwrap();
+    fs::copy(
+        &manifest_path,
+        workspace
+            .0
+            .join("dumps/vecwiki/manifest-20261001-2026-09.json"),
+    )
+    .unwrap();
+    let output = run(&[
+        "import-history",
+        "--root",
+        "dumps",
+        "--work-dir",
+        "stage",
+        "--output-dir",
+        "refreshed",
+        "--sql-release",
+        "20261001",
+        "--history-release",
+        "2026-09",
+        "--languages",
+        "vec",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SALTA checkpoint completo"));
+    assert_eq!(fs::read(&raw).unwrap(), before_raw);
+    assert_eq!(
+        fs::read(workspace.0.join("refreshed/vec-history.json")).unwrap(),
+        before_history
+    );
+    assert!(!workspace.0.join("refreshed/lmo-history.json").exists());
+    let output = run(&[
+        "import-dumps",
+        "--manifest",
+        "manifest.json",
+        "--work-dir",
+        "stage",
+        "--output",
+        "data/imported/vec-raw.json",
+        "--history-output",
+        "data/imported/vec-raw.json",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(fs::read(raw).unwrap(), before_raw);
+    assert_eq!(fs::read(history).unwrap(), before_history);
+    let db = rusqlite::Connection::open(workspace.0.join("stage/vecwiki-20261001.sqlite")).unwrap();
+    db.execute(
+        "UPDATE imported SET sha256='changed' WHERE table_name='user_groups'",
+        [],
+    )
+    .unwrap();
+    let output = run(&[
+        "import-history",
+        "--manifest",
+        "manifest.json",
+        "--work-dir",
+        "stage",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Staging SQL non verificato"));
+    assert_eq!(
+        fs::read(workspace.0.join("data/imported/vec-history.json")).unwrap(),
+        before_history
+    );
+}
+
+#[test]
 fn complete_census_streaming_and_both_category_schemas_preserve_records() {
     let mut graphs = Vec::new();
     for modern in [false, true] {
