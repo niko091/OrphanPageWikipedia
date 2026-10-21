@@ -2474,18 +2474,8 @@ impl PublicationLock {
             options.share_mode(0);
         }
         let file = options.open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe extern "C" {
-                fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
-            }
-            // SAFETY: the owned live descriptor is valid. LOCK_EX|LOCK_NB
-            // serializes writers; closing it releases the lock after a crash.
-            if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
-                return Err("Un'altra pubblicazione è già in corso".into());
-            }
-        }
+        file.try_lock()
+            .map_err(|error| format!("Un altro writer è attivo: {error}"))?;
         Ok(Self { _file: file })
     }
 }
@@ -3828,93 +3818,128 @@ pub struct TopicPrediction {
 #[cfg(feature = "cli")]
 pub trait TopicModel {
     fn labels(&self) -> Result<Vec<String>, String>;
-    fn word_id(&self, word: &str) -> Result<i32, String>;
+    fn word_ids(&mut self, words: &[&str]) -> Result<Vec<i32>, String>;
     fn predict(&mut self, inputs: &[String]) -> Result<Vec<TopicPrediction>, String>;
 }
 
+/// An owned local fastText worker. Its executable is embedded at build time,
+/// extracted into a private owned directory and removed after the child exits.
 #[cfg(feature = "cli")]
-unsafe extern "C" {
-    fn ow_topic_load(
-        path: *const std::ffi::c_char,
-        handle: *mut *mut std::ffi::c_void,
-        error: *mut std::ffi::c_char,
-        capacity: usize,
-    ) -> i32;
-    fn ow_topic_free(handle: *mut std::ffi::c_void);
-    fn ow_topic_labels(
-        handle: *mut std::ffi::c_void,
-        context: *mut std::ffi::c_void,
-        receive: extern "C" fn(*mut std::ffi::c_void, *const u8, usize, f32),
-        error: *mut std::ffi::c_char,
-        capacity: usize,
-    ) -> i32;
-    fn ow_topic_word(handle: *mut std::ffi::c_void, word: *const std::ffi::c_char) -> i32;
-    fn ow_topic_predict(
-        handle: *mut std::ffi::c_void,
-        text: *const std::ffi::c_char,
-        context: *mut std::ffi::c_void,
-        receive: extern "C" fn(*mut std::ffi::c_void, *const u8, usize, f32),
-        error: *mut std::ffi::c_char,
-        capacity: usize,
-    ) -> i32;
+struct TopicWorker {
+    child: std::process::Child,
+    input: std::io::BufWriter<std::process::ChildStdin>,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    _directory: PreparedDirectory,
 }
 
-/// An owned fastText 0.9.3 handle. It is deliberately neither Send nor Sync.
 #[cfg(feature = "cli")]
-pub struct NativeTopicModel(std::ptr::NonNull<std::ffi::c_void>);
-
-#[cfg(feature = "cli")]
-impl Drop for NativeTopicModel {
+impl Drop for TopicWorker {
     fn drop(&mut self) {
-        // SAFETY: load transfers one owned C++ handle; Drop frees it once.
-        unsafe { ow_topic_free(self.0.as_ptr()) };
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 #[cfg(feature = "cli")]
-struct TopicResponse {
-    prediction: TopicPrediction,
-    invalid: bool,
-}
-
-#[cfg(feature = "cli")]
-extern "C" fn receive_topic(
-    context: *mut std::ffi::c_void,
-    label: *const u8,
-    size: usize,
-    score: f32,
-) {
-    // SAFETY: C++ invokes this synchronously with our live context and a string
-    // valid for this callback only. All bytes are copied before returning.
-    let response = unsafe { &mut *context.cast::<TopicResponse>() };
-    if response.prediction.labels.len() >= 64 {
-        response.invalid = true;
-        return;
-    }
-    match std::str::from_utf8(unsafe { std::slice::from_raw_parts(label, size) }) {
-        Ok(label) => {
-            response.prediction.labels.push(label.to_owned());
-            response.prediction.probabilities.push(f64::from(score));
+impl TopicWorker {
+    fn start(model: &std::path::Path) -> DumpResult<Self> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let (directory, _) = export_directory(&std::env::temp_dir())?;
+        let path = directory.path.join(if cfg!(windows) {
+            "fasttext.exe"
+        } else {
+            "fasttext"
+        });
+        let mut file = std::fs::File::create_new(&path)?;
+        file.write_all(include_bytes!(env!("ORPHANWIKI_FASTTEXT_WORKER")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
-        Err(_) => response.invalid = true,
+        drop(file);
+        let mut child = Command::new(&path)
+            .arg(model)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Pipe fastText mancanti".into());
+        };
+        Ok(Self {
+            child,
+            input: std::io::BufWriter::with_capacity(65536, input),
+            output: std::io::BufReader::with_capacity(65536, output),
+            _directory: directory,
+        })
+    }
+    fn read_u32(&mut self) -> Result<u32, String> {
+        use std::io::Read;
+        let mut bytes = [0; 4];
+        self.output
+            .read_exact(&mut bytes)
+            .map_err(|e| format!("Risposta fastText incompleta: {e}"))?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn read_string(&mut self, maximum: usize) -> Result<String, String> {
+        use std::io::Read;
+        let low = self.read_u32()?;
+        let high = self.read_u32()?;
+        let count =
+            usize::try_from(u64::from(low) | (u64::from(high) << 32)).map_err(|e| e.to_string())?;
+        if count > maximum {
+            return Err("Risposta fastText fuori limite".into());
+        }
+        let mut bytes = vec![0; count];
+        self.output
+            .read_exact(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
+    fn status(&mut self) -> Result<(), String> {
+        match self.read_u32()? {
+            0 => Ok(()),
+            1 => Err(self.read_string(16384)?),
+            _ => Err("Stato fastText non valido".into()),
+        }
+    }
+    fn request(&mut self, operation: u8, inputs: &[&str]) -> Result<(), String> {
+        use std::io::Write;
+        if inputs.iter().any(|s| s.contains(['\n', '\0'])) {
+            return Err("Il modello accetta righe prive di NUL o newline".into());
+        }
+        let count = u32::try_from(inputs.len()).map_err(|e| e.to_string())?;
+        let mut write = || -> std::io::Result<()> {
+            self.input.write_all(&[operation])?;
+            self.input.write_all(&count.to_le_bytes())?;
+            for input in inputs {
+                self.input.write_all(&(input.len() as u64).to_le_bytes())?;
+                self.input.write_all(input.as_bytes())?;
+            }
+            self.input.flush()
+        };
+        write().map_err(|e| format!("Invio a fastText fallito: {e}"))?;
+        self.status()?;
+        if self.read_u32()? != count {
+            return Err("Risposta fastText con dimensione diversa".into());
+        }
+        Ok(())
     }
 }
 
+/// Checksum-verified fastText 0.9.3, isolated behind safe bounded I/O.
 #[cfg(feature = "cli")]
-fn topic_error(buffer: &[std::ffi::c_char]) -> String {
-    String::from_utf8_lossy(
-        &buffer
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect::<Vec<_>>(),
-    )
-    .into_owned()
+pub struct NativeTopicModel {
+    worker: TopicWorker,
+    labels: Vec<String>,
 }
 
 #[cfg(feature = "cli")]
 impl NativeTopicModel {
-    /// Load a checksum-verified artifact with the same C++ engine as Python.
     pub fn load(path: &std::path::Path, spec: &serde_json::Value) -> DumpResult<Self> {
         use sha2::Digest;
         use std::io::Read;
@@ -3932,84 +3957,92 @@ impl NativeTopicModel {
         if spec["model_sha512"] != format!("{:x}", digest.finalize()) {
             return Err("Checksum dei pesi del modello non corrispondente".into());
         }
-        let path = std::ffi::CString::new(path.to_str().ok_or("Percorso del modello non UTF-8")?)?;
-        let mut error = [0; 4096];
-        let mut handle = std::ptr::null_mut();
-        // SAFETY: valid terminated path, writable handle/error; C++ catches exceptions.
-        let status =
-            unsafe { ow_topic_load(path.as_ptr(), &mut handle, error.as_mut_ptr(), error.len()) };
-        if status != 0 {
-            return Err(topic_error(&error).into());
+        let mut worker = TopicWorker::start(path)?;
+        worker.status()?;
+        if worker.read_u32()? != 64 {
+            return Err("Tassonomia fastText incompleta".into());
         }
-        let model = Self(std::ptr::NonNull::new(handle).ok_or("Handle fastText mancante")?);
-        validate_topic_labels(&model.labels()?, spec)?;
-        Ok(model)
-    }
-
-    fn response(&self, input: Option<&str>) -> Result<TopicPrediction, String> {
-        let mut response = TopicResponse {
-            prediction: TopicPrediction {
-                labels: Vec::with_capacity(64),
-                probabilities: Vec::with_capacity(64),
-            },
-            invalid: false,
-        };
-        let mut error = [0; 4096];
-        let context = std::ptr::from_mut(&mut response).cast();
-        // SAFETY: the owned handle is live, callbacks synchronously copy strings
-        // into our context, and no C++ exception crosses the ABI.
-        let status = if let Some(input) = input {
-            if input.contains('\n') {
-                return Err("Il modello accetta una riga per input".into());
-            }
-            let input = std::ffi::CString::new(input).map_err(|e| e.to_string())?;
-            unsafe {
-                ow_topic_predict(
-                    self.0.as_ptr(),
-                    input.as_ptr(),
-                    context,
-                    receive_topic,
-                    error.as_mut_ptr(),
-                    error.len(),
-                )
-            }
-        } else {
-            unsafe {
-                ow_topic_labels(
-                    self.0.as_ptr(),
-                    context,
-                    receive_topic,
-                    error.as_mut_ptr(),
-                    error.len(),
-                )
-            }
-        };
-        if status != 0 {
-            return Err(topic_error(&error));
+        let mut labels = Vec::with_capacity(64);
+        for _ in 0..64 {
+            labels.push(worker.read_string(1048576)?);
         }
-        if response.invalid {
-            return Err("Etichette fastText non valide o incomplete".into());
-        }
-        Ok(response.prediction)
+        validate_topic_labels(&labels, spec)?;
+        Ok(Self { worker, labels })
     }
 }
 
 #[cfg(feature = "cli")]
 impl TopicModel for NativeTopicModel {
     fn labels(&self) -> Result<Vec<String>, String> {
-        Ok(self.response(None)?.labels)
+        Ok(self.labels.clone())
     }
-    fn word_id(&self, word: &str) -> Result<i32, String> {
-        let word = std::ffi::CString::new(word).map_err(|e| e.to_string())?;
-        // SAFETY: live handle, valid terminated word, read-only dictionary query.
-        Ok(unsafe { ow_topic_word(self.0.as_ptr(), word.as_ptr()) })
+    fn word_ids(&mut self, words: &[&str]) -> Result<Vec<i32>, String> {
+        let mut ids = Vec::with_capacity(words.len());
+        for batch in words.chunks(4096) {
+            self.worker.request(1, batch)?;
+            for _ in batch {
+                ids.push(i32::from_le_bytes(self.worker.read_u32()?.to_le_bytes()));
+            }
+        }
+        Ok(ids)
     }
     fn predict(&mut self, inputs: &[String]) -> Result<Vec<TopicPrediction>, String> {
-        inputs
-            .iter()
-            .map(|input| self.response(Some(input)))
-            .collect()
+        let mut predictions = Vec::with_capacity(inputs.len());
+        for batch in inputs.chunks(10000) {
+            self.worker
+                .request(2, &batch.iter().map(String::as_str).collect::<Vec<_>>())?;
+            for _ in batch {
+                self.worker.status()?;
+                let count = self.worker.read_u32()?;
+                if count > 64 {
+                    return Err("Risposta fastText con troppe etichette".into());
+                }
+                let mut prediction = TopicPrediction {
+                    labels: Vec::with_capacity(count as usize),
+                    probabilities: Vec::with_capacity(count as usize),
+                };
+                for _ in 0..count {
+                    prediction.labels.push(self.worker.read_string(1048576)?);
+                    let probability = self
+                        .worker
+                        .read_string(64)?
+                        .parse::<f32>()
+                        .map_err(|e| e.to_string())?;
+                    if !probability.is_finite() {
+                        return Err("Probabilità fastText non finita".into());
+                    }
+                    prediction.probabilities.push(f64::from(probability));
+                }
+                predictions.push(prediction);
+            }
+        }
+        Ok(predictions)
     }
+}
+
+#[cfg(feature = "cli")]
+fn model_vocabulary(
+    model: &mut impl TopicModel,
+    items: impl Iterator<Item = String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut items = items;
+    let mut known = std::collections::HashSet::new();
+    loop {
+        let batch = items.by_ref().take(4096).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let ids = model.word_ids(&batch.iter().map(String::as_str).collect::<Vec<_>>())?;
+        if ids.len() != batch.len() {
+            return Err("Risposta del vocabolario incompleta".into());
+        }
+        for (item, id) in batch.into_iter().zip(ids) {
+            if id >= 0 {
+                known.insert(item);
+            }
+        }
+    }
+    Ok(known)
 }
 
 #[cfg(feature = "cli")]
@@ -6534,12 +6567,7 @@ pub fn predict_imported_topics(
         return Err("Identità delle pagine SQL incomplete".into());
     }
     let (unique, _) = crate::unique_items(&items);
-    let mut known = std::collections::HashSet::new();
-    for item in unique.into_keys() {
-        if model.word_id(&item)? >= 0 {
-            known.insert(item);
-        }
-    }
+    let known = model_vocabulary(model, unique.into_keys())?;
     let redirects = sql_redirects(&source)?;
     let parents = sql_category_parents(&source)?;
     let mut inputs = crate::TopicInputAccumulator::new(titles, items, redirects.clone(), known)?;
@@ -6727,12 +6755,7 @@ pub fn predict_topics(
     let graph_seconds = begin.elapsed().as_secs_f64();
     topic_deadline(deadline)?;
     let (unique, _) = crate::unique_items(&items);
-    let mut known = HashSet::new();
-    for item in unique.keys() {
-        if model.word_id(item)? >= 0 {
-            known.insert(item.clone());
-        }
-    }
+    let known = model_vocabulary(model, unique.keys().cloned())?;
     let inputs = crate::topic_inputs(pages.len(), unique, known, incoming)?;
     let mapping_seconds = begin.elapsed().as_secs_f64() - graph_seconds;
     let prediction_start = std::time::Instant::now();

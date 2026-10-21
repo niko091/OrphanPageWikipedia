@@ -1,6 +1,7 @@
 //! Native analysis shared by Rust callers and the optional Python bindings.
 //! The `python` feature adds conversions and synchronization only; calculations
 //! and their validation are also available with `--no-default-features`.
+#![forbid(unsafe_code)]
 
 pub mod dashboard;
 pub mod dumps;

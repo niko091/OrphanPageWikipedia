@@ -1,4 +1,5 @@
 //! Standalone command contracts. Each backend stage is enabled as it is ported.
+#![forbid(unsafe_code)]
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

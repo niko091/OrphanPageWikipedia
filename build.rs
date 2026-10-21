@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(feature = "cli")]
@@ -36,12 +37,13 @@ fn build_fasttext() -> Result<(), Box<dyn std::error::Error>> {
     let source = output.join("fasttext-0.9.3/src");
     let mut compiler = cc::Build::new();
     // Upstream is frozen; do not replay its unrelated compiler warnings on
-    // every Cargo command. Our bridge is checked separately with warnings on.
+    // every Cargo command. Our worker is checked separately with warnings on.
     compiler
         .cpp(true)
         .std("c++17")
         .include(&source)
-        .warnings(false);
+        .warnings(false)
+        .cargo_metadata(false);
     // Upstream setup.py replaces extra_compile_args with its C++17 flags.
     // Keep portable compiler defaults: no fast-math, native CPU or FMA flags.
     compiler.flag_if_supported("-pthread");
@@ -63,12 +65,38 @@ fn build_fasttext() -> Result<(), Box<dyn std::error::Error>> {
         compiler.file(source.join(format!("{name}.cc")));
     }
     compiler.try_compile("orphanwiki_fasttext")?;
-    cc::Build::new()
-        .cpp(true)
-        .std("c++17")
-        .flag("-isystem")
-        .flag(source.as_os_str())
-        .file("src/dumps.cc")
-        .try_compile("orphanwiki_topic_bridge")?;
+    let tool = cc::Build::new().cpp(true).std("c++17").get_compiler();
+    let mut command = tool.to_command();
+    let helper = output.join(if tool.is_like_msvc() {
+        "orphanwiki-fasttext.exe"
+    } else {
+        "orphanwiki-fasttext"
+    });
+    if tool.is_like_msvc() {
+        command
+            .arg("/std:c++17")
+            .arg("/EHsc")
+            .arg(format!("/I{}", source.display()))
+            .arg("src/dumps.cc")
+            .arg(output.join("orphanwiki_fasttext.lib"))
+            .arg(format!("/Fe:{}", helper.display()));
+    } else {
+        command
+            .arg("-std=c++17")
+            .arg("-isystem")
+            .arg(&source)
+            .arg("src/dumps.cc")
+            .arg(output.join("liborphanwiki_fasttext.a"))
+            .arg("-pthread")
+            .arg("-o")
+            .arg(&helper);
+    }
+    if !command.status()?.success() {
+        return Err("Compilazione del worker fastText fallita".into());
+    }
+    println!(
+        "cargo:rustc-env=ORPHANWIKI_FASTTEXT_WORKER={}",
+        helper.display()
+    );
     Ok(())
 }

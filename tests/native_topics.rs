@@ -237,8 +237,11 @@ impl TopicModel for MockModel {
     fn labels(&self) -> Result<Vec<String>, String> {
         Ok(self.labels.clone())
     }
-    fn word_id(&self, word: &str) -> Result<i32, String> {
-        Ok(if word == "Q99999" { -1 } else { 1 })
+    fn word_ids(&mut self, words: &[&str]) -> Result<Vec<i32>, String> {
+        Ok(words
+            .iter()
+            .map(|word| if *word == "Q99999" { -1 } else { 1 })
+            .collect())
     }
     fn predict(&mut self, inputs: &[String]) -> Result<Vec<TopicPrediction>, String> {
         self.calls.push(inputs.to_vec());
@@ -286,9 +289,15 @@ fn real_fasttext_engine_reads_verified_models_and_retains_all_float_probabilitie
         let spec = work.model(dim);
         let mut model = NativeTopicModel::load(&work.0.join("model.bin"), &spec).unwrap();
         assert_eq!(model.labels().unwrap().len(), 64);
-        assert_eq!(model.word_id("Q2").unwrap(), 1);
-        assert_eq!(model.word_id("Q999").unwrap(), -1);
-        assert!(model.word_id("Q2\0x").is_err());
+        assert_eq!(model.word_ids(&["Q2", "Q999"]).unwrap(), [1, -1]);
+        assert!(model.word_ids(&["Q2\0x"]).is_err());
+        let words = vec!["Q2"; 4097];
+        assert!(model.word_ids(&words).unwrap().iter().all(|id| *id == 1));
+        let bulk = model.predict(&vec!["Q2 ".repeat(512); 257]).unwrap();
+        assert_eq!(bulk.len(), 257);
+        assert!(bulk
+            .iter()
+            .all(|p| p.labels == bulk[0].labels && p.probabilities == bulk[0].probabilities));
         let response = model.predict(&["Q2".into(), "Q2 Q3".into()]).unwrap();
         assert_eq!(response.len(), 2);
         for row in &response {
