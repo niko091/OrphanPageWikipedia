@@ -21,6 +21,7 @@ from .core import (
     compare_files,
     comparison_collections,
     configured_languages,
+    select_languages,
     json_sha256,
     load_topic_model,
     prepared_summaries_match,
@@ -87,20 +88,18 @@ def manifest_entry(result, filename, transports=None):
     return {'language': meta['language'], 'file': filename, 'date': meta['finished_at'],
             'published_at': datetime.now(timezone.utc).isoformat(),
             'demo': meta.get('demo', False), 'kind': meta.get('kind', 'wiki'),
-            **(transports or {'observations_file': filename.removesuffix('.json') + '-observations.json'}
-               if meta.get('kind') != 'aggregate' else {})}
+            **(transports or {})}
 
 
 @operational_phase('export.publish')
-def _publish_prepared(prepared, destination, excluded=()):
+def _publish_prepared(prepared, destination):
     """Move prepared transports, then publish their manifest last."""
     prepared, destination = Path(prepared), Path(destination)
     manifest = prepared / 'manifest.json'
-    excluded = set(excluded)
     for path in sorted(prepared.rglob('*')):
         if path.is_dir():
             (destination / path.relative_to(prepared)).mkdir(parents=True, exist_ok=True)
-        elif path.is_file() and path != manifest and path not in excluded:
+        elif path.is_file() and path != manifest:
             target = destination / path.relative_to(prepared)
             target.parent.mkdir(parents=True, exist_ok=True)
             path.replace(target)
@@ -206,7 +205,6 @@ def publish_available_aggregate(output_dir, prepared_report=None):
             entry = latest[member['language']]
             existing_name = entry.get('summary_file')
             existing_creators = entry.get('creator_index_file')
-            source_path = output_dir / member['file']
             fingerprint = [fingerprints_by_language[member['language']]]
             if (existing_name and re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', existing_name) and
                     existing_creators and re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', existing_creators) and
@@ -428,13 +426,16 @@ def main():
         parser.error('--history-cache-mib deve essere compreso tra 1 e 65536')
     if hasattr(args, 'history_commit_rows') and not 1 <= args.history_commit_rows <= 10000000:
         parser.error('--history-commit-rows deve essere compreso tra 1 e 10000000')
-    if args.command in ('fetch-content', 'quality', 'refresh-measures'):
-        from .dumps import fetch_content, infer_quality, refresh_measures
-        selected = configured_languages(args.languages_file)
+    if args.command in ('fetch-content', 'quality', 'refresh-measures', 'fetch-dumps', 'topics') or (
+            args.command == 'import-history' and not args.manifest):
+        try:
+            selected = select_languages(configured_languages(args.languages_file), args.languages)
+        except ValueError as error:
+            parser.error(str(error))
         languages = args.languages or [language for language, _ in selected]
         databases = dict(selected)
-        if not languages or len(languages) != len(set(languages)) or set(languages) - set(databases):
-            parser.error('Lingue richieste fuori dalla configurazione unica')
+    if args.command in ('fetch-content', 'quality', 'refresh-measures'):
+        from .dumps import fetch_content, infer_quality, refresh_measures
         if args.command == 'fetch-content':
             fetch_content(languages, args.content_release, args.root, databases, args.plan)
         elif args.command == 'quality':
@@ -453,57 +454,36 @@ def main():
         rebuild_dashboard(args.data_dir)
     elif args.command == 'fetch-dumps':
         from .dumps import fetch_dumps
-        selected = configured_languages(args.languages_file)
-        configured = [language for language, _ in selected]
-        languages = args.languages or configured
-        if len(languages) != len(set(languages)) or set(languages) - set(configured):
-            parser.error('Le lingue richieste devono appartenere alla configurazione unica')
-        databases = {language: database for language, database in selected if language in languages}
         fetch_dumps(languages, args.sql_release, args.history_release, args.root, databases,
                     plan_only=args.plan)
-    elif args.command == 'import-dumps':
+    elif args.command in ('import-dumps', 'import-history'):
         from .dumps import import_graph, import_history
-        manifest = json.loads(Path(args.manifest).read_text())
-        language = manifest['language']
-        wiki_database(language, manifest.get('database'))
-        output = args.output or f'data/imported/{language}-raw.json'
-        import_graph(args.manifest, output, args.work_dir)
-        history_output = args.history_output or f'data/imported/{language}-history.json'
-        import_history(args.manifest, history_output, args.work_dir,
-                       cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
-    elif args.command == 'import-history':
-        from .dumps import import_history
-        if args.manifest:
-            if args.languages or args.sql_release or args.history_release:
+        if args.command == 'import-dumps' or args.manifest:
+            if args.command == 'import-history' and (args.languages or args.sql_release or args.history_release):
                 parser.error('--manifest non può essere combinato con una selezione di release/lingue')
             manifest = json.loads(Path(args.manifest).read_text())
             language = manifest['language']
             wiki_database(language, manifest.get('database'))
-            output = args.output or f'data/imported/{language}-history.json'
+            if args.command == 'import-dumps':
+                import_graph(args.manifest, args.output or f'data/imported/{language}-raw.json', args.work_dir)
+                output = args.history_output
+            else:
+                output = args.output
+            output = output or f'data/imported/{language}-history.json'
             import_history(args.manifest, output, args.work_dir,
                            cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
         else:
             if not args.sql_release or not args.history_release or args.output:
                 parser.error('Senza --manifest indicare --sql-release e --history-release; usare --output-dir')
-            selected = configured_languages(args.languages_file)
-            languages = args.languages or [code for code, _ in selected]
-            if not languages or len(languages) != len(set(languages)) or set(languages) - set(dict(selected)):
-                parser.error('Lingue richieste fuori dalla configurazione unica')
             for language, database in selected:
-                if language in languages:
-                    import_history(Path(args.root) / database / f'manifest-{args.sql_release}-{args.history_release}.json',
-                                   Path(args.output_dir) / f'{language}-history.json', args.work_dir,
-                                   cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
+                import_history(Path(args.root) / database / f'manifest-{args.sql_release}-{args.history_release}.json',
+                               Path(args.output_dir) / f'{language}-history.json', args.work_dir,
+                               cache_mib=args.history_cache_mib, commit_rows=args.history_commit_rows)
     elif args.command == 'topics':
         if not math.isfinite(args.time_budget_seconds) or args.time_budget_seconds <= 0:
             parser.error('Il budget deve essere un numero positivo finito')
         began = time.monotonic()
         deadline = began + args.time_budget_seconds
-        selected = configured_languages(args.languages_file)
-        configured = [language for language, _ in selected]
-        languages = args.languages or configured
-        if not languages or len(languages) != len(set(languages)) or set(languages) - set(configured):
-            parser.error('I blocchi dei temi devono appartenere all’unico elenco configurato')
         paths = [Path(args.input_dir) / f'{code}-raw.json' for code in languages]
         if any(not path.is_file() for path in paths):
             parser.error('Manca un censimento completo: importare prima i dump')

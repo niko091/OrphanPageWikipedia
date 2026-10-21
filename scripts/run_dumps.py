@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -118,12 +118,6 @@ def fetched_files(record):
     return [Path(item['path']) for item in record['files'].values()]
 
 
-def imported_files_match(graph, history, stage, manifest_path, manifest, history_required=True):
-    """Reuse an import only when source identities and staging agree."""
-    return imported_files_reason(graph, history, stage, manifest_path, manifest,
-                                 history_required) == 'verified_reuse'
-
-
 def imported_files_reason(graph, history, stage, manifest_path, manifest, history_required=True):
     """Report why verified SQL/History staging can or cannot be reused."""
     if not all(complete_json(path) for path in ((graph, history) if history_required else (graph,))) or signature(stage) is None:
@@ -138,30 +132,26 @@ def imported_files_reason(graph, history, stage, manifest_path, manifest, histor
                 or graph_meta.get('complete') is not True
                 or graph_meta.get('dump_manifest_sha256') != checksum(manifest_path)):
             return 'source_mismatch'
-        with sqlite3.connect(stage.resolve().as_uri() + '?mode=ro', uri=True) as connection:
+        with closing(sqlite3.connect(stage.resolve().as_uri() + '?mode=ro', uri=True)) as connection:
             sql = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
             if any(sql.get(name) != manifest['files'][name]['sha256_local'] for name in SQL_TABLES):
                 return 'stage_table_mismatch'
             if not history_required:
                 return 'verified_reuse'
-        if (history_meta.get('source') != 'MediaWiki History dumps / ' + manifest['database']
-                or history_meta.get('language') != manifest['language']
-                or history_meta.get('sql_release') != manifest['sql_release']
-                or history_meta.get('history_release') != manifest['history_release']
-                or history_meta.get('complete') is not True):
-            return 'source_mismatch'
-        if history_meta.get('creation_rule') != HISTORY_RULE:
-            return 'definition_mismatch'
-        history_files = {name: item['sha256_local'] for name, item in manifest['files'].items()
-                         if name.endswith('.tsv.bz2')}
-        if history_meta.get('history_files') != history_files:
-            return 'source_mismatch'
-        with sqlite3.connect(f'file:{stage}?mode=ro', uri=True) as connection:
-            sql = dict(connection.execute('SELECT table_name,sha256 FROM imported'))
+            if (history_meta.get('source') != 'MediaWiki History dumps / ' + manifest['database']
+                    or history_meta.get('language') != manifest['language']
+                    or history_meta.get('sql_release') != manifest['sql_release']
+                    or history_meta.get('history_release') != manifest['history_release']
+                    or history_meta.get('complete') is not True):
+                return 'source_mismatch'
+            if history_meta.get('creation_rule') != HISTORY_RULE:
+                return 'definition_mismatch'
+            history_files = {name: item['sha256_local'] for name, item in manifest['files'].items()
+                             if name.endswith('.tsv.bz2')}
+            if history_meta.get('history_files') != history_files:
+                return 'source_mismatch'
             scanned = {(name, phase): digest for name, phase, digest in
                        connection.execute('SELECT file,phase,sha256 FROM history_imported')}
-        if any(sql.get(name) != manifest['files'][name]['sha256_local'] for name in SQL_TABLES):
-            return 'stage_table_mismatch'
         if any(scanned.get((name, 'initial')) != digest + ':' + HISTORY_RULE
                for name, digest in history_files.items()):
             return 'definition_mismatch'
@@ -716,15 +706,10 @@ def interrupt_for_shutdown(_signum, _frame):
 
 
 def run_pipeline(args, log, benchmark=None):
-    from orphanwiki.core import configured_languages, comparison_collections
+    from orphanwiki.core import configured_languages, select_languages, comparison_collections
     from orphanwiki.dumps import HISTORY_RULE, _read_first_metadata
     configured = configured_languages(project_path(args.languages_file))
-    if args.languages:
-        if len(args.languages) != len(set(args.languages)) or set(args.languages) - {code for code, _ in configured}:
-            raise ValueError('Le lingue richieste devono essere distinte e presenti nella configurazione')
-        selected = [pair for pair in configured if pair[0] in args.languages]
-    else:
-        selected = configured
+    selected = select_languages(configured, args.languages)
     languages = [language for language, _ in selected]
     log_line(log, 'LINGUE ' + ' '.join(languages))
 
@@ -809,20 +794,21 @@ def run_pipeline(args, log, benchmark=None):
         if not args.force and import_reason == 'verified_reuse':
             log_line(log, f'SALTA importazione {language}: grafo, cronologia e checkpoint già completi')
             state.save(f'import:{language}', import_inputs, outputs)
-        elif not args.force and imported_files_match(graph, history, stage, manifest, metadata, history_required=False):
-            log_line(log, f'CHECKPOINT grafo {language}: verified_reuse; cronologia={import_reason}')
-            step(f'aggiornamento cronologia {language}',
-                     [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
-                      '--work-dir', str(work_dir), *history_options])
-            state.save(f'import:{language}', import_inputs, outputs)
         else:
+            graph_reason = (imported_files_reason(graph, history, stage, manifest, metadata, history_required=False)
+                            if not args.force else 'forced')
             if not args.force:
                 log_line(log, f'CHECKPOINT grafo {language}: '
-                         f'{imported_files_reason(graph, history, stage, manifest, metadata, history_required=False)}')
-            step(f'importazione {language}',
-                     [*base, 'import-dumps', '--manifest', str(manifest),
-                      '--output', str(graph), '--history-output', str(history),
-                      '--work-dir', str(work_dir), *history_options])
+                         f'{graph_reason}; cronologia={import_reason}')
+            if graph_reason == 'verified_reuse':
+                step(f'aggiornamento cronologia {language}',
+                         [*base, 'import-history', '--manifest', str(manifest), '--output', str(history),
+                          '--work-dir', str(work_dir), *history_options])
+            else:
+                step(f'importazione {language}',
+                         [*base, 'import-dumps', '--manifest', str(manifest),
+                          '--output', str(graph), '--history-output', str(history),
+                          '--work-dir', str(work_dir), *history_options])
             state.save(f'import:{language}', import_inputs, outputs)
         require_file(graph, 'Grafo importato')
         require_file(history, 'Cronologia importata')

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orphanwiki.core import operational_span
+from orphanwiki.core import configured_languages, operational_span, select_languages
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -251,6 +251,25 @@ elif command == 'refresh-measures':
 
 
 class DumpPipelineTests(unittest.TestCase):
+    def test_configured_selection_retains_pool_order_and_validates_every_edition(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'languages.json'
+            config.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo', 'it'],
+                                          'databases': {'lmo': 'customwiki'}}))
+            self.assertEqual(configured_languages(config),
+                             [('vec', 'vecwiki'), ('lmo', 'customwiki'), ('it', 'itwiki')])
+            editions = configured_languages(config)
+            self.assertEqual(select_languages(editions), editions)
+            self.assertEqual(select_languages(editions, ['lmo', 'vec']),
+                             [('vec', 'vecwiki'), ('lmo', 'customwiki')])
+            for selection in ([], ['vec', 'vec'], ['en'], ['vec', 'en']):
+                with self.subTest(selection=selection), self.assertRaises(ValueError):
+                    select_languages(editions, selection)
+            config.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo'],
+                                          'databases': {'lmo': 'invalid'}}))
+            with self.assertRaises(ValueError):
+                select_languages(configured_languages(config), ['vec'])
+
     def test_nested_spans_preserve_results_counters_and_error_boundaries(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'spans.jsonl'

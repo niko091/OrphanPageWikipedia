@@ -1289,7 +1289,7 @@ def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_row
 def _next_for_page(cursor, current, page_id):
     """Consume an ID-sorted SQLite cursor without holding other pages."""
     values = []
-    while current is not None and current[0] < page_id:
+    if current is not None and current[0] < page_id:
         raise ValueError('Staging con relazione senza la voce sorgente')
     while current is not None and current[0] == page_id:
         values.append(current[1])
@@ -1985,14 +1985,16 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
                         comparison_connection.execute('INSERT INTO wikis VALUES(?,?,?)',
                             (language, json.dumps(metadata, ensure_ascii=False), expected))
                     return expected
-                prepared = temporary / output.name
+                publish_dir = temporary / 'publish'
+                publish_dir.mkdir()
+                prepared = publish_dir / output.name
                 transports = export_result(result, prepared, update_manifest=False, announce=False)
                 existing = output.parent / 'manifest.json'
                 manifest_entries = json.loads(existing.read_text()) if existing.exists() else []
                 manifest_entries = [entry for entry in manifest_entries if entry.get('file') != output.name]
                 manifest_entries.append(manifest_entry(result, output.name, transports))
-                write_json(temporary / 'manifest.json', manifest_entries)
-                _publish_prepared(temporary, output.parent, excluded=(temporary / 'history.sqlite',))
+                write_json(publish_dir / 'manifest.json', manifest_entries)
+                _publish_prepared(publish_dir, output.parent)
                 from .__main__ import publish_available_aggregate
                 publish_available_aggregate(output.parent)
                 print(f'Esportate {expected:,} voci: {output}', flush=True)

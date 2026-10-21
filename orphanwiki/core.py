@@ -162,7 +162,7 @@ def wiki_database(language, database=None):
 
 
 def configured_languages(path='config/languages.json'):
-    """Return every configured edition; this is the sole collection selection."""
+    """Return every configured edition; this is the sole collection pool."""
     config = json.loads(Path(path).read_text(encoding='utf-8'))
     if not isinstance(config, dict) or set(config) - {'version', 'languages', 'databases'}:
         raise ValueError('Configurazione lingue non valida')
@@ -174,6 +174,15 @@ def configured_languages(path='config/languages.json'):
             or set(databases) - set(languages)):
         raise ValueError('Configurazione lingue non valida')
     return [(code, wiki_database(code, databases.get(code))) for code in languages]
+
+
+def select_languages(editions, selected=None):
+    """Validate a subset of the edition pool, retaining configuration order."""
+    if selected is None:
+        return editions
+    if not selected or len(selected) != len(set(selected)) or set(selected) - {code for code, _ in editions}:
+        raise ValueError('Le lingue richieste devono essere distinte e presenti nella configurazione')
+    return [(code, database) for code, database in editions if code in selected]
 
 
 def _approved_graph_source(metadata, database):
@@ -1789,7 +1798,7 @@ def iter_export_sections(path):
             raise ValueError('Contenuto inatteso dopo l’esportazione JSON')
 
 
-def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
+def write_json(path, value, arrays=None, mappings=None):
     """Stream to a temporary file, publishing only after successful serialization."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1799,15 +1808,15 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
         with temporary.open('w', encoding='utf-8') as stream:
             created = True
             record_encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
-            if not arrays and not embedded_paths and not mappings:
+            if not arrays and not mappings:
                 if (isinstance(value, dict) and value.get('format') in ('connections_v1', 'connections_v2')
                         and isinstance(value.get('link_candidates'), dict)):
                     stream.writelines(_detail_chunks(value, record_encoder))
                 else:
                     stream.writelines(_json_chunks(value))
             else:
-                arrays, embedded_paths, mappings = arrays or {}, embedded_paths or {}, mappings or {}
-                sections = list(arrays) + list(embedded_paths) + list(mappings)
+                arrays, mappings = arrays or {}, mappings or {}
+                sections = list(arrays) + list(mappings)
                 if len(sections) != len(set(sections)) or set(sections) - set(value):
                     raise ValueError('Sezioni JSON in streaming non valide')
                 stream.write('{')
@@ -1836,11 +1845,6 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
                             stream.write(':')
                             stream.writelines(_json_record_chunks(record, record_encoder))
                         stream.write('}')
-                    elif key in embedded_paths:
-                        # Only embed a completed checkpoint produced by this collector.
-                        with Path(embedded_paths[key]).open(encoding='utf-8') as source:
-                            while chunk := source.read(65536):
-                                stream.write(chunk)
                     else:
                         stream.writelines(_json_chunks(item))
                 stream.write('}')

@@ -11,7 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, closing, redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,6 +77,28 @@ class DumpTests(unittest.TestCase):
                         redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                     main()
                 self.assertEqual(error.exception.code, 2)
+
+    def test_import_cli_keeps_graph_and_history_outputs_separate(self):
+        from orphanwiki.__main__ import main
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'language': 'vec', 'database': 'vecwiki'}))
+            graph, history = str(root / 'graph.json'), str(root / 'history.json')
+            for command in ('import-dumps', 'import-history'):
+                options = (['--output', graph, '--history-output', history]
+                           if command == 'import-dumps' else ['--output', history])
+                with self.subTest(command=command), patch.object(sys, 'argv', [
+                        'orphanwiki', command, '--manifest', str(manifest), '--work-dir', folder, *options]), \
+                        patch('orphanwiki.dumps.import_graph') as graph_import, \
+                        patch('orphanwiki.dumps.import_history') as history_import:
+                    main()
+                    history_import.assert_called_once_with(
+                        str(manifest), history, folder, cache_mib=256, commit_rows=250000)
+                    if command == 'import-dumps':
+                        graph_import.assert_called_once_with(str(manifest), graph, folder)
+                    else:
+                        graph_import.assert_not_called()
 
     def test_history_deduplication_preserves_conflicts_and_initial_revisions(self):
         from orphanwiki.dumps import _history_schema, _history_scan, _history_records
@@ -259,6 +281,50 @@ class DumpTests(unittest.TestCase):
             download.assert_called_once_with(
                 ['vec'], '20261001', '2026-09', folder,
                 {'vec': 'vecwiki'}, plan_only=True)
+
+    def test_collection_commands_reject_invalid_subsets_before_work(self):
+        from orphanwiki.__main__ import main
+        commands = {
+            'fetch-dumps': ['--sql-release', '20261001', '--history-release', '2026-09', '--plan'],
+            'fetch-content': ['--content-release', '2026-10-01', '--plan'],
+            'quality': ['--content-release', '2026-10-01'],
+            'refresh-measures': [],
+            'import-history': ['--sql-release', '20261001', '--history-release', '2026-09'],
+            'topics': [],
+        }
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            config = Path(folder) / 'languages.json'
+            config.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo']}))
+            workers = [stack.enter_context(patch(target)) for target in (
+                'orphanwiki.dumps.fetch_dumps', 'orphanwiki.dumps.fetch_content',
+                'orphanwiki.dumps.infer_quality', 'orphanwiki.dumps.refresh_measures',
+                'orphanwiki.dumps.import_history', 'orphanwiki.__main__.load_topic_model')]
+            for command, options in commands.items():
+                for languages in (['vec', 'vec'], ['en'], ['vec', 'en']):
+                    argv = ['orphanwiki', command, *options, '--languages-file', str(config),
+                            '--languages', *languages]
+                    with self.subTest(command=command, languages=languages), \
+                            patch.object(sys, 'argv', argv), redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
+            for worker in workers:
+                worker.assert_not_called()
+
+    def test_fetch_cli_preserves_explicit_language_order_and_database_overrides(self):
+        from orphanwiki.__main__ import main
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'languages.json'
+            config.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo', 'it'],
+                                          'databases': {'lmo': 'customwiki'}}))
+            argv = ['orphanwiki', 'fetch-dumps', '--languages-file', str(config),
+                    '--languages', 'lmo', 'vec', '--sql-release', '20261001',
+                    '--history-release', '2026-09', '--root', folder, '--plan']
+            with patch.object(sys, 'argv', argv), patch('orphanwiki.dumps.fetch_dumps') as download:
+                main()
+            download.assert_called_once_with(
+                ['lmo', 'vec'], '20261001', '2026-09', folder,
+                {'vec': 'vecwiki', 'lmo': 'customwiki'}, plan_only=True)
 
     def test_bounded_native_graph_and_category_batches_match_bulk(self):
         titles = ['A', 'B', 'C', 'D']
