@@ -10,6 +10,19 @@ permissions:
 jobs:
   ubuntu:
     runs-on: ubuntu-24.04
+    services:
+      mariadb:
+        image: mariadb:11.4@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
+        env:
+          MARIADB_ROOT_PASSWORD: orphanwiki-local-test
+          MARIADB_DATABASE: orphanwiki_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      ORPHANWIKI_TEST_MYSQL_URL: mysql://root:orphanwiki-local-test@127.0.0.1:3306/orphanwiki_test
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

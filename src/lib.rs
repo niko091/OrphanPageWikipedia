@@ -5,6 +5,8 @@
 
 pub mod dashboard;
 pub mod dumps;
+#[cfg(feature = "cli")]
+pub mod editorial;
 
 use std::collections::{HashMap, HashSet};
 

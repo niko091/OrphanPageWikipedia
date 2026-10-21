@@ -5,6 +5,94 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn standalone_editorial_http_preserves_reviews_and_stops_on_sigterm() {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.0.join("web/data/vec-connections")).unwrap();
+    fs::write(workspace.0.join("web/index.html"), "<h1>Dashboard</h1>").unwrap();
+    fs::write(workspace.0.join("web/data/manifest.json"),r#"[{"file":"vec.json","language":"vec","date":"2026-10-01T00:00:00Z","connections_dir":"vec-connections"}]"#).unwrap();
+    fs::write(workspace.0.join("web/data/vec-connections/1.json"),r#"{"format":"connections_v1","metadata":{"language":"vec","finished_at":"2026-10-01T00:00:00Z","complete":true},"pages":[{"page_id":1,"orphan":true}],"link_candidates":{"1":{"candidates":[{"page_id":2}]}}}"#).unwrap();
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+            .args(["serve", "--port", "0"])
+            .env_clear()
+            .env("ORPHANWIKI_WEB_ROOT", "web")
+            .current_dir(&workspace.0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    std::io::BufReader::new(server.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = line.trim().strip_prefix("Dashboard: ").unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let response = client.get(url).send().unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().unwrap(), "<h1>Dashboard</h1>");
+    assert!(client.head(url).send().unwrap().bytes().unwrap().is_empty());
+    let body = r#"{"dataset":"vec.json","language":"vec","source_id":2,"target_id":1,"status":"fixed","version":0}"#;
+    let submit = || {
+        client
+            .post(format!("{url}/api/reviews"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .unwrap()
+    };
+    assert_eq!(submit().status(), 200);
+    assert_eq!(submit().status(), 409);
+    let response = client
+        .get(format!("{url}/api/reviews?dataset=vec.json"))
+        .send()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&response.bytes().unwrap()).unwrap();
+    assert_eq!(value["reviews"][0]["version"], 1);
+    assert_eq!(
+        client
+            .post(format!("{url}/api/reviews"))
+            .header("content-type", "text/plain")
+            .body(body)
+            .send()
+            .unwrap()
+            .status(),
+        415
+    );
+    #[cfg(unix)]
+    {
+        assert!(Command::new("kill")
+            .args(["-TERM", &server.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SIGTERM did not stop the HTTP server"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 struct Workspace(PathBuf);
 
 impl Workspace {
@@ -52,6 +140,7 @@ fn standalone_help_needs_neither_python_nor_repository_files() {
         "compare",
         "refresh-measures",
         "dashboard",
+        "serve",
     ] {
         assert!(help.contains(command));
         assert!(workspace.run(&[command, "--help"]).status.success());

@@ -129,6 +129,16 @@ fn cli() -> Command {
         .arg(option("work-dir"))
         .arg(option("output"))
         .arg(path_option("rules", "config/categories.json"));
+    let serve = Command::new("serve")
+        .about("Dashboard e valutazioni editoriali condivise")
+        .arg(option("web-root"))
+        .arg(option("database"))
+        .arg(option("bind").default_value("127.0.0.1"))
+        .arg(
+            option("port")
+                .default_value("8000")
+                .value_parser(clap::value_parser!(u16)),
+        );
     Command::new("orphanwiki")
         .about("Censimento e analisi delle pagine orfane")
         .version(env!("CARGO_PKG_VERSION"))
@@ -136,7 +146,7 @@ fn cli() -> Command {
         .arg(option("repo-root").global(true).help("Radice di configurazioni e percorsi relativi; altrimenti cerca dalla directory corrente"))
         .subcommands([
             Command::new("dashboard").about("Prepara i trasporti dagli export approvati").arg(path_option("data-dir", "web/data")),
-            content, quality, refresh, downloads, imported, history, compare, topics, analyze,
+            content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve,
         ])
 }
 
@@ -204,6 +214,28 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "serve" {
+            let database = _native::editorial::ReviewDatabase::from_environment(
+                &self.root,
+                self.args.get_one::<String>("database").map(PathBuf::from),
+            )?;
+            let web_root = self
+                .args
+                .get_one::<String>("web-root")
+                .cloned()
+                .or_else(|| std::env::var("ORPHANWIKI_WEB_ROOT").ok())
+                .unwrap_or_else(|| "web".into());
+            let app =
+                _native::editorial::ReviewApplication::new(self.root.join(web_root), database);
+            return _native::editorial::serve(
+                app,
+                self.args
+                    .get_one::<String>("bind")
+                    .ok_or("Indirizzo mancante")?,
+                *self.args.get_one::<u16>("port").ok_or("Porta mancante")?,
+            )
+            .map_err(|e| e.to_string());
+        }
         if self.name == "refresh-measures" {
             let input = self.path("input-dir")?;
             let output = self.path("data-dir")?;
