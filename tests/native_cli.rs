@@ -72,10 +72,48 @@ fn bad_arguments_and_pending_stages_never_publish_output() {
     );
     let output = workspace.run(&["dashboard", "--data-dir", "should-not-exist"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("non è ancora migrato"));
+    assert!(!output.stderr.is_empty());
     assert_eq!(fs::read_dir(&workspace.0).unwrap().count(), 0);
+}
+
+#[test]
+fn standalone_dashboard_publishes_a_full_generation_without_python_or_repository_config() {
+    let workspace = Workspace::new();
+    let canonical = r#"{"metadata":{"language":"vec","complete":true,"finished_at":"2026-10-02T00:00:00Z"},"pages":[{"page_id":1,"title":"A","orphan":true}]}"#;
+    fs::write(workspace.0.join("vec.json"), canonical).unwrap();
+    fs::write(
+        workspace.0.join("manifest.json"),
+        r#"[{"file":"vec.json","language":"vec","date":"2026-10-02T00:00:00Z"}]"#,
+    )
+    .unwrap();
+    let result = workspace.run(&["dashboard", "--data-dir", "."]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.0.join("manifest.json")).unwrap()).unwrap();
+    for key in [
+        "observations_file",
+        "articles_file",
+        "summary_file",
+        "creator_index_file",
+        "cards_file",
+        "cards_dir",
+        "connections_dir",
+        "connections_metadata_file",
+        "profile_topics_dir",
+    ] {
+        assert!(workspace
+            .0
+            .join(manifest[0][key].as_str().unwrap())
+            .exists());
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("vec.json")).unwrap(),
+        canonical
+    );
 }
 
 #[test]

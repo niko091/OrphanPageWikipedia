@@ -2409,6 +2409,216 @@ impl Drop for PreparedDirectory {
 }
 
 #[cfg(feature = "cli")]
+fn export_directory(parent: &std::path::Path) -> DumpResult<(PreparedDirectory, String)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let generation = canonical_json_sha256(&serde_json::json!([
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ]))?[..32]
+            .to_owned();
+        let path = parent.join(format!("orphanwiki-export-{generation}"));
+        match PreparedDirectory::new(&path) {
+            Ok(directory) => return Ok((directory, generation)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+struct PublicationLock {
+    _file: std::fs::File,
+}
+
+#[cfg(feature = "cli")]
+impl PublicationLock {
+    fn acquire(destination: &std::path::Path) -> DumpResult<Self> {
+        let identity = canonical_json_sha256(&serde_json::json!(resolved_path(destination)?
+            .to_str()
+            .ok_or("Percorso non UTF-8")?))?;
+        let path = std::env::temp_dir().join(format!("orphanwiki-publish-{identity}.lock"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
+            }
+            // SAFETY: the owned live descriptor is valid. LOCK_EX|LOCK_NB
+            // serializes writers; closing it releases the lock after a crash.
+            if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+                return Err("Un'altra pubblicazione è già in corso".into());
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(feature = "cli")]
+fn publication_walk(
+    prepared: &std::path::Path,
+    destination: &std::path::Path,
+    relative: &std::path::Path,
+    move_files: bool,
+    rename: &mut impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> DumpResult<()> {
+    for entry in std::fs::read_dir(prepared.join(relative))? {
+        let entry = entry?;
+        let relative = relative.join(entry.file_name());
+        if relative == std::path::Path::new("manifest.json") {
+            continue;
+        }
+        let target = destination.join(&relative);
+        let kind = entry.file_type()?;
+        if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+            return Err("Prodotto di pubblicazione non regolare".into());
+        }
+        if !move_files && target.try_exists()? {
+            return Err(format!("La pubblicazione sovrascriverebbe {}", target.display()).into());
+        }
+        if kind.is_dir() {
+            if move_files {
+                std::fs::create_dir(&target)?;
+            }
+            publication_walk(prepared, destination, &relative, move_files, rename)?;
+        } else if move_files {
+            rename(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn publish_prepared(
+    prepared: &std::path::Path,
+    destination: &std::path::Path,
+    original_manifest: Option<&[u8]>,
+    mut rename: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> DumpResult<()> {
+    let _lock = PublicationLock::acquire(destination)?;
+    let manifest = destination.join("manifest.json");
+    let current = match std::fs::read(&manifest) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current.as_deref() != original_manifest {
+        return Err("Manifest modificato da un altro writer".into());
+    }
+    if !prepared.join("manifest.json").is_file() {
+        return Err("Manifest preparato mancante".into());
+    }
+    publication_walk(
+        prepared,
+        destination,
+        std::path::Path::new(""),
+        false,
+        &mut rename,
+    )?;
+    std::fs::create_dir_all(destination)?;
+    publication_walk(
+        prepared,
+        destination,
+        std::path::Path::new(""),
+        true,
+        &mut rename,
+    )?;
+    rename(&prepared.join("manifest.json"), &manifest)?;
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn dataset_filename(value: &serde_json::Value) -> DumpResult<&str> {
+    let name = value.as_str().ok_or("Nome dataset non valido")?;
+    if !name.ends_with(".json")
+        || name.len() <= 5
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+    {
+        return Err("Nome dataset non valido".into());
+    }
+    Ok(name)
+}
+
+/// Regenerate every approved member's transports, retaining aggregate entries
+/// and canonical JSON/CSV. No approved file is overwritten; the manifest moves
+/// only after every new file and empty transport directory is installed.
+#[cfg(feature = "cli")]
+pub fn rebuild_dashboard(folder: &std::path::Path) -> DumpResult<()> {
+    use serde_json::Value;
+    let original = std::fs::read(folder.join("manifest.json"))?;
+    let mut manifest: Vec<Value> = serde_json::from_slice(&original)?;
+    if manifest.is_empty() {
+        return Err("Manifest non valido".into());
+    }
+    let mut files = std::collections::HashSet::new();
+    for entry in &manifest {
+        let name = dataset_filename(&entry["file"])?;
+        if !entry.is_object() || !files.insert(name.to_owned()) {
+            return Err("Dataset duplicato nel manifest".into());
+        }
+        if entry["kind"] != "aggregate" {
+            crate::wiki_database(entry["language"].as_str().ok_or("Lingua mancante")?, None)?;
+        }
+    }
+    let (prepared, generation) =
+        export_directory(folder.parent().ok_or("Directory dati non valida")?)?;
+    let mut sources = Vec::new();
+    for (position, entry) in manifest.iter_mut().enumerate() {
+        if entry["kind"] == "aggregate" {
+            continue;
+        }
+        let source = folder.join(dataset_filename(&entry["file"])?);
+        sources.push((source.clone(), file_signature(&source)?));
+        let member = prepared.path.join(format!("member-{position}"));
+        let names = prepare_dashboard_exports(&source, &member, Some(entry), Some(&generation))?;
+        for name in names.as_object().ok_or("Trasporti non validi")?.values() {
+            let name = name.as_str().ok_or("Nome trasporto non valido")?;
+            if files.contains(name) || name == "manifest.json" {
+                return Err("Trasporto sovrapposto a un dataset".into());
+            }
+            std::fs::rename(member.join(name), prepared.path.join(name))?;
+        }
+        std::fs::remove_dir(member)?;
+        entry
+            .as_object_mut()
+            .ok_or("Voce del manifest non valida")?
+            .extend(names.as_object().ok_or("Trasporti non validi")?.clone());
+    }
+    for (source, signature) in sources {
+        if file_signature(&source)? != signature {
+            return Err("Dataset modificato durante la conversione".into());
+        }
+    }
+    DumpClient::<WikimediaHttp>::write_json(
+        &prepared.path.join("manifest.json"),
+        &serde_json::json!(manifest),
+    )?;
+    publish_prepared(&prepared.path, folder, Some(&original), |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+#[cfg(feature = "cli")]
 fn write_browser_projection(
     path: &std::path::Path,
     staged: &CanonicalExport,
@@ -6141,6 +6351,46 @@ pub fn import_dumps(
 #[cfg(test)]
 mod tests {
     use super::parse_insert;
+    #[cfg(feature = "cli")]
+    #[test]
+    fn publication_failures_keep_the_prior_manifest_and_approved_files() {
+        let (root, _) = super::export_directory(&std::env::temp_dir()).unwrap();
+        let prepared = root.path.join("prepared");
+        let live = root.path.join("live");
+        std::fs::create_dir(&prepared).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        for name in ["new-a.json", "new-b.json", "manifest.json"] {
+            std::fs::write(prepared.join(name), name).unwrap();
+        }
+        std::fs::create_dir(prepared.join("empty")).unwrap();
+        std::fs::write(live.join("manifest.json"), b"approved").unwrap();
+        std::fs::write(live.join("old.json"), b"canonical").unwrap();
+        assert!(
+            super::publish_prepared(&prepared, &live, Some(b"stale"), |a, b| std::fs::rename(
+                a, b
+            ))
+            .is_err()
+        );
+        let mut moves = 0;
+        assert!(
+            super::publish_prepared(&prepared, &live, Some(b"approved"), |a, b| {
+                moves += 1;
+                if moves == 2 {
+                    Err(std::io::Error::other("synthetic rename failure"))
+                } else {
+                    std::fs::rename(a, b)
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(moves, 2);
+        assert_eq!(
+            std::fs::read(live.join("manifest.json")).unwrap(),
+            b"approved"
+        );
+        assert_eq!(std::fs::read(live.join("old.json")).unwrap(), b"canonical");
+        assert!(prepared.join("manifest.json").is_file());
+    }
 
     use super::history_activity;
 

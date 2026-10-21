@@ -1,6 +1,7 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    export_csv, prepare_dashboard_exports, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
+    export_csv, prepare_dashboard_exports, rebuild_dashboard, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS,
+    OBSERVATION_COLUMNS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -71,6 +72,75 @@ fn header() -> String {
         "content_revision_id,quality_revision_relation\r\n"
     )
     .into()
+}
+
+#[test]
+fn dashboard_publication_switches_generations_and_keeps_every_previously_approved_file() {
+    let w = Workspace::new();
+    let source = w.source(
+        &json!([{"page_id":1,"title":"A","orphan":true},{"page_id":2,"title":"B","orphan":false}]),
+        None,
+    );
+    fs::write(w.0.join("canonical.csv"), "approved csv").unwrap();
+    let aggregate = json!({"file":"all.json","language":"all","kind":"aggregate","date":null});
+    fs::write(w.0.join("all.json"), "approved aggregate").unwrap();
+    fs::write(w.0.join("manifest.json"),json!([{"file":"canonical.json","language":"vec","date":null,"published_at":"old"},aggregate]).to_string()).unwrap();
+    let canonical = fs::read(&source).unwrap();
+    rebuild_dashboard(&w.0).unwrap();
+    let first = read_json(w.0.join("manifest.json"));
+    let old = snapshot(&w.0);
+    assert_eq!(first[1], aggregate);
+    assert_eq!(first[0]["published_at"], "old");
+    assert_eq!(first[0].as_object().unwrap().len(), 13);
+    for (key, name) in first[0].as_object().unwrap() {
+        if key.ends_with("_file") || key.ends_with("_dir") {
+            assert!(w.0.join(name.as_str().unwrap()).exists());
+        }
+    }
+    rebuild_dashboard(&w.0).unwrap();
+    let next = read_json(w.0.join("manifest.json"));
+    for key in [
+        "observations_file",
+        "articles_file",
+        "summary_file",
+        "creator_index_file",
+        "cards_file",
+        "cards_dir",
+        "connections_dir",
+        "connections_metadata_file",
+        "profile_topics_dir",
+    ] {
+        assert_ne!(first[0][key], next[0][key]);
+    }
+    for (path, bytes) in old {
+        if path != std::path::Path::new("manifest.json") {
+            assert_eq!(fs::read(w.0.join(path)).unwrap(), bytes);
+        }
+    }
+    assert_eq!(fs::read(&source).unwrap(), canonical);
+    assert_eq!(
+        fs::read_to_string(w.0.join("canonical.csv")).unwrap(),
+        "approved csv"
+    );
+}
+
+#[test]
+fn invalid_dashboard_members_and_duplicate_manifests_publish_nothing() {
+    let w = Workspace::new();
+    w.source(&json!([{"page_id":1,"title":"A","orphan":true}]), None);
+    fs::write(w.0.join("broken.json"), "{\"metadata\":").unwrap();
+    let good = json!({"file":"canonical.json","language":"vec","date":null});
+    for manifest in [
+        json!([good,{"file":"broken.json","language":"lmo","date":null}]),
+        json!([good, good]),
+        json!([{"file":"../bad.json","language":"vec"}]),
+        json!([]),
+    ] {
+        fs::write(w.0.join("manifest.json"), manifest.to_string()).unwrap();
+        let before = snapshot(&w.0);
+        assert!(rebuild_dashboard(&w.0).is_err());
+        assert_eq!(snapshot(&w.0), before);
+    }
 }
 
 #[test]

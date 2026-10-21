@@ -203,6 +203,11 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "dashboard" {
+            _native::dumps::rebuild_dashboard(&self.path("data-dir")?)
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if self.name == "topics" {
             let work = self
                 .args
