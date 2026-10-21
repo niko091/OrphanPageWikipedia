@@ -9,14 +9,14 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["python"]
-python = ["dep:pyo3", "dep:regex", "dep:chrono"]
+python = ["dep:pyo3"]
 dashboard = ["dep:wasm-bindgen"]
 
 [dependencies]
 pyo3 = { version = "0.28", optional = true, features = ["extension-module", "abi3-py311"] }
 
-regex = { version = "=1.12.4", optional = true }
-chrono = { version = "=0.4.45", optional = true, default-features = false, features = ["std"] }
+regex = "=1.12.4"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"

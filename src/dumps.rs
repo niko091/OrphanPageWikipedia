@@ -102,7 +102,6 @@ pub fn parse_insert(statement: &str) -> Result<Vec<Vec<Option<String>>>, String>
     Ok(rows)
 }
 
-#[cfg(feature = "python")]
 pub fn history_activity(
     events: Vec<(String, i32)>,
     creations: Vec<String>,
@@ -175,10 +174,8 @@ pub fn history_activity(
 mod tests {
     use super::parse_insert;
 
-    #[cfg(feature = "python")]
     use super::history_activity;
 
-    #[cfg(feature = "python")]
     #[test]
     fn prior_activity_uses_strict_time_and_completed_months() {
         let mut events = Vec::new();
@@ -191,7 +188,6 @@ mod tests {
         assert_eq!(metrics, vec![(5, 5, 2, "two".to_owned())]);
     }
 
-    #[cfg(feature = "python")]
     #[test]
     fn prior_activity_sweep_preserves_query_order_duplicates_and_time_boundaries() {
         let events = vec![
@@ -223,7 +219,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "python")]
     #[test]
     fn prior_activity_caches_streaks_without_changing_creation_month_exclusion() {
         let mut events = Vec::new();
