@@ -711,6 +711,59 @@ pub struct SummaryAccumulator {
     identities: HashSet<(String, u64)>,
 }
 
+// Preserve the frozen Python -> JSON -> serde_json 1.0.150 chart-input bridge.
+// The CLI enables float_roundtrip for canonical records, but approved chart
+// reports historically read Python's shortest decimal via the fast parser's
+// significand/power operations. Restrict this behavior to summary inputs; do
+// not round canonical observations, CSV, previews or transport projections.
+fn summary_bridge_float(number: &serde_json::Number) -> Result<f64, String> {
+    static POWERS: std::sync::OnceLock<Result<Vec<f64>, String>> = std::sync::OnceLock::new();
+    let powers = POWERS
+        .get_or_init(|| {
+            (0..=308)
+                .map(|i| format!("1e{i}").parse::<f64>().map_err(|e| e.to_string()))
+                .collect()
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let encoded = crate::dumps::python_float(number).map_err(|e| e.to_string())?;
+    let positive = !encoded.starts_with('-');
+    let encoded = encoded.strip_prefix('-').unwrap_or(&encoded);
+    let (mantissa, exponent) = encoded.split_once('e').unwrap_or((encoded, "0"));
+    let fractional = mantissa
+        .split_once('.')
+        .map_or(0, |(_, digits)| digits.len());
+    let significand = mantissa
+        .replace('.', "")
+        .parse::<u64>()
+        .map_err(|e| e.to_string())?;
+    let mut exponent = exponent.parse::<i32>().map_err(|e| e.to_string())?
+        - i32::try_from(fractional).map_err(|e| e.to_string())?;
+    let mut value = significand as f64;
+    loop {
+        if let Some(power) = powers.get(exponent.unsigned_abs() as usize) {
+            if exponent >= 0 {
+                value *= power;
+            } else {
+                value /= power;
+            }
+            break;
+        }
+        if value == 0.0 {
+            break;
+        }
+        if exponent >= 0 {
+            return Err("chart input number out of range".into());
+        }
+        value /= 1e308;
+        exponent += 308;
+    }
+    if !value.is_finite() {
+        return Err("chart input number out of range".into());
+    }
+    Ok(if positive { value } else { -value })
+}
+
 impl SummaryAccumulator {
     fn page_language<'a>(&'a self, page: &'a SummaryPage) -> &'a str {
         page.language.as_deref().unwrap_or(&self.language)
@@ -737,15 +790,75 @@ impl SummaryAccumulator {
     pub fn add_json(&mut self, input: &str) -> Result<(), String> {
         let pages: Vec<SummaryPage> = serde_json::from_str(input).map_err(|e| e.to_string())?;
         for page in pages {
-            let language = page.language.as_deref().unwrap_or(&self.language);
-            if page.page_id == 0 || language.is_empty() || page.title.is_empty() {
-                return Err("invalid dashboard article identity".into());
-            }
-            if !self.identities.insert((language.to_owned(), page.page_id)) {
-                return Err("duplicate dashboard article identity".into());
-            }
-            self.pages.push(page);
+            self.push_page(page)?;
         }
+        Ok(())
+    }
+
+    /// Read only chart fields from an already decoded observation, preserving
+    /// the frozen Python JSON bridge's numeric ingestion. Member
+    /// exports ignore an incidental page.language; aggregate callers supply
+    /// the verified member language explicitly, as the Python projection does.
+    pub fn add_observation(
+        &mut self,
+        input: &serde_json::Value,
+        language: Option<&str>,
+    ) -> Result<(), String> {
+        let fields = input.as_object().ok_or("invalid dashboard observation")?;
+        let projection = serde::de::value::MapDeserializer::<_, serde_json::Error>::new(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "language")
+                .map(|(key, value)| (key.as_str(), value)),
+        );
+        let mut page = SummaryPage::deserialize(projection).map_err(|e| e.to_string())?;
+        page.language = language.map(str::to_owned);
+        for (key, field) in [
+            ("age_days", &mut page.age_days),
+            ("length_bytes", &mut page.length_bytes),
+            ("quality_score", &mut page.quality_score),
+            (
+                "creator_prior_edits_main",
+                &mut page.creator_prior_edits_main,
+            ),
+            (
+                "creator_prior_edits_other",
+                &mut page.creator_prior_edits_other,
+            ),
+            ("creator_prior_articles", &mut page.creator_prior_articles),
+            ("creator_tenure_days", &mut page.creator_tenure_days),
+            ("creator_orphans_current", &mut page.creator_orphans_current),
+            (
+                "creator_prior_edits_main_history",
+                &mut page.creator_prior_edits_main_history,
+            ),
+            (
+                "creator_prior_edits_other_history",
+                &mut page.creator_prior_edits_other_history,
+            ),
+            (
+                "creator_continuity_months_before_creation",
+                &mut page.creator_continuity_months_before_creation,
+            ),
+        ] {
+            if let serde_json::Value::Number(number) = &input[key] {
+                if number.is_f64() {
+                    *field = Some(summary_bridge_float(number)?);
+                }
+            }
+        }
+        self.push_page(page)
+    }
+
+    fn push_page(&mut self, page: SummaryPage) -> Result<(), String> {
+        let language = page.language.as_deref().unwrap_or(&self.language);
+        if page.page_id == 0 || language.is_empty() || page.title.is_empty() {
+            return Err("invalid dashboard article identity".into());
+        }
+        if !self.identities.insert((language.to_owned(), page.page_id)) {
+            return Err("duplicate dashboard article identity".into());
+        }
+        self.pages.push(page);
         Ok(())
     }
 
@@ -930,6 +1043,78 @@ impl SummaryAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chart_float_ingestion_preserves_the_frozen_bridge_without_mutating_observations() {
+        let input = serde_json::json!({"page_id":1,"title":"Exact input","orphan":true,
+            "quality_status":"scored","quality_score":0.9859704508633369});
+        let before = input.clone();
+        let mut summary = SummaryAccumulator::new("vec".into(), false, false);
+        summary.add_observation(&input, None).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&summary.finish().unwrap()).unwrap();
+        assert_eq!(
+            report["profiles"]["thresholds"]["vec"][2]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            0.9859704508633368f64.to_bits()
+        );
+        assert_eq!(input, before);
+        assert_eq!(
+            input["quality_score"].as_f64().unwrap().to_bits(),
+            0.9859704508633369f64.to_bits()
+        );
+    }
+
+    #[cfg(not(feature = "cli"))]
+    #[test]
+    fn chart_bridge_matches_the_original_parser_on_finite_binary64_inputs() {
+        let mut bits = 918_271_613u64;
+        for _ in 0..100_000 {
+            bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let value = f64::from_bits(bits);
+            let Some(number) = serde_json::Number::from_f64(value) else {
+                continue;
+            };
+            let encoded = crate::dumps::python_float(&number).unwrap();
+            let original = serde_json::from_str::<f64>(&encoded);
+            let bridged = summary_bridge_float(&number);
+            match (original, bridged) {
+                (Ok(a), Ok(b)) => assert_eq!(a.to_bits(), b.to_bits(), "{encoded}"),
+                (Err(_), Err(_)) => {}
+                pair => panic!("bridge and reference disagree for {encoded}: {pair:?}"),
+            }
+        }
+    }
+    #[test]
+    fn decoded_observations_ignore_incidental_languages_and_scope_verified_members() {
+        let page = serde_json::json!({"page_id":1,"title":"A","orphan":true,
+            "language":{"not":"a member identity"},"history_creator_key":"history:7",
+            "creator_prior_edits_main_history":3,"unused":[1,2,3]});
+        let mut member = SummaryAccumulator::new("vec".into(), false, true);
+        member.add_observation(&page, None).unwrap();
+        assert!(member.add_observation(&page, None).is_err());
+        assert_eq!(member.len(), 1);
+        let report: serde_json::Value = serde_json::from_str(&member.finish().unwrap()).unwrap();
+        assert_eq!(report["overview"]["attributed_orphans"], 1);
+        assert_eq!(report["creators"][0]["key"], "history:7");
+        let mut aggregate = SummaryAccumulator::new("all".into(), true, true);
+        aggregate.add_observation(&page, Some("vec")).unwrap();
+        aggregate.add_observation(&page, Some("lmo")).unwrap();
+        assert_eq!(aggregate.len(), 2);
+        let report: serde_json::Value = serde_json::from_str(&aggregate.finish().unwrap()).unwrap();
+        assert_eq!(report["creators"].as_array().unwrap().len(), 2);
+        assert_eq!(report["overview"]["total"], 2);
+        assert!(aggregate
+            .add_observation(&serde_json::json!([]), None)
+            .is_err());
+        assert!(aggregate
+            .add_observation(
+                &serde_json::json!({"page_id":2,"title":"","orphan":true}),
+                None
+            )
+            .is_err());
+        assert_eq!(aggregate.len(), 2);
+    }
     #[test]
     fn interest_score_prioritizes_topics_and_uses_language_only_in_aggregate() {
         let report = interest_scores(InterestInput {

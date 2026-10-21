@@ -20,9 +20,15 @@ impl Workspace {
         Self(path)
     }
     fn source(&self, pages: &Value, candidates: Option<&Value>) -> PathBuf {
+        self.canonical(
+            &json!({"language":"vec","complete":true}),
+            pages,
+            candidates,
+        )
+    }
+    fn canonical(&self, metadata: &Value, pages: &Value, candidates: Option<&Value>) -> PathBuf {
         let path = self.0.join("canonical.json");
-        let mut text =
-            format!("{{\"metadata\":{{\"language\":\"vec\",\"complete\":true}},\"pages\":{pages}");
+        let mut text = format!("{{\"metadata\":{metadata},\"pages\":{pages}");
         if let Some(candidates) = candidates {
             text.push_str(&format!(",\"link_candidates\":{candidates}"));
         }
@@ -358,7 +364,7 @@ fn browser_indices_keep_every_display_value_candidate_count_and_topic_lookup() {
     let before = fs::read(&source).unwrap();
     let folder = w.0.join("prepared");
     let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
-    assert_eq!(names.as_object().unwrap().len(), 7);
+    assert_eq!(names.as_object().unwrap().len(), 9);
     assert!(!folder.join("manifest.json").exists());
     for (key, format, columns) in [
         ("observations_file", "observations_v1", OBSERVATION_COLUMNS),
@@ -741,6 +747,184 @@ fn a_census_without_orphans_still_prepares_empty_editorial_directories() {
                 .count(),
             0
         );
+    }
+}
+
+#[test]
+fn prepared_summaries_keep_historical_attribution_creation_missing_values_and_source_identity() {
+    let w = Workspace::new();
+    let pages = json!([
+        {"page_id":1,"title":"A","orphan":true,"page_created_at":"2020-01-01T00:00:00Z","age_days":365.25,
+            "creator_key":"current:1","history_creator_key":"history:7","creator_prior_edits_main":999,
+            "creator_prior_edits_main_history":3,"creator_groups_at_creation_history":["sysop"],"creator_is_bot_now":false,
+            "topic_status":"predicted","topic_labels":[],"quality_status":"scored","quality_score":0.9859704508633369,"length_bytes":0},
+        {"page_id":2,"title":"B","orphan":false,"page_created_at":null,"age_days":9000,
+            "history_first_revision_age_days":9000,"creator_key":"current:2","history_creator_key":"history:7",
+            "creator_prior_edits_main_history":5,"topic_status":"missing","topic_labels":null,"quality_status":"missing"}
+    ]);
+    let metadata = json!({"language":"vec","complete":true,"finished_at":"2026-10-02T00:00:00Z",
+        "creators":{"status":"not_collected"},"history":{"status":"collected"},"measures_rule":"creation_quality_creators_v2"});
+    let source = w.canonical(&metadata, &pages, None);
+    let before = fs::read(&source).unwrap();
+    let folder = w.0.join("historical");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let summary = read_json(folder.join(names["summary_file"].as_str().unwrap()));
+    let creators = read_json(folder.join(names["creator_index_file"].as_str().unwrap()));
+    assert_eq!(summary["format"], "dashboard_summary_v1");
+    assert_eq!(summary["histogram_rule"], "shared_p2_p98_tails_v1");
+    assert_eq!(summary["measures_rule"], "creation_quality_creators_v2");
+    assert_eq!(summary["metadata"], metadata);
+    assert_eq!(creators["metadata"], metadata);
+    assert_eq!(summary["census_page_count"], 2);
+    assert_eq!(creators["census_page_count"], 2);
+    assert_eq!(creators["format"], "creator_index_v1");
+    assert_eq!(summary["sources"], creators["sources"]);
+    assert_eq!(summary["sources"][0]["file"], "canonical.json");
+    assert_eq!(summary["sources"][0]["size"], before.len());
+    let nanos = fs::metadata(&source)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    assert_eq!(
+        summary["sources"][0]["mtime_ns"].as_u64().unwrap() as u128,
+        nanos
+    );
+    assert_eq!(creators["creators"].as_array().unwrap().len(), 1);
+    assert_eq!(creators["creators"][0]["key"], "history:7");
+    assert_eq!(creators["creators"][0]["total"], 2);
+    assert!(summary["reports"].get("creators").is_none());
+    assert_eq!(summary["reports"]["numeric"]["age_days"]["known"], 1);
+    assert_eq!(
+        summary["reports"]["numeric"]["age_days"]["groups"][0]["median"],
+        1.0
+    );
+    assert_eq!(
+        summary["reports"]["numeric"]["age_days"]["groups"][1]["missing"],
+        1
+    );
+    assert_eq!(
+        summary["reports"]["numeric"]["creator_prior_edits_main"]["groups"][0]["median"],
+        3.0
+    );
+    assert_eq!(
+        summary["reports"]["profiles"]["topics"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        summary["reports"]["profiles"]["features"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        summary["reports"]["profiles"]["thresholds"]["vec"][2]
+            .as_f64()
+            .unwrap()
+            .to_bits(),
+        0.9859704508633368f64.to_bits()
+    );
+    assert_eq!(
+        summary["article_preview"][0]["quality_score"]
+            .as_f64()
+            .unwrap()
+            .to_bits(),
+        0.9859704508633369f64.to_bits()
+    );
+    assert_eq!(fs::read(&source).unwrap(), before);
+    let mut current = metadata.clone();
+    current["creators"]["status"] = json!("collected");
+    w.canonical(&current, &pages, None);
+    let folder = w.0.join("current");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let creators = read_json(folder.join(names["creator_index_file"].as_str().unwrap()));
+    assert_eq!(creators["creators"].as_array().unwrap().len(), 2);
+    assert!(creators["creators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["key"].as_str().unwrap().starts_with("current:")));
+}
+
+#[test]
+fn preview_uses_full_unicode_casefold_title_id_ties_and_only_the_first_25_orphans() {
+    let w = Workspace::new();
+    let titles = [
+        "ß", "SS", "ss", "ẞ", "ﬃoo", "ffiOo", "ffi", "ﬀ", "FF", "İ", "I\u{307}", "Σ", "σ", "ς",
+        "ǰ", "J\u{30c}", "ᾈ", "K", "K", "Ω", "ω", "Ա", "ա", "А", "а", "A", "a", "Å", "å", "Z", "z",
+        "Ꭰ", "ꭰ", "I", "i", "ı", "µ", "μ",
+    ];
+    let pages=titles.iter().enumerate().rev().map(|(i,title)|json!({"page_id":i+1,"title":title,"orphan":true,"category":format!("Category {i}"),"language":{"discard":"incidental"}})).collect::<Vec<_>>();
+    let source = w.source(&json!(pages), None);
+    let folder = w.0.join("prepared");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let summary = read_json(folder.join(names["summary_file"].as_str().unwrap()));
+    let preview = summary["article_preview"].as_array().unwrap();
+    let expected = [
+        "A", "a", "FF", "ﬀ", "ffi", "ffiOo", "ﬃoo", "I", "i", "I\u{307}", "İ", "J\u{30c}", "ǰ",
+        "K", "K", "SS", "ss", "ß", "ẞ", "Z", "z", "Å", "å", "ı", "µ",
+    ];
+    assert_eq!(
+        preview
+            .iter()
+            .map(|row| row["title"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(preview.iter().all(|row| row.get("language").is_none()
+        && row.as_object().unwrap().len() == OBSERVATION_COLUMNS.len()));
+    assert_eq!(
+        summary["reports"]["categories"].as_array().unwrap().len(),
+        20
+    );
+    assert_eq!(summary["reports"]["overview"]["total"], titles.len());
+    let source = w.source(
+        &json!([
+            {"page_id":3,"title":"Same","orphan":true},
+            {"page_id":1,"title":"Same","orphan":true},
+            {"page_id":2,"title":"Before","orphan":false}
+        ]),
+        None,
+    );
+    let folder = w.0.join("ties");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let summary = read_json(folder.join(names["summary_file"].as_str().unwrap()));
+    assert_eq!(
+        summary["article_preview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["page_id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn late_summary_validation_removes_prepared_editorial_and_article_products() {
+    let w = Workspace::new();
+    for invalid in [
+        json!({"page_id":2,"title":null,"orphan":true}),
+        json!({"page_id":2,"title":"","orphan":true}),
+        json!({"page_id":2,"title":"B","orphan":true,"quality_score":{}}),
+        json!({"page_id":2,"title":"B","orphan":true,"topic_labels":true}),
+    ] {
+        let source = w.source(
+            &json!([{"page_id":1,"title":"A","orphan":true},invalid]),
+            None,
+        );
+        let before = fs::read(&source).unwrap();
+        let folder = w.0.join("prepared");
+        assert!(prepare_dashboard_exports(&source, &folder, None, None).is_err());
+        assert!(!folder.exists());
+        assert_eq!(fs::read(&source).unwrap(), before);
+        w.assert_files(&["canonical.json"]);
     }
 }
 

@@ -309,6 +309,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaccia"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ef16690750b6e9a238378f57d3c1325d42e2d82e29b7dfd75f6d387d753b050"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,6 +817,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "focaccia",
  "pyo3",
  "quick-xml",
  "regex",

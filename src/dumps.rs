@@ -954,7 +954,6 @@ impl<T: DumpHttp> DumpClient<T> {
     }
 }
 
-#[cfg(feature = "cli")]
 type DumpResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[cfg(feature = "cli")]
@@ -2786,10 +2785,160 @@ fn write_editorial_exports(
     )
 }
 
-/// Prepare complete article/profile indices and editorial transports in a NEW
-/// private directory. These are not an approved publication: chart summaries
-/// and the manifest are prepared by subsequent stages. On error only the owned
-/// directory is removed. No evidence is dropped from complete detail records.
+#[cfg(feature = "cli")]
+fn write_dashboard_summaries(
+    source: &std::path::Path,
+    folder: &std::path::Path,
+    names: &serde_json::Value,
+    staged: &CanonicalExport,
+) -> DumpResult<()> {
+    use serde_json::{json, Value};
+    use std::io::{BufWriter, Write};
+    let metadata = &staged.metadata;
+    let collected =
+        |status: &Value| matches!(status.as_str(), Some("collected" | "partially_collected"));
+    let mut summary = crate::dashboard::SummaryAccumulator::new(
+        metadata["language"]
+            .as_str()
+            .ok_or("Lingua mancante")?
+            .into(),
+        false,
+        !collected(&metadata["creators"]["status"]) && collected(&metadata["history"]["status"]),
+    );
+    struct Preview {
+        title: String,
+        id: i64,
+        fields: Value,
+    }
+    let mut preview = Vec::<Preview>::with_capacity(26);
+    let mut query = staged
+        .database
+        .prepare("SELECT data FROM pages ORDER BY position")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let page: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        summary.add_observation(&page, None)?;
+        if page["orphan"] != true {
+            continue;
+        }
+        let title = page["title"].as_str().ok_or("Titolo mancante")?;
+        let id = page["page_id"].as_i64().ok_or("ID mancante")?;
+        let position = preview.partition_point(|old| {
+            focaccia::unicode_full_casecmp(&old.title, title)
+                .then_with(|| old.title.as_str().cmp(title))
+                .then_with(|| old.id.cmp(&id))
+                .is_lt()
+        });
+        if position < 25 {
+            preview.insert(
+                position,
+                Preview {
+                    title: title.into(),
+                    id,
+                    fields: OBSERVATION_COLUMNS
+                        .iter()
+                        .map(|key| (String::from(*key), page[key].clone()))
+                        .collect(),
+                },
+            );
+            preview.truncate(25);
+        }
+    }
+    if summary.len() != staged.count {
+        return Err("Riepilogo del censimento incompleto".into());
+    }
+    let encoded = summary.finish()?;
+    drop(summary);
+    let mut reports: Value = serde_json::from_str(&encoded)?;
+    drop(encoded);
+    let creators = reports
+        .as_object_mut()
+        .ok_or("Riepilogo non valido")?
+        .remove("creators")
+        .ok_or("Indice autori mancante")?;
+    reports["categories"]
+        .as_array_mut()
+        .ok_or("Riepilogo categorie mancante")?
+        .truncate(20);
+    let sources = json!([{"language":metadata["language"],"file":source.file_name().and_then(|s|s.to_str()).ok_or("Nome raccolta non valido")?,
+        "size":staged.signature.0,"mtime_ns":staged.signature.1}]);
+    let default_rule = json!("creation_quality_creators_v3");
+    let article_preview = preview
+        .into_iter()
+        .map(|entry| entry.fields)
+        .collect::<Vec<_>>();
+    #[derive(serde::Serialize)]
+    struct Summary<'a> {
+        format: &'static str,
+        histogram_rule: &'static str,
+        measures_rule: &'a Value,
+        metadata: &'a Value,
+        sources: &'a Value,
+        census_page_count: usize,
+        reports: &'a Value,
+        article_preview: &'a [Value],
+    }
+    write_atomic(
+        &folder.join(
+            names["summary_file"]
+                .as_str()
+                .ok_or("Nome riepilogo mancante")?,
+        ),
+        |file| {
+            let mut writer = BufWriter::with_capacity(65536, file);
+            serde_json::to_writer(
+                &mut writer,
+                &Summary {
+                    format: "dashboard_summary_v1",
+                    histogram_rule: "shared_p2_p98_tails_v1",
+                    measures_rule: metadata.get("measures_rule").unwrap_or(&default_rule),
+                    metadata,
+                    sources: &sources,
+                    census_page_count: staged.count,
+                    reports: &reports,
+                    article_preview: &article_preview,
+                },
+            )?;
+            writer.flush()?;
+            Ok(())
+        },
+    )?;
+    #[derive(serde::Serialize)]
+    struct Creators<'a> {
+        format: &'static str,
+        metadata: &'a Value,
+        sources: &'a Value,
+        census_page_count: usize,
+        creators: &'a Value,
+    }
+    write_atomic(
+        &folder.join(
+            names["creator_index_file"]
+                .as_str()
+                .ok_or("Nome indice autori mancante")?,
+        ),
+        |file| {
+            let mut writer = BufWriter::with_capacity(65536, file);
+            serde_json::to_writer(
+                &mut writer,
+                &Creators {
+                    format: "creator_index_v1",
+                    metadata,
+                    sources: &sources,
+                    census_page_count: staged.count,
+                    creators: &creators,
+                },
+            )?;
+            writer.flush()?;
+            Ok(())
+        },
+    )
+}
+
+/// Prepare all member dashboard transports in a NEW private directory. This
+/// does not publish an approval manifest. Only the owned directory is removed
+/// on error. The existing chart accumulator retains compact per-page measures;
+/// graph/candidate vectors are never retained across target records.
 /// Source stat fingerprints and generation names follow the Python transport
 /// contract; previous generations and the canonical source are never rewritten.
 #[cfg(feature = "cli")]
@@ -2849,7 +2998,9 @@ pub fn prepare_dashboard_exports(
         "cards_file":format!("{stem}-cards-v2.json"),
         "cards_dir":format!("{stem}-cards"),
         "connections_dir":format!("{stem}-connections"),
-        "connections_metadata_file":format!("{stem}-connections-metadata.json")
+        "connections_metadata_file":format!("{stem}-connections-metadata.json"),
+        "summary_file":format!("{stem}-summary.json"),
+        "creator_index_file":format!("{stem}-creators.json")
     });
     let mut prepared = PreparedDirectory::new(folder)?;
     for (key, format, columns, count) in [
@@ -2899,6 +3050,7 @@ pub fn prepare_dashboard_exports(
         &identity("orphan_cards_v2")?,
         &identity("connections_v2")?,
     )?;
+    write_dashboard_summaries(source, folder, &names, &staged)?;
     if file_signature(source)? != staged.signature {
         return Err("Esportazione modificata durante la conversione".into());
     }
@@ -4566,8 +4718,7 @@ pub fn write_canonical_json(
 
 // serde_json's shortest digits use nearest/even ties, matching Python repr.
 // Rust Debug's tie policy differs (e.g. 1255183068570128.25), so do not use it.
-#[cfg(feature = "cli")]
-fn python_float(number: &serde_json::Number) -> DumpResult<String> {
+pub(crate) fn python_float(number: &serde_json::Number) -> DumpResult<String> {
     let encoded = number.to_string();
     let (sign, encoded) = encoded
         .strip_prefix('-')
