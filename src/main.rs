@@ -203,6 +203,30 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if matches!(self.name.as_str(), "fetch-dumps" | "fetch-content") {
+            use _native::dumps::{DumpClient, WikimediaHttp};
+            let mut client = DumpClient::new(WikimediaHttp::new()?);
+            let release = |name: &str| {
+                self.args
+                    .get_one::<String>(name)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("Release mancante: {name}"))
+            };
+            let root = self.path("root")?;
+            let plan = self.args.get_flag("plan");
+            if self.name == "fetch-dumps" {
+                client.fetch_dumps(
+                    &self.editions,
+                    release("sql-release")?,
+                    release("history-release")?,
+                    &root,
+                    plan,
+                )?;
+            } else {
+                client.fetch_content(&self.editions, release("content-release")?, &root, plan)?;
+            }
+            return Ok(());
+        }
         Err(format!("Il backend Rust del comando {} non è ancora migrato; usare il percorso Python verificato. Nessun output pubblicato.", self.name))
     }
 }
