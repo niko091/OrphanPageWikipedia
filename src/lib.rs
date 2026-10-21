@@ -1197,38 +1197,45 @@ pub fn join_topic_rows(
         if record["page_id"].as_i64() != Some(id) || record["revision_id"] != row["revision_id"] {
             return Err("Temi o revisione non corrispondenti".into());
         }
-        let status = record["topic_status"]
-            .as_str()
-            .ok_or("Stato dei temi mancante")?;
-        let count = record["topic_input_count"]
-            .as_u64()
-            .ok_or("Numero di collegamenti del modello incoerente")?;
-        let labels = &record["topic_labels"];
-        if !matches!(
-            status,
-            "predicted" | "no_model_vocabulary" | "no_mapped_outlinks"
-        ) || (status == "predicted") != (count > 0)
-            || (status == "predicted") == labels.is_null()
-        {
-            return Err("Stato di disponibilità dei temi incoerente".into());
-        }
-        if !labels.is_null() {
-            let labels = labels.as_array().ok_or("Etichette dei temi non valide")?;
-            let mut distinct = HashSet::with_capacity(labels.len());
-            for label in labels {
-                let label = label.as_str().ok_or("Etichetta dei temi non valida")?;
-                if !taxonomy.contains(label) || !distinct.insert(label) {
-                    return Err("Temi sconosciuti o duplicati".into());
-                }
-            }
-        }
-        predicted += usize::from(status == "predicted");
+        predicted += usize::from(validate_topic_record(record, taxonomy)?);
         let row = row.as_object_mut().ok_or("Osservazione non valida")?;
         for field in ["topic_labels", "topic_status", "topic_input_count"] {
             row.insert(field.into(), record[field].clone());
         }
     }
     Ok(predicted)
+}
+
+pub(crate) fn validate_topic_record(
+    record: &serde_json::Value,
+    taxonomy: &HashSet<String>,
+) -> Result<bool, String> {
+    let status = record["topic_status"]
+        .as_str()
+        .ok_or("Stato dei temi mancante")?;
+    let count = record["topic_input_count"]
+        .as_u64()
+        .ok_or("Numero di collegamenti del modello incoerente")?;
+    let labels = &record["topic_labels"];
+    if !matches!(
+        status,
+        "predicted" | "no_model_vocabulary" | "no_mapped_outlinks"
+    ) || (status == "predicted") != (count > 0)
+        || (status == "predicted") == labels.is_null()
+    {
+        return Err("Stato di disponibilità dei temi incoerente".into());
+    }
+    if !labels.is_null() {
+        let labels = labels.as_array().ok_or("Etichette dei temi non valide")?;
+        let mut distinct = HashSet::with_capacity(labels.len());
+        for label in labels {
+            let label = label.as_str().ok_or("Etichetta dei temi non valida")?;
+            if !taxonomy.contains(label) || !distinct.insert(label) {
+                return Err("Temi sconosciuti o duplicati".into());
+            }
+        }
+    }
+    Ok(status == "predicted")
 }
 
 /// Compute both ages independently. A reconstructed or observed creation event
