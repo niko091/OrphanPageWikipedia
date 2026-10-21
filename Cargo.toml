@@ -16,7 +16,7 @@ required-features = ["cli"]
 default = ["python"]
 python = ["dep:pyo3"]
 dashboard = ["dep:wasm-bindgen"]
-cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc"]
+cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc", "serde_json/float_roundtrip"]
 
 [dependencies]
 pyo3 = { version = "0.28", optional = true, features = ["extension-module", "abi3-py311"] }
