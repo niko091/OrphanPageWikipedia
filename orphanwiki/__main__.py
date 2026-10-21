@@ -3,6 +3,8 @@ import csv
 import hashlib
 import json
 import math
+import signal
+import sys
 import re
 import tempfile
 import time
@@ -11,9 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import (
+    operational_span,
+    operational_phase,
+    phase_counts,
     aggregate_index,
     analyze,
     compare_files,
+    comparison_collections,
     configured_languages,
     json_sha256,
     load_topic_model,
@@ -33,11 +39,16 @@ def export(raw, output, rules, topics=None, history=None, quality=None):
     export_result(result, output)
 
 
+@operational_phase('export.wiki')
 def export_result(result, output, update_manifest=True, announce=True):
+    phase_counts(language=result['metadata'].get('language'), rows=len(result['pages']))
     output = Path(output)
-    write_json(output, result, arrays={'pages': result['pages']},
-               mappings={'link_candidates': result['link_candidates'].items()} if 'link_candidates' in result else None)
-    with output.with_suffix('.csv').open('w', encoding='utf-8', newline='') as stream:
+    with operational_span('export.canonical_json', rows=len(result['pages'])) as span:
+        write_json(output, result, arrays={'pages': result['pages']},
+                   mappings={'link_candidates': result['link_candidates'].items()} if 'link_candidates' in result else None)
+        span['bytes'] = output.stat().st_size if output.is_file() else None
+    with operational_span('export.csv', rows=len(result['pages'])) as span, \
+            output.with_suffix('.csv').open('w', encoding='utf-8', newline='') as stream:
         fields = ['page_id', 'title', 'category', 'category_status', 'orphan', 'in_degree', 'out_degree', 'created_at', 'age_days', 'history_first_revision_at', 'history_first_revision_age_days', 'length_bytes', 'origin', 'creator_key', 'creator_data_status', 'creator_account_type', 'creator_tenure_days', 'creator_prior_edits_main', 'creator_prior_edits_other', 'creator_prior_articles', 'creator_articles_created_total', 'creator_articles_in_census', 'creator_orphans_current', 'creator_orphans_current_share', 'creator_orphans_at_30_days', 'history_creator_key', 'history_creator_status', 'history_data_status', 'creator_groups_at_creation_history', 'creator_continuity_months_before_creation', 'creator_continuity_bucket_before_creation', 'creator_prior_edits_main_history', 'creator_prior_edits_other_history']
         fields += ['creator_attribution', 'creator_registered_at', 'creator_tenure_status', 'creator_experience_status',
                    'topic_labels', 'topic_status', 'topic_input_count',
@@ -56,6 +67,8 @@ def export_result(result, output, update_manifest=True, announce=True):
         for page, candidates in rows:
             writer.writerow({**page, 'candidate_count': candidates.get('candidate_count'),
                              'candidate_status': candidates.get('status')})
+        stream.flush()
+        span['bytes'] = stream.tell()
     transports = write_dashboard_exports(output, output.parent)
     if update_manifest:
         manifest_path = output.parent / 'manifest.json'
@@ -78,6 +91,7 @@ def manifest_entry(result, filename, transports=None):
                if meta.get('kind') != 'aggregate' else {})}
 
 
+@operational_phase('export.publish')
 def _publish_prepared(prepared, destination, excluded=()):
     """Move prepared transports, then publish their manifest last."""
     prepared, destination = Path(prepared), Path(destination)
@@ -102,7 +116,8 @@ def comparison_filename(language, result, languages):
     identity = {'language': language, 'release': release,
                 'input': meta.get('input_sha256'), 'history': meta.get('history'),
                 'topics': meta.get('topics'), 'quality': meta.get('quality'),
-                'age_rule': meta.get('age_rule'), 'measures_rule': meta.get('measures_rule'), 'references': sorted(languages)}
+                'age_rule': meta.get('age_rule'), 'measures_rule': meta.get('measures_rule'),
+                'references': meta.get('comparison', {}).get('collections') or sorted(languages)}
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
                                        default=str).encode()).hexdigest()[:12]
     return f'{language}-{release}-{digest}.json'
@@ -123,6 +138,7 @@ def _matching_aggregate_report(report, metadata, sources, count):
     return {**{key: value for key, value in previous.items() if key != 'comparison_coverage'}, **metadata}
 
 
+@operational_phase('export.available_aggregate')
 def publish_available_aggregate(output_dir, prepared_report=None):
     """Index the latest complete dump export per language without reading article arrays.
 
@@ -282,6 +298,7 @@ def discover_collections(folder):
     return paths
 
 
+@operational_phase('export.comparison')
 def publish_comparison(results, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -379,8 +396,9 @@ def main():
     compare = sub.add_parser('compare', help='Confronto interlingua in tutte le direzioni')
     compare.add_argument('inputs', nargs='*', help='Raccolte complete, una per lingua; senza argomenti legge tutti i *-raw.json')
     compare.add_argument('--input-dir', default='data')
+    compare.add_argument('--languages-file', default='config/languages.json')
     compare.add_argument('--output-dir', default='web/data')
-    compare.add_argument('--work-dir', help='Directory dello staging SQLite temporaneo; predefinita: directory di output')
+    compare.add_argument('--work-dir', help='Indici incrementali SQLite; predefinita: staging accanto ai grafi di input')
     compare.add_argument('--topics', nargs='*', default=[], help='Predizioni locali opzionali; altrimenti usa i file fratelli *-topics.json')
     compare.add_argument('--qualities', nargs='*', default=[], help='Qualità V2 verificata per lingua')
     compare.add_argument('--histories', nargs='*', default=[], help='Cronologie dei dump verificate, una per lingua')
@@ -532,8 +550,11 @@ def main():
         paths = [Path(p) for p in args.inputs] if args.inputs else discover_collections(args.input_dir)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        allowed = {code for code, _ in configured_languages(args.languages_file)}
+        paths, published = comparison_collections(paths, output_dir, allowed)
         with compare_files(paths, json.loads(Path(args.rules).read_text()),
-                           args.topics, args.work_dir or output_dir, args.histories, args.qualities) as results:
+                           args.topics, args.work_dir, args.histories, args.qualities,
+                           allowed_languages=allowed, published=published) as results:
             protected = {Path(path).resolve() for path in [*paths, *args.topics, *args.histories, *args.qualities]}
             filenames = ['manifest.json', 'all.json', 'all-demo.json']
             for language, result in results.items():
@@ -570,4 +591,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    def interrupted(_signum, _frame):
+        raise InterruptedError('SIGTERM')
+
+    signal.signal(signal.SIGTERM, interrupted)
+    if '--plan' in sys.argv:
+        main()
+    else:
+        with operational_span('command', command=sys.argv[1] if len(sys.argv) > 1 else None):
+            main()

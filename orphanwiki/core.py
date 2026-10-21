@@ -1,14 +1,19 @@
 import bisect
 import hashlib
+import itertools
 import json
 import multiprocessing
+import os
 import re
 import sqlite3
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
 HISTOGRAM_RULE = 'shared_p2_p98_tails_v1'
@@ -17,6 +22,7 @@ QUALITY_REVISION_RULE = 'selected_official_xml_revision_v1'
 ARTICLE_PREVIEW_LIMIT = 25
 TOPIC_LOOKUP_SHARD_SIZE = 1024
 TRANSPORT_RULE = 'dashboard_transports_v3'
+COMPARISON_CACHE_RULE = 'verified_graph_and_ordered_pairs_v1'
 SUMMARY_FIELDS = (
     'page_id', 'title', 'orphan', 'category', 'topic_status', 'topic_labels',
     'page_created_at', 'age_days', 'length_bytes', 'quality_score', 'quality_status',
@@ -27,6 +33,80 @@ SUMMARY_FIELDS = (
     'creator_prior_edits_main_history', 'creator_prior_edits_other_history',
     'creator_continuity_months_before_creation', 'creator_groups_at_creation_history',
 )
+_PHASE_CONTEXT = ContextVar('operational_phase', default=None)
+_LOCAL_RUN_ID = uuid.uuid4().hex
+
+
+@contextmanager
+def operational_span(name, **details):
+    """Optional operational JSONL, never part of scientific/checkpoint identity.
+
+    Durations are inclusive. Reconstruct exclusive time by subtracting the
+    union of child intervals, never by adding children to their parent.
+    Start records allow the runner to close spans after abrupt worker death.
+    Missing counters stay null; rows/bytes describe only the named operation.
+    """
+    path = os.environ.get('ORPHANWIKI_SPANS_FILE')
+    if not path:
+        yield {}
+        return
+    parent = _PHASE_CONTEXT.get()
+    record = {'run_id': os.environ.get('ORPHANWIKI_RUN_ID') or (parent['run_id'] if parent else _LOCAL_RUN_ID),
+              'span_id': uuid.uuid4().hex,
+              'parent_id': parent['span_id'] if parent else os.environ.get('ORPHANWIKI_PARENT_SPAN'),
+              'pid': os.getpid(), 'name': name, 'rows': None, 'bytes': None, **details}
+    def emit(event, **values):
+        # Each process appends one complete small record, with no shared Python
+        # buffering. Diagnostic I/O failures must not change collection/reuse.
+        try:
+            with open(path, 'ab', buffering=0) as stream:
+                stream.write((json.dumps({**record, 'event': event,
+                    'monotonic_ns': time.monotonic_ns(), **values}, allow_nan=False) + '\n').encode())
+        except OSError:
+            pass
+    started = time.monotonic_ns()
+    emit('span_start', started_ns=started)
+    token = _PHASE_CONTEXT.set(record)
+    status, error = 'completed', None
+    try:
+        yield record
+    except BaseException as exception:
+        status = 'interrupted' if isinstance(exception, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
+        error = type(exception).__name__
+        raise
+    finally:
+        finished = time.monotonic_ns()
+        emit('span_end', started_ns=started, finished_ns=finished,
+             wall_seconds=(finished - started) / 1e9, status=status, error=error)
+        _PHASE_CONTEXT.reset(token)
+
+
+def operational_phase(name):
+    """Instrument a regular function; streaming iterators use explicit spans."""
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            with operational_span(name):
+                return function(*args, **kwargs)
+        return measured
+    return decorate
+
+
+def phase_counts(**values):
+    record = _PHASE_CONTEXT.get()
+    if record is not None:
+        record.update(values)
+
+
+def operational_environment():
+    environment = dict(os.environ)
+    current = _PHASE_CONTEXT.get()
+    if current is not None:
+        environment['ORPHANWIKI_PARENT_SPAN'] = current['span_id']
+        environment['ORPHANWIKI_RUN_ID'] = current['run_id']
+    elif environment.get('ORPHANWIKI_SPANS_FILE') and not environment.get('ORPHANWIKI_RUN_ID'):
+        environment['ORPHANWIKI_RUN_ID'] = _LOCAL_RUN_ID
+    return environment
 
 
 def _summary_page(record, language=None):
@@ -106,6 +186,7 @@ def _approved_graph_source(metadata, database):
             and re.fullmatch(r'[0-9a-f]{64}', metadata['dump_manifest_sha256']) is not None)
 
 
+@operational_phase('model')
 def load_topic_model(path, configuration='config/topics.json'):
     """Load only an explicitly supplied, checksum-verified local model artifact."""
     spec = json.loads(Path(configuration).read_text())
@@ -118,22 +199,28 @@ def load_topic_model(path, configuration='config/topics.json'):
             not re.fullmatch(r'[0-9a-f]{128}', checksum)):
         raise ValueError('Configurazione del modello dei temi non valida')
     digest = hashlib.sha512()
-    with Path(path).open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(block)
-    if digest.hexdigest() != spec['model_sha512']:
-        raise ValueError('Checksum dei pesi del modello non corrispondente')
+    with operational_span('hash.model', algorithm='sha512') as span:
+        size = 0
+        with Path(path).open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+                size += len(block)
+        span['bytes'] = size
+        if digest.hexdigest() != spec['model_sha512']:
+            raise ValueError('Checksum dei pesi del modello non corrispondente')
     try:
         import fasttext
     except ImportError as error:
         raise RuntimeError('Installare il supporto locale: pip install "fasttext==0.9.3" "numpy>=1.26,<3"') from error
-    model = fasttext.load_model(str(path))
+    with operational_span('model.load'):
+        model = fasttext.load_model(str(path))
     actual = {label.removeprefix('__label__').replace('_', ' ') for label in model.get_labels()}
     if actual != set(labels):
         raise ValueError('Il modello non contiene la tassonomia completa prevista')
     return model, spec
 
 
+@operational_phase('topics')
 def predict_topics(raw, model, spec, batch_size=256, deadline=None):
     """One native graph call, then bounded fastText batches over dump QIDs.
 
@@ -180,7 +267,8 @@ def predict_topics(raw, model, spec, batch_size=256, deadline=None):
     for offset in range(0, len(eligible), batch_size):
         check_deadline()
         indexes = eligible[offset:offset + batch_size]
-        predicted, probabilities = model.predict([inputs[i][0] for i in indexes], k=-1, threshold=0.0)
+        with operational_span('model.predict', rows=len(indexes)):
+            predicted, probabilities = model.predict([inputs[i][0] for i in indexes], k=-1, threshold=0.0)
         if len(predicted) != len(indexes) or len(probabilities) != len(indexes):
             raise ValueError('Risposta del modello incompleta')
         selected = threshold_topics(labels, [list(row) for row in predicted],
@@ -298,7 +386,16 @@ def _comparison_schema(connection):
         CREATE TABLE ambiguous(language TEXT, item TEXT, PRIMARY KEY(language,item)) WITHOUT ROWID;
         CREATE TABLE edges(language TEXT, target INTEGER, source INTEGER);
         CREATE TABLE candidates(language TEXT, id INTEGER, status TEXT, candidate_count INTEGER, data TEXT,
-            PRIMARY KEY(language,id)) WITHOUT ROWID;''')
+            PRIMARY KEY(language,id)) WITHOUT ROWID;
+        CREATE TABLE comparison_inputs(language TEXT PRIMARY KEY, graph_identity TEXT,
+            analysis_identity TEXT, sources TEXT);
+        CREATE TABLE comparison_metadata(language TEXT PRIMARY KEY, metadata TEXT);
+        CREATE TABLE comparison_pairs(language TEXT, reference TEXT, local_identity TEXT,
+            reference_identity TEXT, PRIMARY KEY(language,reference)) WITHOUT ROWID;
+        CREATE TABLE comparison_matches(language TEXT, reference TEXT, target INTEGER, source INTEGER,
+            reference_source INTEGER, reference_target INTEGER,
+            PRIMARY KEY(language,reference,target,source)) WITHOUT ROWID;
+        CREATE INDEX matches_by_target ON comparison_matches(language,target,source,reference);''')
 
 
 def _comparison_analysis(raw, rules, topics, history=None, quality=None):
@@ -314,6 +411,7 @@ def _comparison_analysis(raw, rules, topics, history=None, quality=None):
     return result
 
 
+@operational_phase('comparison.staging')
 def _stage_comparison(connection, result):
     """Persist complete observations and only edges eligible for item matching.
 
@@ -324,6 +422,7 @@ def _stage_comparison(connection, result):
     if connection.execute('SELECT 1 FROM wikis WHERE language=?', (language,)).fetchone():
         raise ValueError('Una sola raccolta per lingua nel confronto')
     pages = result['pages']
+    phase_counts(language=language, rows=len(pages))
     from ._native import unique_items, matchable_edges
     for page in pages:
         if type(page['page_id']) is not int or page['page_id'] <= 0:
@@ -374,26 +473,99 @@ def _comparison_prefetch(connection, language, orphans):
     return records
 
 
-def _comparison_candidates(connection, language, page_id, item, prepared):
+def _comparison_edges(connection, language, page_ids, references=None):
+    """One indexed edge lookup per target block; SQLite spills its sort to disk.
+
+    Order candidates and their full evidence in SQL so a large target never
+    crosses the Python/Rust boundary as a second, complete edge vector.
+    CROSS JOIN fixes the target-first lookup order, including on skewed wikis.
+    Unique item mappings give each candidate at most one reference edge per
+    language, so language alone orders its full evidence tuple exactly.
+    """
+    placeholders = ','.join('?' for _ in page_ids)
+    reference_filter = (' AND ti.language IN (' + ','.join('?' for _ in references) + ')'
+                        if references is not None else '')
+    return connection.execute(f'''
+        SELECT p.id,lp.id,lp.title,lp.outgoing,ti.language,bp.id,bp.title,bt.id,bt.title
+        FROM pages p
+        CROSS JOIN items ti ON ti.item=p.item AND ti.language!=p.language
+        CROSS JOIN edges e ON e.language=ti.language AND e.target=ti.id
+        CROSS JOIN items si ON si.language=e.language AND si.id=e.source
+        CROSS JOIN items li ON li.language=p.language AND li.item=si.item
+        CROSS JOIN pages lp ON lp.language=li.language AND lp.id=li.id
+        CROSS JOIN pages bp ON bp.language=si.language AND bp.id=si.id
+        CROSS JOIN pages bt ON bt.language=ti.language AND bt.id=ti.id
+        WHERE p.language=? AND p.id IN ({placeholders}) AND li.id!=p.id {reference_filter}
+        ORDER BY p.id,lp.outgoing!=0,lp.title,lp.id,ti.language
+        ''', (language, *page_ids, *(references or ())))
+
+
+def _matched_comparison_edges(connection, language, page_ids):
+    placeholders = ','.join('?' for _ in page_ids)
+    return connection.execute(f'''
+        SELECT m.target,lp.id,lp.title,lp.outgoing,m.reference,bp.id,bp.title,bt.id,bt.title
+        FROM comparison_matches m
+        CROSS JOIN pages lp ON lp.language=m.language AND lp.id=m.source
+        CROSS JOIN pages bp ON bp.language=m.reference AND bp.id=m.reference_source
+        CROSS JOIN pages bt ON bt.language=m.reference AND bt.id=m.reference_target
+        WHERE m.language=? AND m.target IN ({placeholders})
+        ORDER BY m.target,lp.outgoing!=0,lp.title,lp.id,m.reference''', (language, *page_ids))
+
+
+@operational_phase('matching.incremental_pairs')
+def _update_comparison_pairs(connection):
+    identities = dict(connection.execute('SELECT language,graph_identity FROM comparison_inputs'))
+    completed = {(local, reference): (a, b) for local, reference, a, b in
+                 connection.execute('SELECT * FROM comparison_pairs')}
+    for language, identity in sorted(identities.items()):
+        references = [other for other in sorted(identities) if other != language and
+                      completed.get((language, other)) != (identity, identities[other])]
+        reused = len(identities) - 1 - len(references)
+        if reused:
+            print(f'CHECKPOINT matching {language}: verified_reuse; {reused} coppie', flush=True)
+        if not references:
+            continue
+        with operational_span('matching.new_pairs', language=language, references=references) as span, connection:
+            for other in references:
+                connection.execute('DELETE FROM comparison_matches WHERE language=? AND reference=?', (language, other))
+                connection.execute('DELETE FROM comparison_pairs WHERE language=? AND reference=?', (language, other))
+            orphans = connection.execute('''SELECT p.id FROM pages p
+                JOIN items i ON i.language=p.language AND i.id=p.id
+                WHERE p.language=? AND p.incoming=0 ORDER BY p.id''', (language,))
+            edge_count = targets = 0
+            block_size = 512
+            while block := orphans.fetchmany(block_size):
+                edges = iter(_comparison_edges(connection, language, [row[0] for row in block], references))
+                count = 0
+                while batch := list(itertools.islice(edges, 512)):
+                    connection.executemany('INSERT INTO comparison_matches VALUES(?,?,?,?,?,?)',
+                        ((language, row[4], row[0], row[1], row[5], row[7]) for row in batch))
+                    count += len(batch)
+                targets += len(block)
+                edge_count += count
+                block_size = max(1, min(512, len(block) * 8192 // max(1, count)))
+            connection.executemany('INSERT INTO comparison_pairs VALUES(?,?,?,?)',
+                ((language, other, identity, identities[other]) for other in references))
+            span.update(rows=targets, reference_edges=edge_count)
+        print(f'Matching incrementale {language}: {len(references)} coppie nuove '
+              f'({" ".join(references)}); {edge_count} evidenze', flush=True)
+
+
+def _comparison_candidates(edges, prepared):
     status, counterparts = prepared
     candidates = []
     if status == 'compared':
-        # Keep the target-edge lookup ahead of source-item joins for each orphan.
-        edges = connection.execute('''
-            SELECT lp.id,lp.title,lp.outgoing,bt.language,bp.id,bp.title,bt.id,bt.title
-            FROM items ti CROSS JOIN edges e ON e.language=ti.language AND e.target=ti.id
-            CROSS JOIN items si ON si.language=e.language AND si.id=e.source
-            CROSS JOIN items li ON li.language=? AND li.item=si.item
-            CROSS JOIN pages lp ON lp.language=li.language AND lp.id=li.id
-            CROSS JOIN pages bp ON bp.language=si.language AND bp.id=si.id
-            CROSS JOIN pages bt ON bt.language=ti.language AND bt.id=ti.id
-            WHERE ti.item=? AND ti.language!=? AND li.id!=?
-            ORDER BY ti.language,bp.id''', (language, item, language, page_id))
-        from ._native import rank_candidates
-        candidates = [{'page_id': pid, 'title': title, 'out_degree': outgoing,
-                       'dead_end': outgoing == 0,
-                       'evidence': [dict(zip(('language', 'source_page_id', 'source_title', 'target_page_id', 'target_title'), edge)) for edge in evidence]}
-                      for pid, title, outgoing, evidence in rank_candidates(list(edges))]
+        for (pid, title, outgoing), group in itertools.groupby(edges, key=lambda row: row[1:4]):
+            if pid <= 0 or not title or outgoing < 0:
+                raise ValueError('invalid candidate evidence')
+            evidence = []
+            for row in group:
+                if not row[4] or row[5] <= 0 or not row[6] or row[7] <= 0 or not row[8]:
+                    raise ValueError('invalid candidate evidence')
+                evidence.append(dict(zip(('language', 'source_page_id', 'source_title',
+                                          'target_page_id', 'target_title'), row[4:])))
+            candidates.append({'page_id': pid, 'title': title, 'out_degree': outgoing,
+                               'dead_end': outgoing == 0, 'evidence': evidence})
         if not any(c['status'] in ('orphan', 'non_orphan') for c in counterparts):
             status = 'counterpart_unavailable'
     return {'status': status, 'candidate_count': len(candidates) if status == 'compared' else None,
@@ -444,13 +616,20 @@ class _StagedCandidates(Mapping):
             yield str(pid), json.loads(encoded)
 
 
-def _finish_comparison(connection):
-    """Batch scalar lookups, retaining the indexed edge stream for each orphan."""
+@operational_phase('comparison')
+def _finish_comparison(connection, incremental=False):
+    """Batch scalar and edge lookups, retaining one target's final record at a time."""
     # The edge stream is appended while each wiki is analyzed. Build its
     # lookup index once, after all inserts, to avoid random B-tree writes for
     # hundreds of millions of links in a large SQL collection.
-    connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS edges_by_target '
-                       'ON edges(language,target,source)')
+    with operational_span('comparison.edge_index'):
+        connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS edges_by_target '
+                           'ON edges(language,target,source)')
+    if incremental:
+        _update_comparison_pairs(connection)
+        connection.execute('DELETE FROM candidates')
+        connection.execute('DELETE FROM comparison_metadata')
+        connection.commit()
     wikis = [(language, json.loads(meta), count) for language, meta, count in
              connection.execute('SELECT language,metadata,page_count FROM wikis ORDER BY language')]
     if len(wikis) < 2:
@@ -465,19 +644,41 @@ def _finish_comparison(connection):
     results = {}
     for language, meta, count in wikis:
         processed = 0
-        with connection:
+        with connection, operational_span('matching.wiki', language=language) as wiki_span:
             orphans = connection.execute('SELECT id,item FROM pages WHERE language=? AND incoming=0 ORDER BY id',
                                          (language,))
-            while block := orphans.fetchmany(512):
-                prepared = _comparison_prefetch(connection, language, block)
-                for pid, item in block:
-                    record = _comparison_candidates(connection, language, pid, item, prepared[pid])
-                    connection.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
-                                       (language, pid, record['status'], record['candidate_count'],
-                                        json.dumps(record, ensure_ascii=False)))
-                    processed += 1
-                    if processed % 1000 == 0:
-                        print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)
+            block_size = 512
+            while block := orphans.fetchmany(block_size):
+                with operational_span('matching.block', language=language) as block_span:
+                    prepared = _comparison_prefetch(connection, language, block)
+                    block_span.update(rows=len(block), reference_edges=0, candidate_rows=0,
+                                      max_target_evidence_rows=0, edge_fetch_batch_rows=1)
+                    eligible = [pid for pid, _ in block if prepared[pid][0] == 'compared']
+                    edges = ((_matched_comparison_edges(connection, language, eligible) if incremental else
+                              _comparison_edges(connection, language, eligible)) if eligible else ())
+                    groups = iter(itertools.groupby(edges, key=lambda row: row[0]))
+                    current = next(groups, None)
+                    for pid, item in block:
+                        has_edges = current is not None and current[0] == pid
+                        record = _comparison_candidates(current[1] if has_edges else (), prepared[pid])
+                        if has_edges:
+                            current = next(groups, None)
+                        edge_count = sum(len(candidate['evidence']) for candidate in record['candidates'])
+                        block_span['reference_edges'] += edge_count
+                        block_span['candidate_rows'] += len(record['candidates'])
+                        block_span['max_target_evidence_rows'] = max(block_span['max_target_evidence_rows'], edge_count)
+                        connection.execute('INSERT INTO candidates VALUES(?,?,?,?,?)',
+                                           (language, pid, record['status'], record['candidate_count'],
+                                            json.dumps(record, ensure_ascii=False)))
+                        del record
+                        processed += 1
+                        if processed % 1000 == 0:
+                            print(f'Confronto {language}: {processed} orfane; tutte le lingue di riferimento', flush=True)
+                    # The first block has at most 512 targets. Subsequent sorts
+                    # aim for 8192 evidence rows using observed fanout. Even an
+                    # exceptional single target is streamed in full, never cut.
+                    block_size = max(1, min(512, len(block) * 8192 // max(1, block_span['reference_edges'])))
+            wiki_span['rows'] = processed
         meta['comparison'] = {'rule': 'cross_language_incoming_v1', 'status': 'compared',
             'reference_languages': [other for other, _, _ in wikis if other != language],
             'collections': provenance, 'matching_source': 'local page_props.wikibase_item from SQL dumps',
@@ -486,6 +687,9 @@ def _finish_comparison(connection):
             'interpretation': 'candidates for manual review, not validated recommendations'}
         results[language] = {'metadata': meta, 'pages': _StagedPages(connection, language, count),
                              'link_candidates': _StagedCandidates(connection, language)}
+        if incremental:
+            connection.execute('INSERT INTO comparison_metadata VALUES(?,?)',
+                               (language, json.dumps(meta, ensure_ascii=False)))
         print(f'Confronto completato: {language}; {processed} orfane', flush=True)
     return results
 
@@ -510,9 +714,14 @@ def compare_languages(raws, rules=None, topics=None, histories=None, qualities=N
                 for lang, result in _finish_comparison(connection).items()}
 
 
-def _comparison_file_worker(path, staging, rules, topics, histories, qualities, sender):
+def _comparison_file_worker(path, staging, rules, topics, histories, qualities, sender,
+                            parent_id=None, run_id=None):
     """A sequential spawned worker releases all graph/JSON/native allocations."""
     try:
+        if parent_id is not None:
+            os.environ['ORPHANWIKI_PARENT_SPAN'] = parent_id
+        if run_id is not None:
+            os.environ['ORPHANWIKI_RUN_ID'] = run_id
         from .dumps import _read_first_metadata
         graph_metadata = _read_first_metadata(path)
         language = graph_metadata['language']
@@ -575,21 +784,242 @@ def _comparison_file_worker(path, staging, rules, topics, histories, qualities, 
         sender.close()
 
 
-@contextmanager
-def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None, qualities=None):
-    """Sequential comparisons with verified SQL staging for large imported wikis.
+def comparison_collections(paths, output_dir, allowed_languages):
+    """Include previously published configured editions, with their local raw sources.
 
-    Each worker streams matchable edges, article observations and candidates to
-    SQLite. Large imported editions retain titles and redirect mappings in RAM,
-    but never materialize all raw pages, revisions or source adjacency together.
-    Results must be exported within this context, before closing the database.
+    This only reads approved metadata. It never acquires or substitutes a
+    release for an old member; missing local sources stop an expanded run.
     """
-    if len(paths) < 2:
-        raise ValueError('Servono almeno due raccolte complete di lingue diverse')
+    from .dumps import _read_first_metadata
+    supplied = {_read_first_metadata(path)['language']: Path(path) for path in paths}
+    if len(supplied) != len(paths):
+        raise ValueError('Una sola raccolta per lingua nel confronto')
+    manifest_path = Path(output_dir) / 'manifest.json'
+    exports = {}
+    if manifest_path.exists():
+        entries = json.loads(manifest_path.read_text())
+        if not isinstance(entries, list):
+            raise ValueError('Manifest non valido')
+        latest = {}
+        for entry in entries:
+            if (not isinstance(entry, dict) or entry.get('kind', 'wiki') != 'wiki'
+                    or entry.get('demo') or entry.get('language') not in allowed_languages):
+                continue
+            language = entry['language']
+            if language not in latest or (entry.get('date', ''), entry.get('published_at', '')) > (
+                    latest[language].get('date', ''), latest[language].get('published_at', '')):
+                latest[language] = entry
+        for language, entry in latest.items():
+            filename = entry.get('file')
+            if not isinstance(filename, str) or not re.fullmatch(r'[a-zA-Z0-9_.-]+\.json', filename):
+                raise ValueError('Nome export approvato non valido')
+            export = Path(output_dir) / filename
+            metadata = _read_first_metadata(export)
+            if (metadata.get('language') != language or metadata.get('complete') is not True
+                    or not _approved_graph_source(metadata, wiki_database(language, metadata.get('database')))):
+                if language in supplied:
+                    # A selected edition may be repairing an obsolete export.
+                    # Recompute it from the explicit verified source instead.
+                    continue
+                raise ValueError('Export precedente non verificabile per il confronto incrementale')
+            exports[language] = export
+            if language not in supplied:
+                options = {Path(path).parent / f'{language}-raw.json' for path in paths}
+                found = [path for path in options if path.is_file()]
+                if len(found) != 1:
+                    raise ValueError(f'{language}: conservare il grafo locale già raccolto per estendere il confronto')
+                supplied[language] = found[0]
+    return [supplied[language] for language in sorted(supplied)], exports
+
+
+def _comparison_source(path, rules, topics, histories, qualities, signatures=None):
+    from .dumps import _read_first_metadata, _hash
+    path = Path(path).resolve()
+    metadata = _read_first_metadata(path)
+    language = metadata['language']
+    def checksum(source):
+        source = Path(source).resolve()
+        before = source.stat()
+        digest = _hash(source, 'sha256')
+        after = source.stat()
+        signature = (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
+        if signature != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino):
+            raise ValueError('Input modificato durante la verifica del confronto')
+        if signatures is not None:
+            signatures[str(source)] = signature
+        return digest
+    sources = {'raw': str(path)}
+    digests = {'raw': checksum(path)}
+    for kind, supplied in (('topics', topics), ('history', histories), ('quality', qualities)):
+        supplement = supplied.get(language)
+        if supplement is None:
+            candidate = path.with_name(path.stem.removesuffix('-raw') + f'-{kind}.json')
+            supplement = candidate if candidate.exists() else None
+        sources[kind] = str(Path(supplement).resolve()) if supplement is not None else None
+        digests[kind] = checksum(supplement) if supplement is not None else None
+    graph = json_sha256({'rule': COMPARISON_CACHE_RULE, 'raw': digests['raw']})
+    analysis = json_sha256({'rule': COMPARISON_CACHE_RULE, 'inputs': digests,
+                           'categories': rules or {}, 'measures': MEASURES_RULE,
+                           'quality_revision': QUALITY_REVISION_RULE})
+    return language, graph, analysis, sources
+
+
+def _cached_comparison_results(connection):
+    return {language: {'metadata': json.loads(metadata),
+                      'pages': _StagedPages(connection, language, count),
+                      'link_candidates': _StagedCandidates(connection, language)}
+            for language, count, metadata in connection.execute('''
+                SELECT w.language,w.page_count,m.metadata FROM wikis w
+                JOIN comparison_metadata m ON m.language=w.language ORDER BY w.language''')}
+
+
+@contextmanager
+def _comparison_cache(work_dir):
+    """Serialize writers; immutable, hashed generations survive failed updates."""
+    import fcntl
+    from .dumps import _hash
+    cache = Path(work_dir) / 'comparison-cache'
+    cache.mkdir(parents=True, exist_ok=True)
+    with (cache / 'writer.lock').open('a+b') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('Un altro confronto usa lo stesso indice incrementale') from error
+        try:
+            manifest = cache / 'manifest.json'
+            current = None
+            if manifest.exists():
+                record = json.loads(manifest.read_text())
+                name = record.get('file') if isinstance(record, dict) else None
+                if (not isinstance(record, dict) or record.get('format') != COMPARISON_CACHE_RULE or not isinstance(name, str)
+                        or not re.fullmatch(r'[0-9a-f]{32}\.sqlite', name)):
+                    raise ValueError('Identità della cache del confronto non valida')
+                current = cache / name
+                if (current.stat().st_size != record.get('bytes')
+                        or _hash(current, 'sha256') != record.get('sha256')):
+                    raise ValueError('Checksum della cache del confronto non valido; conservare la generazione precedente')
+            yield cache, current
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@operational_phase('matching.adopt_published_pairs')
+def _seed_comparison_pairs(connection, exports):
+    """Adopt complete approved old comparisons after verifying their graph identities.
+
+    The full source document is parsed, with bounded SQL buffers. Every adopted
+    edge must exist in the verified graph and map to the stated local QIDs.
+    Missing/ambiguous/zero outcomes are retained by explicit pair checkpoints.
+    """
+    from .dumps import _read_first_metadata
+    wikis = {language: json.loads(metadata) for language, metadata in
+             connection.execute('SELECT language,metadata FROM wikis')}
+    identities = dict(connection.execute('SELECT language,graph_identity FROM comparison_inputs'))
+    connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS edges_by_target ON edges(language,target,source)')
+    for language, path in exports.items():
+        if language not in wikis:
+            continue
+        metadata = _read_first_metadata(path)
+        comparison = metadata.get('comparison', {})
+        if (comparison.get('rule') != 'cross_language_incoming_v1'
+                or comparison.get('status') != 'compared'
+                or metadata.get('input_sha256') != wikis[language].get('input_sha256')):
+            continue
+        collections = {row['language']: row for row in comparison.get('collections', [])}
+        references = [other for other in comparison.get('reference_languages', []) if other in wikis and
+            other != language and other in collections and all(collections[other].get(key) == wikis[other].get(key)
+            for key in ('source', 'started_at', 'finished_at', 'input_sha256')) and not connection.execute(
+                'SELECT 1 FROM comparison_pairs WHERE language=? AND reference=?', (language, other)).fetchone()]
+        if not references:
+            continue
+        original = path.stat()
+        connection.executescript('''
+            DROP TABLE IF EXISTS temp.seed_seen;
+            DROP TABLE IF EXISTS temp.seed_edges;
+            CREATE TEMP TABLE seed_seen(id INTEGER PRIMARY KEY);
+            CREATE TEMP TABLE seed_edges(target INTEGER,source INTEGER,reference TEXT,
+                reference_source INTEGER,reference_target INTEGER, title TEXT,outgoing INTEGER,
+                source_title TEXT,target_title TEXT,
+                PRIMARY KEY(reference,target,source)) WITHOUT ROWID;''')
+        buffer = []
+        def flush():
+            connection.executemany('INSERT INTO seed_edges VALUES(?,?,?,?,?,?,?,?,?)', buffer)
+            buffer.clear()
+        with connection:
+            pages = 0
+            for section, identifier, record in iter_export_sections(path):
+                if section == 'pages':
+                    pages += 1
+                elif section == 'link_candidates':
+                    if not identifier.isdecimal() or int(identifier) <= 0:
+                        raise ValueError('ID orfana non valido nel confronto precedente')
+                    target = int(identifier)
+                    connection.execute('INSERT INTO seed_seen VALUES(?)', (target,))
+                    candidates = record.get('candidates')
+                    if (not isinstance(candidates, list) or record.get('candidate_count') != (
+                            len(candidates) if record.get('status') == 'compared' else None)
+                            or (record.get('status') != 'compared' and candidates)
+                            or len({candidate['page_id'] for candidate in candidates}) != len(candidates)):
+                        raise ValueError('Candidati precedenti incompleti o duplicati')
+                    for candidate in candidates:
+                        if (not candidate.get('evidence') or
+                                candidate.get('dead_end') != (candidate.get('out_degree') == 0)):
+                            raise ValueError('Candidato precedente privo di evidenze o grado coerente')
+                        for edge in candidate['evidence']:
+                            if edge['language'] not in references:
+                                continue
+                            buffer.append((target, candidate['page_id'], edge['language'], edge['source_page_id'],
+                                edge['target_page_id'], candidate['title'], candidate['out_degree'],
+                                edge['source_title'], edge['target_title']))
+                            if len(buffer) == 512:
+                                flush()
+            flush()
+            count = connection.execute('SELECT page_count FROM wikis WHERE language=?', (language,)).fetchone()[0]
+            orphans = connection.execute('SELECT COUNT(*) FROM pages WHERE language=? AND incoming=0', (language,)).fetchone()[0]
+            if (pages != count or connection.execute('SELECT COUNT(*) FROM seed_seen').fetchone()[0] != orphans
+                    or connection.execute('''SELECT 1 FROM seed_seen s LEFT JOIN pages p
+                        ON p.language=? AND p.id=s.id WHERE p.id IS NULL OR p.incoming!=0 LIMIT 1''', (language,)).fetchone()):
+                raise ValueError('Censimento delle orfane precedente incompleto')
+            invalid = connection.execute('''SELECT 1 FROM seed_edges s
+                LEFT JOIN pages lp ON lp.language=? AND lp.id=s.source
+                LEFT JOIN pages bp ON bp.language=s.reference AND bp.id=s.reference_source
+                LEFT JOIN pages bt ON bt.language=s.reference AND bt.id=s.reference_target
+                LEFT JOIN items li ON li.language=? AND li.id=s.source
+                LEFT JOIN items si ON si.language=s.reference AND si.id=s.reference_source AND si.item=li.item
+                LEFT JOIN items ti ON ti.language=? AND ti.id=s.target
+                LEFT JOIN items ri ON ri.language=s.reference AND ri.id=s.reference_target AND ri.item=ti.item
+                LEFT JOIN edges e ON e.language=s.reference AND e.target=s.reference_target AND e.source=s.reference_source
+                WHERE lp.id IS NULL OR bp.id IS NULL OR bt.id IS NULL OR si.id IS NULL OR ri.id IS NULL
+                    OR e.source IS NULL OR s.target=s.source OR lp.title!=s.title OR lp.outgoing!=s.outgoing
+                    OR bp.title!=s.source_title OR bt.title!=s.target_title LIMIT 1''', (language, language, language)).fetchone()
+            if invalid or (path.stat().st_size, path.stat().st_mtime_ns) != (original.st_size, original.st_mtime_ns):
+                raise ValueError('Evidenze precedenti incoerenti con i grafi verificati')
+            connection.execute('''INSERT INTO comparison_matches
+                SELECT ?,reference,target,source,reference_source,reference_target FROM seed_edges''', (language,))
+            connection.executemany('INSERT INTO comparison_pairs VALUES(?,?,?,?)',
+                ((language, other, identities[language], identities[other]) for other in references))
+        connection.executescript('DROP TABLE temp.seed_seen; DROP TABLE temp.seed_edges;')
+        print(f'CHECKPOINT matching {language}: adottate {len(references)} coppie pubblicate', flush=True)
+
+
+@contextmanager
+def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None, qualities=None,
+                  allowed_languages=None, published=None):
+    """Reuse verified observations/indices and completed ordered language pairs.
+
+    Cache generations are immutable and hashed. An update copies the previous
+    SQLite indices, stages only changed editions, computes only missing pairs,
+    and atomically approves the completed generation. Publication can fail and
+    retry from this completed operational checkpoint without redoing matching.
+    """
+    from .dumps import _read_first_metadata, _hash
+    if not paths:
+        raise ValueError('Servono raccolte complete per il confronto')
+    work_dir = Path(work_dir or Path(paths[0]).parent / 'staging').resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
     def supplements(files):
         result = {}
         for path in files or []:
-            from .dumps import _read_first_metadata
             language = _read_first_metadata(path)['language']
             if language in result:
                 raise ValueError('Un solo supplemento per lingua')
@@ -597,48 +1027,130 @@ def compare_files(paths, rules=None, topics=None, work_dir=None, histories=None,
         return result
     topics, histories, qualities = supplements(topics), supplements(histories), supplements(qualities)
     context = multiprocessing.get_context('spawn')
-    with tempfile.TemporaryDirectory(prefix='orphanwiki-compare-', dir=work_dir) as folder:
-        staging = str(Path(folder) / 'comparison.sqlite')
-        with closing(sqlite3.connect(staging)) as connection:
-            _comparison_schema(connection)
-            languages = set()
-            for position, path in enumerate(paths, 1):
-                receiver, sender = context.Pipe(duplex=False)
-                worker = context.Process(target=_comparison_file_worker,
-                    args=(str(path), staging, rules, topics, histories, qualities, sender))
-                try:
-                    worker.start()
-                    sender.close()
+    with _comparison_cache(work_dir) as (cache, current):
+        previous = {}
+        if current is not None:
+            with closing(sqlite3.connect(current.as_uri() + '?mode=ro', uri=True)) as source:
+                previous = {language: (graph, analysis, json.loads(sources)) for language, graph, analysis, sources in
+                            source.execute('SELECT * FROM comparison_inputs')}
+        inputs, signatures = {}, {}
+        for path in paths:
+            item = _comparison_source(path, rules, topics, histories, qualities, signatures)
+            if item[0] in inputs:
+                raise ValueError('Una sola raccolta per lingua nel confronto')
+            inputs[item[0]] = item[1:]
+        for language, (_, _, saved) in previous.items():
+            if language in inputs or (allowed_languages is not None and language not in allowed_languages):
+                continue
+            saved = {key: str(work_dir / value) if value is not None else None for key, value in saved.items()}
+            selected = []
+            for kind, supplied in (('topics', topics), ('history', histories), ('quality', qualities)):
+                path = supplied.get(language, saved.get(kind))
+                selected.append({language: path} if path else {})
+            item = _comparison_source(saved['raw'], rules, *selected, signatures=signatures)
+            if item[0] != language:
+                raise ValueError('Identità della lingua cambiata nel grafo conservato')
+            inputs[language] = item[1:]
+        if len(inputs) < 2:
+            raise ValueError('Servono almeno due raccolte complete di lingue diverse')
+        # Store paths relative to the operational work root, so moving a complete
+        # local workspace does not embed a contributor's absolute paths.
+        saved_sources = {language: {kind: os.path.relpath(path, work_dir) if path is not None else None
+                                   for kind, path in sources.items()}
+                         for language, (_, _, sources) in inputs.items()}
+        dirty = {language for language, (graph, analysis, _) in inputs.items()
+                 if language not in previous or previous[language][:2] != (graph, analysis)}
+        retired = set(previous) - inputs.keys()
+        paths_changed = any(language not in previous or previous[language][2] != saved_sources[language]
+                            for language in inputs)
+        if current is not None and not dirty and not retired and not paths_changed:
+            print('CHECKPOINT confronto incrementale: verified_reuse; indici e tutte le coppie', flush=True)
+            with closing(sqlite3.connect(current.as_uri() + '?mode=ro', uri=True)) as connection:
+                results = _cached_comparison_results(connection)
+                if set(results) != set(inputs):
+                    raise ValueError('Cache del confronto incompleta')
+                yield results
+            return
+        with tempfile.TemporaryDirectory(prefix='orphanwiki-compare-', dir=work_dir) as folder:
+            staging = Path(folder) / 'comparison.sqlite'
+            with closing(sqlite3.connect(staging)) as connection:
+                connection.execute('PRAGMA cache_size=-8192')
+                connection.execute('PRAGMA temp_store=FILE')
+                if current is not None:
+                    with closing(sqlite3.connect(current.as_uri() + '?mode=ro', uri=True)) as source:
+                        with operational_span('comparison.copy_verified_indices', bytes=current.stat().st_size):
+                            source.backup(connection, pages=4096)
+                else:
+                    _comparison_schema(connection)
+                with connection:
+                    for language in sorted(dirty | retired):
+                        graph_changed = (language in retired or language not in previous or
+                                         inputs[language][0] != previous[language][0])
+                        if graph_changed:
+                            for table in ('comparison_pairs', 'comparison_matches'):
+                                connection.execute(f'DELETE FROM {table} WHERE language=? OR reference=?', (language, language))
+                        for table in ('wikis', 'pages', 'items', 'ambiguous', 'edges', 'candidates',
+                                      'comparison_inputs', 'comparison_metadata'):
+                            connection.execute(f'DELETE FROM {table} WHERE language=?', (language,))
+                for language in sorted(dirty):
+                    _, _, sources = inputs[language]
+                    receiver, sender = context.Pipe(duplex=False)
+                    trace = operational_environment()
+                    worker = context.Process(target=_comparison_file_worker,
+                        args=(sources['raw'], str(staging), rules,
+                              {language: sources['topics']} if sources['topics'] else {},
+                              {language: sources['history']} if sources['history'] else {},
+                              {language: sources['quality']} if sources['quality'] else {}, sender,
+                              trace.get('ORPHANWIKI_PARENT_SPAN'), trace.get('ORPHANWIKI_RUN_ID')))
                     try:
-                        response = receiver.recv()
-                    except EOFError as error:
+                        worker.start()
+                        sender.close()
+                        try:
+                            response = receiver.recv()
+                        except EOFError as error:
+                            worker.join()
+                            raise RuntimeError(f'Analisi terminata senza risultato: {sources["raw"]}; exit {worker.exitcode}') from error
                         worker.join()
-                        raise RuntimeError(f'Analisi terminata senza risultato: {path}; exit {worker.exitcode}') from error
-                    worker.join()
-                    if 'error' in response:
-                        exception = ValueError if response['type'] == 'ValueError' else RuntimeError
-                        raise exception(f'{path}: {response["error"]}')
-                    if worker.exitcode != 0:
-                        raise RuntimeError(f'Analisi fallita: {path}; exit {worker.exitcode}')
-                    languages.add(response['language'])
-                    peak = response['peak_rss']
-                    memory = f'{peak:.1f} MiB' if peak is not None else 'non disponibile'
-                    print(f'Indice pronto {position}/{len(paths)}: {response["language"]}; picco RSS worker {memory}', flush=True)
-                finally:
-                    if worker.is_alive():
-                        worker.terminate()
-                        worker.join()
-                    receiver.close()
-                    sender.close()
-                    worker.close()
-            if (set(topics) | set(histories) | set(qualities)) - languages:
-                raise ValueError('Supplemento senza la corrispondente raccolta')
-            yield _finish_comparison(connection)
+                        if 'error' in response:
+                            exception = ValueError if response['type'] == 'ValueError' else RuntimeError
+                            raise exception(f'{sources["raw"]}: {response["error"]}')
+                        if worker.exitcode != 0 or response['language'] != language:
+                            raise RuntimeError(f'Analisi fallita: {sources["raw"]}; exit {worker.exitcode}')
+                        peak = response['peak_rss']
+                        memory = f'{peak:.1f} MiB' if peak is not None else 'non disponibile'
+                        print(f'Indice pronto: {language}; picco RSS worker {memory}', flush=True)
+                    finally:
+                        if worker.is_alive():
+                            worker.terminate()
+                            worker.join()
+                        sender.close()
+                        receiver.close()
+                with connection:
+                    for language, (graph, analysis, _) in inputs.items():
+                        connection.execute('INSERT OR REPLACE INTO comparison_inputs VALUES(?,?,?,?)',
+                            (language, graph, analysis, json.dumps(saved_sources[language], sort_keys=True)))
+                if dirty or retired:
+                    _seed_comparison_pairs(connection, published or {})
+                    _finish_comparison(connection, incremental=True)
+                connection.commit()
+            for path, signature in signatures.items():
+                info = Path(path).stat()
+                if (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino) != signature:
+                    raise ValueError('Input modificato durante il confronto incrementale')
+            name = uuid.uuid4().hex + '.sqlite'
+            checkpoint = {'format': COMPARISON_CACHE_RULE, 'file': name,
+                          'bytes': staging.stat().st_size, 'sha256': _hash(staging, 'sha256')}
+            staging.replace(cache / name)
+            write_json(cache / 'manifest.json', checkpoint)
+        with closing(sqlite3.connect((cache / name).as_uri() + '?mode=ro', uri=True)) as connection:
+            yield _cached_comparison_results(connection)
 
 
+@operational_phase('analysis.wiki')
 def analyze(raw, rules=None, include_sources=False, topics=None, history=None, quality=None):
     from .categories import classify
     language = raw['metadata']['language']
+    phase_counts(language=language, rows=len(raw['pages']))
     wiki_database(language, raw['metadata'].get('database'))
     if 'biographies' in raw['metadata'] or any('biography' in p for p in raw['pages']):
         raise ValueError('Dataset arricchito da una fonte esterna: usare i dump ufficiali non modificati')
@@ -841,11 +1353,16 @@ def _detail_chunks(value, encoder):
     yield '}'
 
 
+@operational_phase('hash.canonical_json')
 def json_sha256(value):
     """Hash sorted JSON in bounded chunks without allocating the complete document."""
     digest = hashlib.sha256()
+    size = 0
     for chunk in _json_chunks(value, ensure_ascii=True, sort_keys=True):
-        digest.update(chunk.encode('utf-8'))
+        encoded = chunk.encode('utf-8')
+        size += len(encoded)
+        digest.update(encoded)
+    phase_counts(bytes=size)
     return digest.hexdigest()
 
 
@@ -916,6 +1433,7 @@ def write_observations(path, result):
     write_json(path, compact, arrays={'rows': rows()}, mappings={'link_candidates': counts()})
 
 
+@operational_phase('export.transports')
 def write_dashboard_exports(source, folder, expected=None, *, transport_generation=None):
     """Project an ordered canonical export into bounded browser transports.
 
@@ -1085,6 +1603,7 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
                     'rows': None, 'link_candidates': None},
                    arrays={'rows': ([page.get(field) for field in ARTICLE_INDEX_COLUMNS] for page in orphans.values())},
                    mappings={'link_candidates': shortlists.items()})
+        phase_counts(rows=len(seen), language=metadata['language'], input_bytes=initial.st_size)
         return filenames
     finally:
         events.close()
@@ -1106,6 +1625,7 @@ def write_summary_files(summary_path, creators_path, metadata, count, report_jso
     write_json(creators_path, {'format': 'creator_index_v1', **shared, 'creators': creators})
 
 
+@operational_phase('export.aggregate_summary')
 def write_aggregate_summary(members, output, metadata, aggregate=True):
     """Prepare exact Rust chart reports from canonical page streams once.
 
@@ -1177,6 +1697,7 @@ def write_aggregate_summary(members, output, metadata, aggregate=True):
         raise ValueError('Il file del riepilogo deve terminare con -summary.json')
     write_summary_files(output, creators_output, metadata, total, report_json, sources,
                         [page for _, page in article_preview])
+    phase_counts(rows=total, languages=len(members))
     if aggregate:
         return {'metadata': metadata, 'count': total, 'reports': report_json,
                 'sources': sources, 'article_preview': [page for _, page in article_preview]}

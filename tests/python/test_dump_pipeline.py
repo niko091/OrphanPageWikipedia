@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from orphanwiki.core import operational_span
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts' / 'run_dumps.py'
@@ -24,6 +26,8 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from orphanwiki.core import operational_span
 
 args = sys.argv[1:]
 assert args[:2] == ['-m', 'orphanwiki']
@@ -50,8 +54,11 @@ def sidecars(directory, filename, sources):
 with open(os.environ['PIPELINE_CALLS'], 'a', encoding='utf-8') as calls:
     calls.write(command + ':' + (option('--manifest') if '--manifest' in options else '') + '\\n')
 print('fake stdout ' + command, flush=True)
+with operational_span('mock.command', command=command, rows=1, bytes=4):
+    pass
 if os.environ.get('PAUSE_STAGE') == command:
-    time.sleep(30)
+    with operational_span('mock.pause'):
+        time.sleep(30)
 if os.environ.get('WORK_STAGE') == command:
     import subprocess
     subprocess.run([sys.executable, '-c',
@@ -172,7 +179,7 @@ elif command == 'analyze':
                     'creator_index_file': output.stem + '-creators.json'})
     manifest.write_text(json.dumps(entries))
 elif command == 'compare':
-    graphs = [Path(value) for value in options[:options.index('--histories')]]
+    graphs = [Path(value) for value in options[:next(i for i, value in enumerate(options) if value.startswith('--'))]]
     histories = [Path(value) for value in options[options.index('--histories') + 1:options.index('--output-dir')]]
     assert histories == [graph.with_name(graph.stem.removesuffix('-raw') + '-history.json') for graph in graphs]
     assert all(history.is_file() for history in histories)
@@ -244,6 +251,38 @@ elif command == 'refresh-measures':
 
 
 class DumpPipelineTests(unittest.TestCase):
+    def test_nested_spans_preserve_results_counters_and_error_boundaries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'spans.jsonl'
+            with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE='', ORPHANWIKI_RUN_ID='test'):
+                with operational_span('disabled') as span:
+                    self.assertEqual(span, {})
+            self.assertFalse(path.exists())
+            with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(path), ORPHANWIKI_RUN_ID='test'):
+                with self.assertRaisesRegex(ValueError, 'synthetic'), operational_span('parent') as parent:
+                    with operational_span('child') as child:
+                        child.update(rows=7, bytes=21)
+                        raise ValueError('synthetic')
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([event['event'] for event in events],
+                             ['span_start', 'span_start', 'span_end', 'span_end'])
+            self.assertEqual(child['parent_id'], parent['span_id'])
+            self.assertTrue(all(event['run_id'] == 'test' for event in events))
+            ends = events[2:]
+            self.assertEqual((ends[0]['rows'], ends[0]['bytes']), (7, 21))
+            self.assertIsNone(ends[1]['rows'])
+            self.assertIsNone(ends[1]['bytes'])
+            for event in ends:
+                self.assertEqual(event['status'], 'failed')
+                self.assertEqual(event['error'], 'ValueError')
+                self.assertGreaterEqual(event['finished_ns'], event['started_ns'])
+            self.assertGreaterEqual(ends[1]['wall_seconds'], ends[0]['wall_seconds'])
+            # An unavailable diagnostic sink cannot change collection results.
+            with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=folder):
+                with operational_span('unavailable'):
+                    result = 42
+            self.assertEqual(result, 42)
+
     def test_step_state_reports_reuse_and_invalidation_reasons(self):
         state_class = runpy.run_path(str(SCRIPT))['StepState']
         with tempfile.TemporaryDirectory() as folder:
@@ -307,6 +346,70 @@ class DumpPipelineTests(unittest.TestCase):
         paths = list((self.root / 'logs').glob('*.metrics.jsonl'))
         self.assertEqual(len(paths), 1)
         return [json.loads(line) for line in paths[0].read_text().splitlines()]
+
+    def span_events(self):
+        paths = list((self.root / 'logs').glob('*.spans.jsonl'))
+        self.assertEqual(len(paths), 1)
+        return [json.loads(line) for line in paths[0].read_text().splitlines() if line.strip()]
+
+    def assert_closed_span_tree(self, events):
+        starts = {event['span_id']: event for event in events if event['event'] == 'span_start'}
+        ends = {event['span_id']: event for event in events if event['event'] == 'span_end'}
+        self.assertEqual(starts.keys(), ends.keys())
+        self.assertEqual(len(starts) * 2, len(events))
+        for key, start in starts.items():
+            end = ends[key]
+            self.assertEqual(start['run_id'], end['run_id'])
+            self.assertGreaterEqual(end['finished_ns'], start['started_ns'])
+            if start['parent_id'] is not None:
+                self.assertIn(start['parent_id'], starts)
+                parent = ends[start['parent_id']]
+                self.assertGreaterEqual(start['started_ns'], parent['started_ns'])
+                self.assertLessEqual(end['finished_ns'], parent['finished_ns'])
+
+    def test_child_spans_share_run_and_parent_and_can_be_disabled(self):
+        result = self.invoke('vec')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.span_events()
+        self.assert_closed_span_tree(events)
+        report = self.one_benchmark()
+        self.assertTrue(all(event['run_id'] == report['run_id'] for event in events))
+        commands = [event for event in events if event['name'] == 'mock.command' and event['event'] == 'span_end']
+        self.assertEqual(len(commands), len(report['steps']))
+        self.assertTrue(all(event['rows'] == 1 and event['bytes'] == 4 for event in commands))
+        enabled_calls = [line.split(':')[0] for line in self.calls.read_text().splitlines()]
+        self.calls.write_text('')
+        disabled = self.root / 'disabled'
+        result = self.invoke('vec', extra=('--no-phase-spans',
+            '--dump-root', str(disabled / 'dumps'), '--import-dir', str(disabled / 'imported'),
+            '--output-dir', str(disabled / 'web-data'), '--log-dir', str(disabled / 'logs')))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([line.split(':')[0] for line in self.calls.read_text().splitlines()], enabled_calls)
+        self.assertEqual(list(disabled.rglob('*.spans.jsonl')), [])
+        disabled_report = json.loads(next((disabled / 'logs').glob('*.benchmark.json')).read_text())
+        self.assertIsNone(disabled_report['measurement']['spans_file'])
+
+    def test_abrupt_child_exit_closes_abandoned_spans_at_detection_bound(self):
+        child = ("import os\nfrom orphanwiki.core import operational_span\n"
+                 "with operational_span('mock.abandoned'):\n    os._exit(7)\n")
+        replacement = ("    from orphanwiki.core import operational_environment\n"
+                       "    import subprocess\n"
+                       "    with operational_span('mock.parent'):\n"
+                       f"        subprocess.run([sys.executable, '-c', {child!r}], env=operational_environment(), check=False)\n"
+                       "    sys.exit(7)")
+        self.fake.write_text(FAKE_PYTHON.replace('    sys.exit(7)', replacement))
+        result = self.invoke('vec', fail='import-dumps')
+        self.assertNotEqual(result.returncode, 0)
+        events = self.span_events()
+        self.assert_closed_span_tree(events)
+        abandoned = next(event for event in events if event['name'] == 'mock.abandoned' and event['event'] == 'span_end')
+        self.assertTrue(abandoned['end_is_detection_bound'])
+        self.assertEqual(abandoned['status'], 'interrupted')
+        self.assertEqual(abandoned['returncode'], 7)
+        parent = next(event for event in events if event['name'] == 'mock.parent' and event['event'] == 'span_end')
+        self.assertEqual(abandoned['finished_ns'], parent['finished_ns'])
+        self.assertGreaterEqual(abandoned['detected_ns'], parent['finished_ns'])
+        self.assertEqual(events[-1]['status'], 'failed')
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc metrics')
     def test_benchmark_includes_descendant_resources_and_cpu(self):
@@ -637,7 +740,9 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(self.metric_events()[-1]['status'], 'failed')
 
     def test_plan_only_runs_fetch_and_preserves_import_directory(self):
-        result = self.invoke('vec', extra=('--plan',))
+        unexpected = self.root / 'unexpected-spans.jsonl'
+        with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(unexpected)):
+            result = self.invoke('vec', extra=('--plan',))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), ['fetch-dumps:', 'fetch-content:'])
         self.assertFalse((self.root / 'dumps').exists())
@@ -645,6 +750,8 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertIn('PIPELINE COMPLETATA', self.one_log())
         self.assertEqual(list((self.root / 'logs').glob('*.benchmark.json')), [])
         self.assertEqual(list((self.root / 'logs').glob('*.metrics.jsonl')), [])
+        self.assertEqual(list((self.root / 'logs').glob('*.spans.jsonl')), [])
+        self.assertFalse(unexpected.exists())
 
     def test_plan_applies_language_subset_to_sql_and_content(self):
         result = self.invoke('vec', 'lmo', 'it', extra=('--languages', 'vec', '--plan'))
@@ -709,6 +816,29 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertTrue((self.root / 'imported' / 'vec-topics.json').exists())
         self.assertTrue((self.root / 'imported' / 'it-topics.json').exists())
 
+    def test_new_subset_extends_suggestions_to_previous_editions_without_reacquiring_them(self):
+        config = self.root / 'languages.json'
+        config.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo', 'it']}))
+        first = self.invoke('--languages-file', str(config), extra=('--languages', 'vec'))
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        old_files = {path: path.read_bytes() for path in (self.root / 'imported').glob('vec-*.json')}
+        self.calls.unlink()
+        second = self.invoke('--languages-file', str(config), extra=('--languages', 'lmo', 'it'))
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual([line.split(':', 1)[0] for line in calls], [
+            'fetch-dumps', 'import-dumps', 'import-dumps', 'topics', 'fetch-content', 'quality', 'quality', 'compare'])
+        self.assertFalse(any('vecwiki' in line for line in calls))
+        self.assertEqual(old_files, {path: path.read_bytes() for path in old_files})
+        aggregate = json.loads((self.root / 'web-data' / 'all.json').read_text())
+        self.assertEqual(aggregate['metadata']['languages'], ['it', 'lmo', 'vec'])
+        self.assertIn('LINGUE confronto incrementale: it lmo vec', second.stdout)
+        self.calls.unlink()
+        third = self.invoke('--languages-file', str(config), extra=('--languages', 'lmo', 'it'))
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertIn('SALTA confronto interlingua', third.stdout)
+
     def test_model_runs_for_every_selected_language(self):
         result = self.invoke('it')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -741,6 +871,11 @@ class DumpPipelineTests(unittest.TestCase):
         self.assertEqual(report['status'], 'interrupted')
         self.assertEqual(report['steps'][-1]['returncode'], -15)
         self.assertEqual(self.metric_events()[-1]['status'], 'interrupted')
+        spans = self.span_events()
+        self.assert_closed_span_tree(spans)
+        self.assertEqual(spans[-1]['status'], 'interrupted')
+        pause = next(event for event in spans if event['name'] == 'mock.pause' and event['event'] == 'span_end')
+        self.assertTrue(pause['end_is_detection_bound'])
 
 
 if __name__ == '__main__':

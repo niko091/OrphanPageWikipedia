@@ -1,5 +1,6 @@
 from fixtures import graph_reference
 import copy
+from contextlib import closing
 import csv
 import json
 import os
@@ -15,9 +16,11 @@ from orphanwiki._native import graph_details
 from orphanwiki.core import analyze, compare_files, compare_languages
 from orphanwiki.core import (_comparison_analysis, _comparison_schema, _stage_comparison,
                              _finish_comparison, _StagedPages, _StagedCandidates)
-from orphanwiki.__main__ import export_result
+from orphanwiki.__main__ import export_result, comparison_filename
 from orphanwiki.__main__ import _matching_aggregate_report, publish_comparison, publish_available_aggregate
 from orphanwiki.core import write_aggregate_summary
+from orphanwiki.core import operational_span
+from orphanwiki.core import _comparison_edges, comparison_collections
 
 
 def fixture(language, links):
@@ -37,7 +40,239 @@ def failed_comparison_worker(*args):
 
 
 class ComparisonTests(unittest.TestCase):
-    def test_scalar_counterparts_are_looked_up_per_orphan_block(self):
+    @staticmethod
+    def materialize(results):
+        return {language: {**result, 'pages': list(result['pages']),
+                           'link_candidates': dict(result['link_candidates'].items())}
+                for language, result in results.items()}
+
+    @staticmethod
+    def cached_matches(work):
+        cache = work / 'comparison-cache'
+        manifest = json.loads((cache / 'manifest.json').read_text())
+        with closing(sqlite3.connect((cache / manifest['file']).as_uri() + '?mode=ro', uri=True)) as db:
+            return list(db.execute('SELECT * FROM comparison_matches ORDER BY language,reference,target,source'))
+
+    def test_incremental_new_and_changed_editions_only_compute_incident_pairs(self):
+        from multiprocessing.context import SpawnProcess
+        raws = [fixture('vec', {2: [4]}), fixture('lmo', {2: [1], 3: [1]}),
+                fixture('fr', {4: [1], 2: [5]})]
+        for raw in raws:
+            raw['pages'].reverse()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            work = root / 'work'
+            paths = []
+            for raw in raws:
+                path = root / (raw['metadata']['language'] + '-raw.json')
+                path.write_text(json.dumps(raw)); paths.append(path)
+            with compare_files(paths[:2], work_dir=work) as results:
+                self.assertEqual(self.materialize(results), compare_languages(raws[:2]))
+            original_manifest = (work / 'comparison-cache' / 'manifest.json').read_bytes()
+            original_name = json.loads(original_manifest)['file']
+            original_database = (work / 'comparison-cache' / original_name).read_bytes()
+            original_matches = self.cached_matches(work)
+            pairs, workers = [], []
+            def edges(db, language, ids, references=None):
+                pairs.extend((language, other) for other in references or [])
+                return _comparison_edges(db, language, ids, references)
+            start = SpawnProcess.start
+            def started(process):
+                workers.append(Path(process._args[0]).name)
+                return start(process)
+            with patch('orphanwiki.core._comparison_edges', side_effect=edges), patch.object(SpawnProcess, 'start', started):
+                with compare_files(paths[2:], work_dir=work) as results:
+                    self.assertEqual(self.materialize(results), compare_languages(raws))
+            self.assertEqual(workers, ['fr-raw.json'])
+            self.assertEqual(set(pairs), {('vec', 'fr'), ('lmo', 'fr'), ('fr', 'vec'), ('fr', 'lmo')})
+            self.assertEqual([row for row in self.cached_matches(work) if row[0] != 'fr' and row[1] != 'fr'], original_matches)
+            self.assertEqual((work / 'comparison-cache' / original_name).read_bytes(), original_database)
+            current = (work / 'comparison-cache' / 'manifest.json').read_bytes()
+            expected = compare_languages(raws)
+            with patch('orphanwiki.core._finish_comparison', side_effect=AssertionError('matching repeated')), \
+                    patch.object(SpawnProcess, 'start', side_effect=AssertionError('analysis repeated')):
+                with compare_files(paths[2:], work_dir=work) as results:
+                    self.assertEqual(self.materialize(results), expected)
+            self.assertEqual((work / 'comparison-cache' / 'manifest.json').read_bytes(), current)
+            retained = [row for row in self.cached_matches(work) if row[0] != 'lmo' and row[1] != 'lmo']
+            raws[1]['pages'][3]['links'] = ['lmo-5']
+            paths[1].write_text(json.dumps(raws[1]))
+            pairs.clear(); workers.clear()
+            with patch('orphanwiki.core._comparison_edges', side_effect=edges), patch.object(SpawnProcess, 'start', started):
+                with compare_files(paths[2:], work_dir=work) as results:
+                    self.assertEqual(self.materialize(results), compare_languages(raws))
+            self.assertEqual(workers, ['lmo-raw.json'])
+            self.assertEqual(set(pairs), {('vec', 'lmo'), ('lmo', 'vec'), ('fr', 'lmo'), ('lmo', 'fr')})
+            self.assertEqual([row for row in self.cached_matches(work) if row[0] != 'lmo' and row[1] != 'lmo'], retained)
+
+    def test_incremental_failure_retains_previous_cache_and_retries(self):
+        raws = [fixture('vec', {}), fixture('lmo', {2: [1]}), fixture('fr', {3: [1]})]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); work = root / 'work'
+            paths = []
+            for raw in raws:
+                path = root / (raw['metadata']['language'] + '-raw.json')
+                path.write_text(json.dumps(raw)); paths.append(path)
+            with compare_files(paths[:2], work_dir=work):
+                pass
+            cache = work / 'comparison-cache'
+            before = (cache / 'manifest.json').read_bytes()
+            name = json.loads(before)['file']
+            data = (cache / name).read_bytes()
+            with patch('orphanwiki.core._comparison_edges', side_effect=RuntimeError('matching interrupted')):
+                with self.assertRaisesRegex(RuntimeError, 'matching interrupted'), compare_files(paths[2:], work_dir=work):
+                    self.fail('No partially matched result')
+            self.assertEqual((cache / 'manifest.json').read_bytes(), before)
+            self.assertEqual((cache / name).read_bytes(), data)
+            self.assertFalse(list(work.glob('orphanwiki-compare-*')))
+            source_bytes = paths[0].read_bytes()
+            def modified_source(*args, **kwargs):
+                result = _finish_comparison(*args, **kwargs)
+                paths[0].write_bytes(source_bytes + b' ')
+                return result
+            with patch('orphanwiki.core._finish_comparison', side_effect=modified_source):
+                with self.assertRaisesRegex(ValueError, 'Input modificato'), compare_files(paths[2:], work_dir=work):
+                    self.fail('No cache approved after changing an input during matching')
+            self.assertEqual((cache / 'manifest.json').read_bytes(), before)
+            paths[0].write_bytes(source_bytes)
+            with compare_files(paths[2:], work_dir=work) as results:
+                self.assertEqual(self.materialize(results), compare_languages(raws))
+            record = json.loads((cache / 'manifest.json').read_text())
+            damaged = cache / record['file']
+            contents = damaged.read_bytes()
+            damaged.write_bytes(contents[:-1] + bytes([contents[-1] ^ 1]))
+            with self.assertRaisesRegex(ValueError, 'Checksum'), compare_files(paths[2:], work_dir=work):
+                self.fail('No unverified cached graph')
+
+    def test_incremental_multiple_new_editions_and_retirement_preserve_exact_results(self):
+        rng = random.Random(47)
+        raws = [fixture(language, {i: [j for j in range(1, 7) if rng.random() < .12]
+                                   for i in range(2, 7)}) for language in ('vec', 'lmo', 'fr', 'pt')]
+        raws[0]['pages'][0]['wikibase_item'] = None
+        raws[1]['pages'][0]['wikibase_item'] = 'Q6'  # Ambiguous local target.
+        raws[2]['pages'][2]['wikibase_item'] = None  # Unmatchable reference source.
+        raws[3]['pages'][1]['links'] += ['Alias', 'Alias', 'Cycle', 'pt-2']
+        raws[3]['redirects'] = {'Alias': 'pt-1', 'Cycle': 'Cycle'}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); work = root / 'work'
+            paths = []
+            for raw in raws:
+                rng.shuffle(raw['pages'])
+                path = root / (raw['metadata']['language'] + '-raw.json')
+                path.write_text(json.dumps(raw)); paths.append(path)
+            with compare_files(paths[:2], work_dir=work):
+                pass
+            old = self.cached_matches(work)
+            with compare_files(paths[2:], work_dir=work) as results:
+                self.assertEqual(self.materialize(results), compare_languages(raws))
+                with self.assertRaisesRegex(RuntimeError, 'Un altro confronto'), compare_files(paths[2:], work_dir=work):
+                    self.fail('Concurrent writer accepted')
+            self.assertEqual([row for row in self.cached_matches(work)
+                              if row[0] in ('vec', 'lmo') and row[1] in ('vec', 'lmo')], old)
+            cache = work / 'comparison-cache'
+            manifest = json.loads((cache / 'manifest.json').read_text())
+            with closing(sqlite3.connect(cache / manifest['file'])) as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM comparison_pairs').fetchone()[0], 12)
+            expected = compare_languages(raws[:3])
+            with patch('orphanwiki.core._comparison_edges', side_effect=AssertionError('old pairs repeated')):
+                with compare_files(paths[:1], work_dir=work, allowed_languages={'vec', 'lmo', 'fr'}) as results:
+                    self.assertEqual(self.materialize(results), expected)
+            self.assertTrue(all('pt' not in row[:2] for row in self.cached_matches(work)))
+
+    def test_incremental_measure_change_keeps_pairs_and_publication_failure_reuses_completed_matching(self):
+        from multiprocessing.context import SpawnProcess
+        raws = [fixture('vec', {}), fixture('lmo', {2: [1]})]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); work = root / 'work'
+            paths = []
+            histories = {}
+            for raw in raws:
+                language = raw['metadata']['language']
+                path = root / (language + '-raw.json')
+                path.write_text(json.dumps(raw)); paths.append(path)
+                histories[language] = {'metadata': {'language': language, 'database': language + 'wiki',
+                    'source': 'MediaWiki History dumps / ' + language + 'wiki',
+                    'history_release': '2026-09', 'complete': True}, 'pages': []}
+                (root / (language + '-history.json')).write_text(json.dumps(histories[language]))
+            with self.assertRaisesRegex(RuntimeError, 'publication interrupted'), compare_files(paths, work_dir=work):
+                raise RuntimeError('publication interrupted')
+            expected = compare_languages(raws, histories=histories)
+            with patch.object(SpawnProcess, 'start', side_effect=AssertionError('analysis repeated')), \
+                    patch('orphanwiki.core._finish_comparison', side_effect=AssertionError('matching repeated')):
+                with compare_files(paths, work_dir=work) as results:
+                    self.assertEqual(self.materialize(results), expected)
+            matches = self.cached_matches(work)
+            histories['lmo']['pages'] = [{'page_id': 1, 'article_created_at': '2025-01-01T00:00:00+00:00',
+                                         'creator_prior_edits_main_history': 42}]
+            updated_history = root / 'updated-history.json'
+            updated_history.write_text(json.dumps(histories['lmo']))
+            expected = compare_languages(raws, histories=histories)
+            with patch('orphanwiki.core._comparison_edges', side_effect=AssertionError('pairs invalidated by measures')):
+                with compare_files(paths[:1], work_dir=work, histories=[updated_history]) as results:
+                    self.assertEqual(self.materialize(results), expected)
+            self.assertEqual(self.cached_matches(work), matches)
+
+    def test_incremental_bootstrap_adopts_published_old_pairs_and_all_languages(self):
+        from orphanwiki.__main__ import main
+        raws = [fixture('vec', {}), fixture('lmo', {2: [1]}), fixture('fr', {3: [1]})]
+        for raw in raws:
+            language = raw['metadata']['language']
+            raw['metadata'].update(demo=False, database=language + 'wiki', sql_release='20261001',
+                source='Wikimedia SQL dumps / ' + language + 'wiki', dump_manifest_sha256='a' * 64)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); work = root / 'work'; output = root / 'web'
+            paths = []
+            for raw in raws:
+                path = root / (raw['metadata']['language'] + '-raw.json')
+                path.write_text(json.dumps(raw)); paths.append(path)
+            published_old = compare_languages(raws[:2])
+            publish_comparison(published_old, output)
+            discovered, _ = comparison_collections(paths[2:], output, {'vec', 'lmo', 'fr'})
+            self.assertEqual(set(discovered), set(paths))
+            moved = root / 'preserved-vec.json'
+            paths[0].replace(moved)
+            try:
+                with self.assertRaisesRegex(ValueError, 'conservare il grafo locale'):
+                    comparison_collections(paths[2:], output, {'vec', 'lmo', 'fr'})
+            finally:
+                moved.replace(paths[0])
+            originals = {path.name: path.read_bytes() for path in output.glob('*.json')}
+            language_file = root / 'languages.json'
+            language_file.write_text(json.dumps({'version': 1, 'languages': ['vec', 'lmo', 'fr']}))
+            pairs = []
+            def edges(db, language, ids, references=None):
+                pairs.extend((language, other) for other in references or [])
+                return _comparison_edges(db, language, ids, references)
+            with patch('sys.argv', ['orphanwiki', 'compare', str(paths[2]), '--output-dir', str(output),
+                    '--work-dir', str(work), '--languages-file', str(language_file)]), \
+                    patch('orphanwiki.core._comparison_edges', side_effect=edges):
+                main()
+            self.assertEqual(set(pairs), {('vec', 'fr'), ('lmo', 'fr'), ('fr', 'vec'), ('fr', 'lmo')})
+            for name, data in originals.items():
+                if name != 'manifest.json' and not name.startswith('all-available-'):
+                    self.assertEqual((output / name).read_bytes(), data)
+            with compare_files(paths[2:], work_dir=work) as results:
+                self.assertEqual(self.materialize(results), compare_languages(raws))
+            manifest = json.loads((output / 'manifest.json').read_text())
+            latest = {lang: max((entry for entry in manifest if entry['language'] == lang),
+                               key=lambda entry: entry['published_at']) for lang in ('vec', 'lmo', 'fr')}
+            self.assertTrue(all(set(json.loads((output / entry['file']).read_text())['metadata']['comparison']['reference_languages'])
+                                == set(latest) - {language} for language, entry in latest.items()))
+
+    def test_reference_graph_change_gets_distinct_canonical_filenames(self):
+        raws = [fixture('vec', {}), fixture('lmo', {2: [1]})]
+        for raw in raws:
+            raw['metadata']['sql_release'] = '20261001'
+        first = compare_languages(raws)
+        raws[1]['pages'][1]['links'] = ['lmo-3']
+        second = compare_languages(raws)
+        self.assertEqual(first['vec']['pages'], second['vec']['pages'])
+        self.assertNotEqual(first['vec']['link_candidates'], second['vec']['link_candidates'])
+        for language in first:
+            self.assertNotEqual(comparison_filename(language, first[language], first),
+                                comparison_filename(language, second[language], second))
+
+    def test_scalar_counterparts_and_edges_are_looked_up_per_orphan_block(self):
         connection = sqlite3.connect(':memory:')
         try:
             _comparison_schema(connection)
@@ -53,10 +288,84 @@ class ComparisonTests(unittest.TestCase):
             results = _finish_comparison(connection)
             connection.set_trace_callback(None)
             self.assertEqual(sum(len(result['link_candidates']) for result in results.values()), 1026)
-            self.assertLess(len(selects), 1300)
+            self.assertLess(len(selects), 30)
             self.assertEqual(results['vec']['link_candidates']['513']['candidate_count'], 0)
         finally:
             connection.close()
+
+    def test_skewed_wikis_stream_fanout_in_rank_order_with_indexed_target_lookups(self):
+        stats = {'live': 0, 'peak': 0, 'rows': 0, 'plans': []}
+
+        class TrackedEdge(tuple):
+            def __new__(cls, row):
+                stats['live'] += 1
+                stats['peak'] = max(stats['peak'], stats['live'])
+                stats['rows'] += 1
+                return super().__new__(cls, row)
+
+            def __del__(self):
+                stats['live'] -= 1
+
+        class Connection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                cursor = super().execute(sql, parameters)
+                if 'CROSS JOIN items ti ON ti.item=p.item' in sql:
+                    stats['plans'].append([row[3] for row in
+                        super().execute('EXPLAIN QUERY PLAN ' + sql, parameters)])
+                    return (TrackedEdge(row) for row in cursor)
+                return cursor
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'spans.jsonl'
+            db = sqlite3.connect(':memory:', factory=Connection)
+            self.addCleanup(db.close)
+            _comparison_schema(db)
+            for language, size in [('vec', 600), ('lmo', 6000), ('en', 600)]:
+                raw = fixture(language, {})
+                raw['pages'] = [{'page_id': pid, 'title': f'{language}-{pid}',
+                    'wikibase_item': f'Q{pid}',
+                    'links': ([f'{language}-{target}' for target in range(1, 65)]
+                              if language != 'vec' and 2 <= pid <= 600 else
+                              [f'{language}-1'] if language != 'vec' and pid > 600 else
+                              ['vec-599'] if language == 'vec' and pid == 600 else [])}
+                    for pid in range(1, size + 1)]
+                if language == 'vec':
+                    raw['pages'][1]['title'] = 'Ω'
+                    raw['pages'][2]['title'] = 'é'
+                    raw['pages'][3]['title'] = '𐀀'
+                _stage_comparison(db, _comparison_analysis(raw, {}, None))
+            with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(path), ORPHANWIKI_RUN_ID='skew'), \
+                    patch('orphanwiki._native.rank_candidates', side_effect=AssertionError('full edge vector')):
+                results = _finish_comparison(db)
+            titles = dict(db.execute('SELECT id,title FROM pages WHERE language="vec"'))
+            for target in range(1, 65):
+                record = results['vec']['link_candidates'][str(target)]
+                expected = []
+                for source in range(2, 601):
+                    if source == target:
+                        continue
+                    outgoing = int(source == 600)
+                    expected.append({'page_id': source, 'title': titles[source],
+                        'out_degree': outgoing, 'dead_end': outgoing == 0,
+                        'evidence': [{'language': lang, 'source_page_id': source,
+                            'source_title': f'{lang}-{source}', 'target_page_id': target,
+                            'target_title': f'{lang}-{target}'} for lang in ('en', 'lmo')]})
+                expected.sort(key=lambda candidate: (not candidate['dead_end'], candidate['title'], candidate['page_id']))
+                self.assertEqual(record['candidates'], expected)
+                self.assertEqual(record['candidate_count'], len(expected))
+            self.assertEqual(results['vec']['link_candidates']['600']['candidate_count'], 0)
+            self.assertGreater(stats['rows'], 75000)
+            self.assertLessEqual(stats['peak'], 4)  # Includes groupby's lookahead, independent of fanout.
+            self.assertEqual(stats['live'], 0)
+            for plan in stats['plans']:
+                self.assertTrue(any('SEARCH e USING COVERING INDEX edges_by_target' in line for line in plan), plan)
+                self.assertFalse(any('SCAN e' in line for line in plan), plan)
+            blocks = [json.loads(line) for line in path.read_text().splitlines()
+                      if json.loads(line)['event'] == 'span_end' and json.loads(line)['name'] == 'matching.block']
+            vec_blocks = [block for block in blocks if block['language'] == 'vec']
+            self.assertEqual(vec_blocks[0]['rows'], 512)
+            self.assertTrue(any(block['rows'] < 80 for block in vec_blocks[1:]))
+            self.assertEqual(sum(block['reference_edges'] for block in blocks), stats['rows'])
 
     def test_identical_available_aggregate_reuses_prepared_reports(self):
         results = {}
@@ -154,13 +463,20 @@ class ComparisonTests(unittest.TestCase):
             for raw in raws:
                 path = Path(folder) / (raw['metadata']['language'] + '-raw.json')
                 path.write_text(json.dumps(raw));inputs.append(path);originals.append(path.read_bytes())
-            with compare_files(inputs, work_dir=work) as results:
+            spans_path = Path(folder) / 'spans.jsonl'
+            with patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(spans_path), ORPHANWIKI_RUN_ID=''), \
+                    operational_span('synthetic.comparison') as parent, compare_files(inputs, work_dir=work) as results:
                 actual = {language: {**result, 'pages': list(result['pages']),
                                      'link_candidates': dict(result['link_candidates'].items())}
                           for language, result in results.items()}
                 self.assertEqual(actual, expected)
-                self.assertTrue(list(work.glob('orphanwiki-compare-*')))
-            self.assertEqual(list(work.iterdir()), [])
+                self.assertTrue((work / 'comparison-cache' / 'manifest.json').is_file())
+            spans = [json.loads(line) for line in spans_path.read_text().splitlines()]
+            self.assertTrue(all(span['run_id'] == parent['run_id'] for span in spans))
+            workers = [span for span in spans if span['name'] == 'analysis.wiki' and span['event'] == 'span_end']
+            self.assertEqual(len(workers), 3)
+            self.assertTrue(all(span['parent_id'] == parent['span_id'] for span in workers))
+            self.assertEqual(list(work.glob('orphanwiki-compare-*')), [])
             self.assertEqual([p.read_bytes() for p in inputs], originals)
 
     def test_staged_comparison_preserves_history_creator_and_age_parity(self):

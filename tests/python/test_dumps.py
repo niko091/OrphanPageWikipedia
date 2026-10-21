@@ -6,6 +6,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -450,6 +451,9 @@ class DumpTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            spans_path = root / 'operational-spans.jsonl'
+            self.enterContext(patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(spans_path),
+                                         ORPHANWIKI_RUN_ID='synthetic'))
             files = {}
             for table in SQL_TABLES:
                 columns, values = schemas[table]
@@ -490,6 +494,13 @@ class DumpTests(unittest.TestCase):
             self.assertEqual(inferred['input_sha256'], json_sha256(raw))
             self.assertEqual(json.loads(topic_path.read_text())['pages'], expected_topics['pages'])
             self.assertEqual(inferred['input_file_sha256'], hashlib.sha256(output.read_bytes()).hexdigest())
+            spans = [json.loads(line) for line in spans_path.read_text().splitlines()]
+            ends = [span for span in spans if span['event'] == 'span_end']
+            self.assertTrue({'hash.file', 'sql.import_table', 'sql.projection', 'export.graph_json',
+                             'model.predict'} <= {span['name'] for span in ends})
+            graph_span = next(span for span in ends if span['name'] == 'export.graph_json')
+            self.assertEqual((graph_span['rows'], graph_span['bytes']), (2, output.stat().st_size))
+            self.assertEqual(sum(span['rows'] for span in ends if span['name'] == 'model.predict'), 2)
             analyzed = analyze(raw)
             self.assertEqual(analyzed['metadata']['age_rule'],
                              'unavailable_no_approved_creation_event')
@@ -583,6 +594,9 @@ class DumpTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            spans_path = root / 'operational-spans.jsonl'
+            self.enterContext(patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(spans_path),
+                                         ORPHANWIKI_RUN_ID='synthetic'))
             stage = root / 'stage'
             stage.mkdir()
             with closing(sqlite3.connect(stage / 'vecwiki-20261001.sqlite')) as database:
@@ -608,6 +622,12 @@ class DumpTests(unittest.TestCase):
                                       'sha256_local': hashlib.sha256(path.read_bytes()).hexdigest()}}}))
             output = root / 'history.json'
             self.assertEqual(import_history(manifest, output, stage), 1)
+            spans = [json.loads(line) for line in spans_path.read_text().splitlines()]
+            scans = [span for span in spans if span['name'] == 'history.scan' and span['event'] == 'span_end']
+            self.assertEqual([span['phase'] for span in scans], ['initial', 'activity'])
+            self.assertTrue(all(span['rows'] > 0 for span in scans))
+            self.assertTrue(all(span['sqlite_seconds'] >= 0 for span in scans))
+            self.assertTrue({'history.index', 'history.metrics', 'history.export'} <= {span['name'] for span in spans})
             record = json.loads(output.read_text())['pages'][0]
             self.assertEqual(record['creator_attribution'], 'history_initial_revision_observed')
             self.assertEqual(record['creator_groups_at_creation'], ['sysop'])
@@ -729,6 +749,9 @@ class DumpTests(unittest.TestCase):
         from xml.sax.saxutils import escape
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            spans_path = root / 'operational-spans.jsonl'
+            self.enterContext(patch.dict(os.environ, ORPHANWIKI_SPANS_FILE=str(spans_path),
+                                         ORPHANWIKI_RUN_ID='synthetic'))
             stage = root / 'staging'
             stage.mkdir()
             files = {name: {'sha256_local': name} for name in SQL_TABLES}
@@ -779,6 +802,15 @@ class DumpTests(unittest.TestCase):
             with patch('orphanwiki.dumps._content_pages', wraps=original_reader) as reader:
                 infer_quality(raw_path, content, output, stage)
                 self.assertEqual(reader.call_count, 1)  # completed partition reused
+            spans = [json.loads(line) for line in spans_path.read_text().splitlines()]
+            ends = [span for span in spans if span['event'] == 'span_end']
+            self.assertEqual(len(spans), 2 * len(ends))
+            self.assertTrue({'quality.xml', 'quality.features', 'quality.percentiles', 'quality.export'} <= {span['name'] for span in ends})
+            self.assertTrue(any(span['name'] == 'quality.xml' and span['status'] == 'failed' for span in ends))
+            feature_rows = sum(span['rows'] or 0 for span in ends if span['name'] == 'quality.features')
+            self.assertEqual(feature_rows, 4)
+            self.assertTrue(all(span['rows'] == 5 and span['bytes'] == output.stat().st_size
+                                for span in ends if span['name'] == 'quality.export'))
             quality = json.loads(output.read_text())
             self.assertEqual([p['quality_status'] for p in quality['pages']],
                              ['scored', 'scored', 'scored', 'missing_wikitext', 'missing_current_page'])
@@ -825,7 +857,9 @@ class DumpTests(unittest.TestCase):
                              [(p['in_degree'], p['out_degree'], p['orphan']) for p in bounded['pages']])
             self.assertTrue(all(p['age_days'] > 0 for p in updated['pages']))
             self.assertTrue(all(p['history_first_revision_at'].startswith('2019') for p in updated['pages']))
-            summary_path = bounded_path.parent / name.replace('.json', '-summary.json')
+            manifest_entries = json.loads((bounded_path.parent / 'manifest.json').read_text())
+            entry = next(item for item in manifest_entries if item['file'] == name)
+            summary_path = bounded_path.parent / entry['summary_file']
             summary = json.loads(summary_path.read_text())
             self.assertEqual(summary['reports']['numeric']['age_days']['known'], 5)
             self.assertEqual(summary['reports']['numeric']['creator_tenure_days']['known'], 5)

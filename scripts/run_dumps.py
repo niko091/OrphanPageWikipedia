@@ -19,6 +19,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,10 +33,14 @@ def project_path(value):
 
 
 def checksum(path):
+    from orphanwiki.core import operational_span
     digest = hashlib.sha256()
-    with Path(path).open('rb') as source:
+    with operational_span('hash.file', algorithm='sha256') as span, Path(path).open('rb') as source:
+        size = 0
         for block in iter(lambda: source.read(1024 * 1024), b''):
             digest.update(block)
+            size += len(block)
+        span['bytes'] = size
     return digest.hexdigest()
 
 
@@ -167,21 +173,33 @@ def imported_files_reason(graph, history, stage, manifest_path, manifest, histor
         return 'stage_table_mismatch'
 
 
-def topics_match(path, graph, graph_checksum, language, model_spec, census_pages):
+def topics_match(path, graph, graph_checksum, language, model_spec, census_pages, log=None):
+    from orphanwiki.core import operational_span
+    def outcome(reason):
+        if log is not None:
+            log_line(log, f'CHECKPOINT temi {language}: {reason}')
+        with operational_span('checkpoint.topics', language=language, reason=reason, rows=0, bytes=0):
+            pass
+        return reason == 'verified_reuse'
     if not complete_json(path):
-        return False
+        return outcome('missing_output')
     try:
         from orphanwiki.dumps import _read_first_metadata
         graph_meta = _read_first_metadata(graph)
         meta = _read_first_metadata(path)
-        return (meta.get('language') == language and meta.get('complete') is True
+        source_matches = (meta.get('language') == language and meta.get('complete') is True
                 and meta.get('source') == 'local_model_on_verified_SQL_dump_outlinks'
                 and meta.get('graph_finished_at') == graph_meta.get('finished_at')
-                and meta.get('input_file_sha256') == graph_checksum
-                and meta.get('model') == model_spec
-                and meta.get('predicted_pages', -1) + meta.get('missing_pages', -1) == census_pages)
+                and meta.get('input_file_sha256') == graph_checksum)
+        if not source_matches:
+            return outcome('source_mismatch')
+        if meta.get('model') != model_spec:
+            return outcome('definition_mismatch')
+        if meta.get('predicted_pages', -1) + meta.get('missing_pages', -1) != census_pages:
+            return outcome('coverage_mismatch')
+        return outcome('verified_reuse')
     except (OSError, ValueError, KeyError, TypeError):
-        return False
+        return outcome('invalid_checkpoint')
 
 
 def approved_outputs(output_dir, files):
@@ -436,10 +454,72 @@ class PipelineBenchmark:
         self.monitor_error = None
         self.last_cpu_sample = None
         self.thread = threading.Thread(target=self.monitor, name='pipeline-metrics', daemon=True)
+        self.run_id = uuid.uuid4().hex
+        self.spans_path = path.with_suffix('.spans.jsonl')
+
+    @contextmanager
+    def tracing(self):
+        from orphanwiki.core import operational_span
+        keys = ('ORPHANWIKI_SPANS_FILE', 'ORPHANWIKI_RUN_ID', 'ORPHANWIKI_PARENT_SPAN')
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            if not self.args.no_phase_spans:
+                self.spans_path.touch(exist_ok=False)
+                os.environ.update(ORPHANWIKI_SPANS_FILE=str(self.spans_path), ORPHANWIKI_RUN_ID=self.run_id)
+            with operational_span('pipeline'):
+                yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def close_abandoned_spans(self, offset, returncode):
+        """Close unmatched worker starts after the child and its workers exit.
+
+        These are detection bounds, not invented exact death timestamps. Keep
+        only currently open spans; completed batch records are never retained.
+        """
+        if self.args.no_phase_spans:
+            return
+        pending = {}
+        with self.spans_path.open('rb') as stream:
+            stream.seek(offset)
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue  # A killed process may leave an incomplete final line.
+                if record['event'] == 'span_start':
+                    pending[record['span_id']] = record
+                elif record['event'] == 'span_end':
+                    pending.pop(record['span_id'], None)
+                    for child in pending.values():
+                        if child['parent_id'] == record['span_id']:
+                            child['_end_bound_ns'] = record['finished_ns']
+        finished = time.monotonic_ns()
+        with self.spans_path.open('ab') as stream:
+            # Separate a possibly truncated last record from our valid JSONL.
+            if pending:
+                stream.write(b'\n')
+            for record in pending.values():
+                bound, ancestor = finished, record
+                while ancestor is not None:
+                    bound = min(bound, ancestor.get('_end_bound_ns', finished))
+                    ancestor = pending.get(ancestor['parent_id'])
+                values = {key: value for key, value in record.items() if key != '_end_bound_ns'}
+                stream.write((json.dumps({**values, 'event': 'span_end', 'monotonic_ns': finished,
+                    'finished_ns': bound, 'detected_ns': finished,
+                    'wall_seconds': (bound - record['started_ns']) / 1e9,
+                    'status': 'interrupted', 'error': 'worker_exit', 'returncode': returncode,
+                    'end_is_detection_bound': True}) + '\n').encode())
 
     def emit(self, event, **values):
         with self.lock:
-            self.events.write(json.dumps({'event': event, 'at': datetime.now(timezone.utc).isoformat(),
+            self.events.write(json.dumps({'event': event, 'run_id': self.run_id, 'at': datetime.now(timezone.utc).isoformat(),
                                          'elapsed_seconds': time.monotonic() - self.started,
                                          **values}, ensure_ascii=False, allow_nan=False) + '\n')
 
@@ -485,7 +565,10 @@ class PipelineBenchmark:
                          'config_sha256': {str(path): checksum(path) for path in
                              (project_path(self.args.languages_file), project_path(self.args.model_config),
                               PROJECT_ROOT / 'config/quality.json')},
+                         'run_id': self.run_id,
                          'measurement': {'interval_seconds': self.args.metrics_interval,
+                             'spans_file': None if self.args.no_phase_spans else self.spans_path.name,
+                             'spans': 'inclusive monotonic intervals; subtract child interval unions for exclusive time; abrupt ends are detection bounds',
                              'rss': 'sampled sum of controller and live descendants; shared pages may repeat; not PSS',
                              'cpu': 'getrusage children deltas per completed step; 100 percent = one core',
                              'io': 'controller plus reaped descendants; physical storage bytes, excludes network and cache hits',
@@ -539,15 +622,17 @@ class PipelineBenchmark:
             self.monitor_error = str(error)
             log_line(self.log, f'MONITORAGGIO FALLITO: {error}')
 
-    def begin_step(self, name, command):
+    def begin_step(self, name, command, phase):
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         with self.lock:
             self.active = {'name': name, 'command': [str(value) for value in command],
+                           'span_id': phase.get('span_id'), 'parent_id': phase.get('parent_id'),
                            'sampled_peak_tree_rss_bytes': None}
         self.emit('step_start', **self.active)
-        return time.monotonic(), before
+        return time.monotonic(), before, (self.spans_path.stat().st_size if self.spans_path.exists() else 0)
 
     def end_step(self, baseline, status):
+        self.close_abandoned_spans(baseline[2], status)
         elapsed = time.monotonic() - baseline[0]
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         user, system = after.ru_utime - baseline[1].ru_utime, after.ru_stime - baseline[1].ru_stime
@@ -581,13 +666,20 @@ class PipelineBenchmark:
 
 
 def run_step(log, name, command, benchmark=None):
+    from orphanwiki.core import operational_span
+    with operational_span('pipeline.step', step=name) as phase:
+        _run_step(log, name, command, benchmark, phase)
+
+
+def _run_step(log, name, command, benchmark, phase):
+    from orphanwiki.core import operational_environment
     log_line(log, f'INIZIO {name}: {shlex.join(str(value) for value in command)}')
-    baseline = benchmark.begin_step(name, command) if benchmark else None
+    baseline = benchmark.begin_step(name, command, phase) if benchmark else None
     process = None
     try:
         process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                   env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+                                   env={**operational_environment(), 'PYTHONUNBUFFERED': '1'})
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -624,7 +716,7 @@ def interrupt_for_shutdown(_signum, _frame):
 
 
 def run_pipeline(args, log, benchmark=None):
-    from orphanwiki.core import configured_languages
+    from orphanwiki.core import configured_languages, comparison_collections
     from orphanwiki.dumps import HISTORY_RULE, _read_first_metadata
     configured = configured_languages(project_path(args.languages_file))
     if args.languages:
@@ -747,7 +839,9 @@ def run_pipeline(args, log, benchmark=None):
                              uri=True) as connection:
             census = connection.execute('SELECT COUNT(*) FROM pages').fetchone()[0]
         census_by_language[language] = census
-        if not args.force and topics_match(checkpoint, graph, graph_hash, language, topic_spec, census):
+        if args.force:
+            log_line(log, f'CHECKPOINT temi {language}: forced')
+        if not args.force and topics_match(checkpoint, graph, graph_hash, language, topic_spec, census, log):
             log_line(log, f'SALTA temi {language}: checkpoint completo del modello e grafo invariato')
         else:
             missing_topics.append(language)
@@ -764,7 +858,7 @@ def run_pipeline(args, log, benchmark=None):
             checkpoint = import_dir / f'{language}-topics.json'
             graph = import_dir / f'{language}-raw.json'
             if not topics_match(checkpoint, graph, checksum(graph), language, topic_spec,
-                                census_by_language[language]):
+                                census_by_language[language], log):
                 raise ValueError(f'Inferenza dei temi incompleta per {language}; ripetere lo script')
     content_source = ['--languages-file', str(project_path(args.languages_file)), '--languages', *languages,
                       '--content-release', args.content_release, '--root', str(dump_root)]
@@ -775,6 +869,7 @@ def run_pipeline(args, log, benchmark=None):
             document = json.loads(path.read_text())
             content_outputs.extend([path, *fetched_files(document)])
     content_inputs = {'languages': [list(pair) for pair in selected], 'release': args.content_release}
+    log_line(log, 'CHECKPOINT contenuto XML: ' + state.reason('content-fetch', content_inputs, content_outputs))
     if len(content_outputs) < len(selected) or not state.matches('content-fetch', content_inputs, content_outputs):
         step('contenuto corrente verificato', [*base, 'fetch-content', *content_source])
         content_outputs = []
@@ -782,6 +877,8 @@ def run_pipeline(args, log, benchmark=None):
             path = dump_root / database / f'content-{args.content_release}.json'
             content_outputs.extend([path, *fetched_files(json.loads(path.read_text()))])
         state.save('content-fetch', content_inputs, content_outputs)
+    else:
+        log_line(log, 'SALTA contenuto XML: file verificati e invariati')
     for language, database in selected:
         graph = import_dir / f'{language}-raw.json'
         manifest = dump_root / database / f'content-{args.content_release}.json'
@@ -789,11 +886,27 @@ def run_pipeline(args, log, benchmark=None):
         inputs = {'graph_sha256': checksum(graph), 'manifest_sha256': checksum(manifest),
                   'model_sha256': checksum(PROJECT_ROOT / 'config/quality.json'),
                   'quality_revision_rule': 'selected_official_xml_revision_v1'}
+        log_line(log, f'CHECKPOINT qualità {language}: ' + state.reason(f'quality:{language}', inputs, [quality]))
         if not state.matches(f'quality:{language}', inputs, [quality]):
             step(f'qualità {language}', [*base, 'quality', '--languages-file', str(project_path(args.languages_file)),
                 '--languages', language, '--content-release', args.content_release, '--root', str(dump_root),
                 '--input-dir', str(import_dir), '--output-dir', str(import_dir), '--work-dir', str(work_dir)])
             state.save(f'quality:{language}', inputs, [quality])
+        else:
+            log_line(log, f'SALTA qualità {language}: supplemento verificato e invariato')
+    # Acquisition follows the explicit subset. Suggestions include all approved
+    # previously processed configured editions, in both directions.
+    graph_paths, _ = comparison_collections(graph_paths, output_dir, set(dict(configured)))
+    identities = {}
+    for path in graph_paths:
+        metadata = _read_first_metadata(path)
+        identities[metadata['language']] = metadata
+    selected = [(language, metadata.get('database') or dict(configured)[language])
+                for language, metadata in sorted(identities.items())]
+    languages = [language for language, _ in selected]
+    for language, metadata in identities.items():
+        manifest_hashes.setdefault(language, metadata['dump_manifest_sha256'])
+    log_line(log, 'LINGUE confronto incrementale: ' + ' '.join(languages))
     measures = {}
     for language in languages:
         measures[language] = {'history': _read_first_metadata(import_dir / f'{language}-history.json')}
@@ -825,6 +938,7 @@ def run_pipeline(args, log, benchmark=None):
             return
         step('confronto interlingua: ' + ' '.join(languages),
                  [*base, 'compare', *(str(path) for path in graph_paths),
+                  '--languages-file', str(project_path(args.languages_file)),
                   '--histories', *(str(import_dir / f'{language}-history.json') for language in languages),
                   '--output-dir', str(output_dir), '--work-dir', str(work_dir)])
         if not comparison_matches(output_dir, selected, manifest_hashes, topic_spec, measures):
@@ -847,7 +961,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--languages-file', default='config/languages.json',
                         help='Unico elenco delle Wikipedie complete da elaborare')
-    parser.add_argument('--languages', nargs='+', help='Sottoinsieme della configurazione, senza cambiare gli algoritmi')
+    parser.add_argument('--languages', nargs='+',
+                        help='Edizioni configurate da acquisire; il matching include anche quelle già elaborate')
     parser.add_argument('--sql-release', required=True, help='Release SQL: YYYYMMDD')
     parser.add_argument('--history-release', required=True, help='Release History: YYYY-MM')
     parser.add_argument('--content-release',
@@ -855,7 +970,7 @@ def main(argv=None):
     parser.add_argument('--dump-root', default='data/dumps')
     parser.add_argument('--import-dir', default='data/imported')
     parser.add_argument('--output-dir', default='web/data')
-    parser.add_argument('--work-dir', help='Staging SQLite; predefinito: <dump-root>/staging')
+    parser.add_argument('--work-dir', help='Staging e indici incrementali SQLite; predefinito: <dump-root>/staging')
     parser.add_argument('--log-dir', default='data/logs')
     local_python = PROJECT_ROOT / '.venv' / 'bin' / 'python'
     parser.add_argument('--python', default=str(local_python if local_python.is_file() else sys.executable),
@@ -868,6 +983,8 @@ def main(argv=None):
                         help='Voci per blocco dei temi, da 1 a 10000; non limita il censimento')
     parser.add_argument('--metrics-interval', type=float, default=10,
                         help='Secondi tra campioni risorse e messaggi di attività; predefinito 10')
+    parser.add_argument('--no-phase-spans', action='store_true',
+                        help='Disabilita gli intervalli dettagliati JSONL; conserva i benchmark delle fasi')
     parser.add_argument('--history-cache-mib', type=int, default=256,
                         help='Cache SQLite History in MiB, da 1 a 65536; predefinita 256')
     parser.add_argument('--history-commit-rows', type=int, default=250000,
@@ -910,8 +1027,16 @@ def main(argv=None):
         try:
             if not args.plan:
                 benchmark = PipelineBenchmark(log, log_path.with_suffix('.benchmark.json'), args)
-                benchmark.start()
-            run_pipeline(args, log, benchmark)
+                with benchmark.tracing():
+                    benchmark.start()
+                    run_pipeline(args, log, benchmark)
+            else:
+                inherited_spans = os.environ.pop('ORPHANWIKI_SPANS_FILE', None)
+                try:
+                    run_pipeline(args, log, benchmark)
+                finally:
+                    if inherited_spans is not None:
+                        os.environ['ORPHANWIKI_SPANS_FILE'] = inherited_spans
             status = 'completed'
         except KeyboardInterrupt:
             status = 'interrupted'

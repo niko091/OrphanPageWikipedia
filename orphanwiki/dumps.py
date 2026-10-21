@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from .core import wiki_database, write_json
+from .core import wiki_database, write_json, operational_phase, operational_span, phase_counts
 
 
 BASE = 'https://dumps.wikimedia.org'
@@ -116,22 +116,31 @@ def _names(url):
     return parser.names
 
 
+@operational_phase('hash.file')
 def _hash(path, algorithm):
     digest = hashlib.new(algorithm)
+    size = 0
+    phase_counts(algorithm=algorithm)
     with Path(path).open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
+            size += len(block)
+    phase_counts(bytes=size)
     return digest.hexdigest()
 
 
+@operational_phase('hash.verify')
 def _verified_sha256(path, expected_sha1=None, expected_sha256=None):
     sha1 = hashlib.sha1() if expected_sha1 is not None else None
     sha256 = hashlib.sha256()
+    size = 0
     with Path(path).open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             if sha1 is not None:
                 sha1.update(block)
             sha256.update(block)
+            size += len(block)
+    phase_counts(bytes=size)
     checksum = sha256.hexdigest()
     if ((sha1 is not None and sha1.hexdigest() != expected_sha1)
             or (expected_sha256 is not None and checksum != expected_sha256)):
@@ -317,11 +326,13 @@ def _content_pages(path, database):
             raise ValueError('Identità XML non verificata')
 
 
+@operational_phase('quality')
 def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/quality.json'):
     """Full census, verified partitions, exact SQLite percentiles and Rust scores."""
     from ._native import quality_transforms, quality_scores
     raw_path, manifest_path, output = Path(raw_path), Path(manifest_path), Path(output)
     graph = _read_first_metadata(raw_path)
+    phase_counts(language=graph.get('language'))
     manifest = json.loads(manifest_path.read_text())
     database = wiki_database(graph['language'], graph.get('database'))
     if (graph.get('source') != 'Wikimedia SQL dumps / ' + database or graph.get('complete') is not True
@@ -379,6 +390,9 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
             if info.st_size != record['bytes'] or record['sha256_local'] != record['sha256_publisher']:
                 raise ValueError('Checksum contenuto XML errato')
             if previous == (record['sha256_local'], info.st_size, info.st_mtime_ns):
+                print(f'CHECKPOINT XML {name}: verified_reuse', flush=True)
+                with operational_span('quality.partition', partition=name, reason='verified_reuse', rows=0, bytes=0):
+                    pass
                 continue
             if _hash(path, 'sha256') != record['sha256_publisher']:
                 raise ValueError('Checksum contenuto XML errato')
@@ -395,10 +409,12 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
                         ((pid, rid, name, json.dumps(features) if features is not None else None, *x)
                          for (pid, rid, _, features), x in zip(batch, values)))
                 batch.clear()
+            @operational_phase('quality.features')
             def flush_xml():
                 nonlocal xml_bytes
                 if not xml_batch:
                     return
+                phase_counts(rows=len(xml_batch), bytes=xml_bytes)
                 identifiers = [record[0] for record in xml_batch]
                 selected = {row[0] for row in db.execute(
                     f'SELECT id FROM quality_census WHERE id IN ({",".join("?" for _ in identifiers)})',
@@ -411,31 +427,37 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
                             flush()
                 xml_batch.clear()
                 xml_bytes = 0
-            for pid, ns, redirect, rid, text, namespaces in _content_pages(path, database):
-                if ns == 0 and not redirect:
-                    xml_batch.append((pid, rid, text, namespaces))
-                    xml_bytes += len(text.encode('utf-8')) if text is not None else 0
-                    if len(xml_batch) == 512 or xml_bytes >= 8 * 1024 * 1024:
-                        flush_xml()
-            flush_xml()
-            if batch:
-                flush()
+            with operational_span('quality.xml', partition=name, bytes=info.st_size) as xml_span:
+                xml_rows = 0
+                for pid, ns, redirect, rid, text, namespaces in _content_pages(path, database):
+                    xml_rows += 1
+                    if ns == 0 and not redirect:
+                        xml_batch.append((pid, rid, text, namespaces))
+                        xml_bytes += len(text.encode('utf-8')) if text is not None else 0
+                        if len(xml_batch) == 512 or xml_bytes >= 8 * 1024 * 1024:
+                            flush_xml()
+                flush_xml()
+                if batch:
+                    flush()
+                xml_span['rows'] = xml_rows
             if (path.stat().st_size, path.stat().st_mtime_ns) != (info.st_size, info.st_mtime_ns):
                 raise ValueError('Contenuto XML modificato durante elaborazione')
             with db:
                 db.execute('INSERT OR REPLACE INTO quality_parts VALUES(?,?,?,?)',
                            (name, record['sha256_local'], info.st_size, info.st_mtime_ns))
-        n = db.execute('SELECT COUNT(*) FROM quality_pages WHERE features IS NOT NULL').fetchone()[0]
-        maxima = []
-        for i, minimum in enumerate(spec['minimums']):
-            if n:
-                rank = (n - 1) * spec['percentile']
-                offset = math.floor(rank)
-                pair = db.execute(f'SELECT x{i} FROM quality_pages WHERE features IS NOT NULL ORDER BY x{i} LIMIT 2 OFFSET ?', (offset,)).fetchall()
-                percentile = pair[0][0] + (rank - offset) * ((pair[-1][0]) - pair[0][0])
-            else:
-                percentile = 0
-            maxima.append(max(minimum, percentile))
+        with operational_span('quality.percentiles'):
+            n = db.execute('SELECT COUNT(*) FROM quality_pages WHERE features IS NOT NULL').fetchone()[0]
+            phase_counts(rows=n)
+            maxima = []
+            for i, minimum in enumerate(spec['minimums']):
+                if n:
+                    rank = (n - 1) * spec['percentile']
+                    offset = math.floor(rank)
+                    pair = db.execute(f'SELECT x{i} FROM quality_pages WHERE features IS NOT NULL ORDER BY x{i} LIMIT 2 OFFSET ?', (offset,)).fetchall()
+                    percentile = pair[0][0] + (rank - offset) * ((pair[-1][0]) - pair[0][0])
+                else:
+                    percentile = 0
+                maxima.append(max(minimum, percentile))
         valid = db.execute('''SELECT COUNT(*) FROM quality_census c JOIN quality_pages p ON c.id=p.id
                               WHERE p.features IS NOT NULL''').fetchone()[0]
         same, different, unavailable = db.execute('''SELECT
@@ -462,7 +484,9 @@ def infer_quality(raw_path, manifest_path, output, work_dir, spec_path='config/q
                     yield {'page_id': pid, 'revision_id': revision, 'content_revision_id': actual,
                            'quality_revision_relation': relation,
                            'quality_score': score if status == 'scored' else None, 'quality_status': status}
-        write_json(output, {'metadata': metadata, 'pages': []}, arrays={'pages': pages()})
+        with operational_span('quality.export', rows=census) as span:
+            write_json(output, {'metadata': metadata, 'pages': []}, arrays={'pages': pages()})
+            span['bytes'] = output.stat().st_size
     return metadata
 
 
@@ -638,13 +662,18 @@ def _stage_schema(connection):
     ''')
 
 
+@operational_phase('sql.import_table')
 def _load_table(connection, table, path, digest):
+    phase_counts(table=table)
     target = {'page': 'dump_page', 'linktarget': 'dump_target', 'pagelinks': 'dump_link',
               'redirect': 'dump_redirect', 'page_props': 'dump_prop',
               'categorylinks': 'dump_category', 'user_groups': 'dump_group'}[table]
     old = connection.execute('SELECT sha256 FROM imported WHERE table_name=?', (table,)).fetchone()
     if old and old[0] == digest:
+        phase_counts(reason='verified_reuse', rows=0, bytes=0)
+        print(f'CHECKPOINT SQL {table}: verified_reuse', flush=True)
         return
+    phase_counts(reason='source_mismatch' if old else 'missing_checkpoint')
     connection.execute('DELETE FROM imported WHERE table_name=?', (table,))
     connection.execute(f'DELETE FROM {target}')
     connection.commit()
@@ -716,6 +745,7 @@ def _load_table(connection, table, path, digest):
         if selected:
             connection.executemany(inserts[table], selected)
             count += len(selected)
+            phase_counts(rows=count)
         if count and count % 1000000 < len(selected):
             connection.commit()
             print(f'Dump {table}: {count:,} righe', flush=True)
@@ -725,10 +755,12 @@ def _load_table(connection, table, path, digest):
     print(f'Dump {table}: {count:,} righe acquisite', flush=True)
 
 
+@operational_phase('import.graph')
 def import_graph(manifest_path, output, work_dir):
     """Build the complete article and parsed-link graph from SQL dumps."""
     manifest = json.loads(Path(manifest_path).read_text())
     language = manifest['language']
+    phase_counts(language=language)
     database = wiki_database(language, manifest.get('database'))
     if manifest.get('database') != database:
         raise ValueError('Identità della wiki nel manifest non valida')
@@ -747,48 +779,50 @@ def import_graph(manifest_path, output, work_dir):
             if not path.is_file() or path.stat().st_size != record['bytes'] or _hash(path, 'sha256') != record['sha256_local']:
                 raise ValueError(f'Dump modificato o incompleto: {table}')
             _load_table(connection, table, path, record['sha256_local'])
-        connection.executescript('''
-          CREATE INDEX IF NOT EXISTS dump_link_source ON dump_link(source_id);
-          CREATE INDEX IF NOT EXISTS dump_prop_page_name ON dump_prop(page_id,name);
-          CREATE INDEX IF NOT EXISTS dump_page_ns_title ON dump_page(ns,title);
-          CREATE INDEX IF NOT EXISTS dump_category_source ON dump_category(source_id);
-        ''')
-        expected = connection.execute('SELECT COUNT(*) FROM dump_page WHERE ns=0 AND redirect=0').fetchone()[0]
-        if expected == 0:
-            raise ValueError('Il dump non contiene voci')
-        connection.executescript('DROP TABLE IF EXISTS pages; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS categories;')
-        pages = DiskPages(connection)
-        qids = dict(connection.execute("SELECT page_id,value FROM dump_prop WHERE name='wikibase_item'"))
-        for pid, title, length, revision in connection.execute('SELECT id,title,length,revision FROM dump_page WHERE ns=0 AND redirect=0 ORDER BY id'):
-            item = qids.get(pid)
-            pages[pid] = {'page_id': pid, 'title': title, 'length_bytes': length,
-                          'revision_id': revision, 'wikibase_item': item if item and re.fullmatch(r'Q[1-9][0-9]*', item) else None,
-                          'created_at': None, 'page_created_at': None,
-                          'first_public_revision_at': None, 'creation_date_source': None,
-                          'creation_date_status': 'dump_history_not_joined'}
-        connection.execute('''INSERT INTO links
-          SELECT l.source_id,t.title FROM dump_link l JOIN dump_target t ON t.id=l.target_id
-          JOIN dump_page p ON p.id=l.source_id
-          WHERE t.ns=0 AND p.ns=0 AND p.redirect=0''')
-        connection.execute('''INSERT INTO categories
-          SELECT c.source_id,COALESCE(t.title,c.title) FROM dump_category c
-          LEFT JOIN dump_target t ON t.id=c.target_id
-          JOIN dump_page p ON p.id=c.source_id
-          WHERE p.ns=0 AND p.redirect=0 AND (t.ns=14 OR c.title IS NOT NULL)
-          AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id
-              WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))''')
-        redirects = {source: target for source, target in connection.execute('''
-          SELECT p.title,r.title FROM dump_redirect r JOIN dump_page p ON p.id=r.page_id
-          WHERE p.ns=0 AND p.redirect=1 AND r.ns=0 AND COALESCE(r.interwiki,'')='' ''')}
-        parents = {}
-        for child, parent in connection.execute('''SELECT p.title,COALESCE(t.title,c.title)
-          FROM dump_category c JOIN dump_page p ON p.id=c.source_id
-          LEFT JOIN dump_target t ON t.id=c.target_id
-          WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL)
-          AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id
-              WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))'''):
-            parents.setdefault(child, []).append(parent)
-        pages.prepare_export()
+        with operational_span('sql.projection'):
+            connection.executescript('''
+              CREATE INDEX IF NOT EXISTS dump_link_source ON dump_link(source_id);
+              CREATE INDEX IF NOT EXISTS dump_prop_page_name ON dump_prop(page_id,name);
+              CREATE INDEX IF NOT EXISTS dump_page_ns_title ON dump_page(ns,title);
+              CREATE INDEX IF NOT EXISTS dump_category_source ON dump_category(source_id);
+            ''')
+            expected = connection.execute('SELECT COUNT(*) FROM dump_page WHERE ns=0 AND redirect=0').fetchone()[0]
+            if expected == 0:
+                raise ValueError('Il dump non contiene voci')
+            connection.executescript('DROP TABLE IF EXISTS pages; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS categories;')
+            pages = DiskPages(connection)
+            qids = dict(connection.execute("SELECT page_id,value FROM dump_prop WHERE name='wikibase_item'"))
+            for pid, title, length, revision in connection.execute('SELECT id,title,length,revision FROM dump_page WHERE ns=0 AND redirect=0 ORDER BY id'):
+                item = qids.get(pid)
+                pages[pid] = {'page_id': pid, 'title': title, 'length_bytes': length,
+                              'revision_id': revision, 'wikibase_item': item if item and re.fullmatch(r'Q[1-9][0-9]*', item) else None,
+                              'created_at': None, 'page_created_at': None,
+                              'first_public_revision_at': None, 'creation_date_source': None,
+                              'creation_date_status': 'dump_history_not_joined'}
+            connection.execute('''INSERT INTO links
+              SELECT l.source_id,t.title FROM dump_link l JOIN dump_target t ON t.id=l.target_id
+              JOIN dump_page p ON p.id=l.source_id
+              WHERE t.ns=0 AND p.ns=0 AND p.redirect=0''')
+            connection.execute('''INSERT INTO categories
+              SELECT c.source_id,COALESCE(t.title,c.title) FROM dump_category c
+              LEFT JOIN dump_target t ON t.id=c.target_id
+              JOIN dump_page p ON p.id=c.source_id
+              WHERE p.ns=0 AND p.redirect=0 AND (t.ns=14 OR c.title IS NOT NULL)
+              AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id
+                  WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))''')
+            redirects = {source: target for source, target in connection.execute('''
+              SELECT p.title,r.title FROM dump_redirect r JOIN dump_page p ON p.id=r.page_id
+              WHERE p.ns=0 AND p.redirect=1 AND r.ns=0 AND COALESCE(r.interwiki,'')='' ''')}
+            parents = {}
+            for child, parent in connection.execute('''SELECT p.title,COALESCE(t.title,c.title)
+              FROM dump_category c JOIN dump_page p ON p.id=c.source_id
+              LEFT JOIN dump_target t ON t.id=c.target_id
+              WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL)
+              AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id
+                  WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))'''):
+                parents.setdefault(child, []).append(parent)
+            pages.prepare_export()
+            phase_counts(rows=expected)
         updated = [_history_timestamp(manifest['files'][table].get('job_updated'))
                    for table in SQL_TABLES]
         start = manifest['sql_release'][:4] + '-' + manifest['sql_release'][4:6] + '-' + manifest['sql_release'][6:] + 'T00:00:00+00:00'
@@ -812,7 +846,9 @@ def import_graph(manifest_path, output, work_dir):
                              'item_mapping': {'source': 'page_props.wikibase_item', 'complete': True},
                              'dump_manifest': str(Path(manifest_path).resolve())},
                'pages': [], 'redirects': redirects, 'category_parents': parents}
-        write_json(output, raw, arrays={'pages': pages.export_pages()})
+        with operational_span('export.graph_json', rows=expected) as span:
+            write_json(output, raw, arrays={'pages': pages.export_pages()})
+            span['bytes'] = output.stat().st_size
         if len(pages) != expected:
             raise ValueError('Popolazione del dump cambiata durante l’esportazione')
     print(f'Grafo da dump: {expected:,} voci; {output}', flush=True)
@@ -859,6 +895,7 @@ def _history_rows(path, database):
             yield fields
 
 
+@operational_phase('history.scan')
 def _history_scan(connection, name, path, digest, phase, database, page_ids, user_ids=None,
                   *, commit_rows=250_000):
     """Scan the entire partition, bounding buffers and exact duplicate evidence.
@@ -872,13 +909,16 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
     """
     if type(commit_rows) is not int or not 1 <= commit_rows <= 10_000_000:
         raise ValueError('Commit History: usare da 1 a 10000000 record')
+    phase_counts(phase=phase, database=database, partition=name)
     previous = connection.execute('SELECT sha256 FROM history_imported WHERE file=? AND phase=?',
                                   (name, phase)).fetchone()
     identity = digest + ':' + HISTORY_RULE if phase == 'initial' else digest + ':' + hashlib.sha256(
         json.dumps(sorted(user_ids or ())).encode()).hexdigest()
     if previous and previous[0] == identity:
+        phase_counts(reason='verified_reuse', rows=0, bytes=0)
         print(f'MediaWiki History {database}: {name} {phase}, SALTA checkpoint completo', flush=True)
         return
+    phase_counts(reason='source_mismatch' if previous else 'missing_checkpoint')
     print(f'MediaWiki History {database}: {name} {phase}, INIZIO preparazione staging', flush=True)
     table = 'history_initial' if phase == 'initial' else 'history_edit'
     connection.execute(f'DELETE FROM {table} WHERE file=?', (name,))
@@ -1022,6 +1062,8 @@ def _history_scan(connection, name, path, digest, phase, database, page_ids, use
         sqlite_seconds += time.monotonic() - before
         progress(done=True)
     finally:
+        phase_counts(rows=scanned, retained_rows=count, creation_rows=creation_rows,
+                     sqlite_seconds=sqlite_seconds, commits=commits, cache_hits=cache_hits)
         if creation_scratch:
             connection.execute('DROP TABLE IF EXISTS history_creation_pending')
             connection.execute('DROP TABLE IF EXISTS history_creation_ordered')
@@ -1102,6 +1144,7 @@ def _history_records(connection, page_ids, database):
     return records
 
 
+@operational_phase('history')
 def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_rows=250_000):
     """Keep reconstructed creator evidence separate from the SQL graph."""
     from ._native import history_activity
@@ -1112,6 +1155,7 @@ def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_row
         raise ValueError('Commit History: usare da 1 a 10000000 record')
     manifest = json.loads(Path(manifest_path).read_text())
     language = manifest['language']
+    phase_counts(language=language)
     database = wiki_database(language, manifest.get('database'))
     stage_path = Path(work_dir) / f'{database}-{manifest["sql_release"]}.sqlite'
     if not stage_path.exists():
@@ -1145,7 +1189,8 @@ def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_row
             _history_scan(connection, name, path, data['sha256_local'], 'initial',
                           database, page_ids, commit_rows=commit_rows)
         print(f'MediaWiki History {database}: ricostruzione creazione e attribuzione autori', flush=True)
-        records = _history_records(connection, page_ids, database)
+        with operational_span('history.attribution', rows=len(page_ids)):
+            records = _history_records(connection, page_ids, database)
         snapshot = (_history_timestamp(manifest['files'].get('user_groups', {}).get('job_updated')) or
                     datetime.strptime(manifest['sql_release'], '%Y%m%d').replace(tzinfo=timezone.utc).isoformat())
         for record in records:
@@ -1174,52 +1219,54 @@ def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_row
             _history_scan(connection, name, Path(data['path']), data['sha256_local'],
                           'activity', database, page_ids, user_ids, commit_rows=commit_rows)
         print(f'MediaWiki History {database}: indicizzazione attività autori', flush=True)
-        connection.execute('CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)')
+        with operational_span('history.index'):
+            connection.execute('CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)')
         print(f'MediaWiki History {database}: calcolo misure autori', flush=True)
-        by_user = {}
-        for record in records:
-            if record['creator_user_id'] is not None:
-                by_user.setdefault(record['creator_user_id'], []).append(record)
-        previous = None
-        edits = []
-        finished_users = set()
-        def finish(user, history):
-            if user is None:
-                return
-            finished_users.add(user)
-            group = [r for r in by_user[user] if r['page_created_at']]
-            for record in by_user[user]:
-                if not record['page_created_at']:
-                    record['creator_history_status'] = 'observed_surviving_history'
-            try:
-                summary = history_activity(history, [r['page_created_at'].replace('T', ' ').removesuffix('+00:00')
-                                                     for r in group])
-            except ValueError:
+        with operational_span('history.metrics', rows=len(records)):
+            by_user = {}
+            for record in records:
+                if record['creator_user_id'] is not None:
+                    by_user.setdefault(record['creator_user_id'], []).append(record)
+            previous = None
+            edits = []
+            finished_users = set()
+            def finish(user, history):
+                if user is None:
+                    return
+                finished_users.add(user)
+                group = [r for r in by_user[user] if r['page_created_at']]
+                for record in by_user[user]:
+                    if not record['page_created_at']:
+                        record['creator_history_status'] = 'observed_surviving_history'
+                try:
+                    summary = history_activity(history, [r['page_created_at'].replace('T', ' ').removesuffix('+00:00')
+                                                         for r in group])
+                except ValueError:
+                    for record in group:
+                        record['creator_history_status'] = 'invalid_history_timestamp'
+                    return
+                for record, (main, other, months, bucket) in zip(group, summary):
+                    record.update(creator_prior_edits_main_history=main,
+                                  creator_prior_edits_other_history=other,
+                                  creator_continuity_months_before_creation=months,
+                                  creator_continuity_bucket_before_creation=bucket,
+                                  creator_history_status='observed_surviving_history')
+            for user, timestamp, namespace in connection.execute(
+                    'SELECT user_id,at,namespace FROM history_edit ORDER BY user_id,at'):
+                if previous is not None and user != previous:
+                    finish(previous, edits)
+                    edits = []
+                previous = user
+                edits.append((timestamp, namespace))
+            finish(previous, edits)
+            for user in user_ids - finished_users:
+                finish(user, [])
+            for group in by_user.values():
+                dates = sorted(r['page_created_at'] for r in group
+                               if r['page_created_at'] and r['creator_history_status'] == 'observed_surviving_history')
                 for record in group:
-                    record['creator_history_status'] = 'invalid_history_timestamp'
-                return
-            for record, (main, other, months, bucket) in zip(group, summary):
-                record.update(creator_prior_edits_main_history=main,
-                              creator_prior_edits_other_history=other,
-                              creator_continuity_months_before_creation=months,
-                              creator_continuity_bucket_before_creation=bucket,
-                              creator_history_status='observed_surviving_history')
-        for user, timestamp, namespace in connection.execute(
-                'SELECT user_id,at,namespace FROM history_edit ORDER BY user_id,at'):
-            if previous is not None and user != previous:
-                finish(previous, edits)
-                edits = []
-            previous = user
-            edits.append((timestamp, namespace))
-        finish(previous, edits)
-        for user in user_ids - finished_users:
-            finish(user, [])
-        for group in by_user.values():
-            dates = sorted(r['page_created_at'] for r in group
-                           if r['page_created_at'] and r['creator_history_status'] == 'observed_surviving_history')
-            for record in group:
-                if record['page_created_at'] and record['creator_history_status'] == 'observed_surviving_history':
-                    record['creator_prior_articles'] = bisect.bisect_left(dates, record['page_created_at'])
+                    if record['page_created_at'] and record['creator_history_status'] == 'observed_surviving_history':
+                        record['creator_prior_articles'] = bisect.bisect_left(dates, record['page_created_at'])
         metadata = {'language': language, 'database': database,
                     'creation_rule': HISTORY_RULE, 'creator_metrics_rule': HISTORY_RULE,
                     'account_type_snapshot_at': snapshot,
@@ -1232,7 +1279,9 @@ def import_history(manifest_path, output, work_dir, *, cache_mib=256, commit_row
                     'continuity_rule': 'consecutive completed precreation calendar months with at least five edits; Vital Signs stability adaptation',
                     'group_scope': 'nonempty reconstructed historical group list at first revision; blank means unknown',
                     'history_files': {name: data['sha256_local'] for name, data in files}}
-        write_json(output, {'metadata': metadata, 'pages': []}, arrays={'pages': records})
+        with operational_span('history.export', rows=len(records)) as span:
+            write_json(output, {'metadata': metadata, 'pages': []}, arrays={'pages': records})
+            span['bytes'] = output.stat().st_size
     print(f'Cronologia da dump: {len(records):,} voci; {output}', flush=True)
     return len(records)
 
@@ -1308,6 +1357,7 @@ def _read_first_metadata(path):
         events.close()
 
 
+@operational_phase('analysis.join_history')
 def _history_stage(path, connection, graph_metadata, expected_count):
     """Validate and index a complete supplement without materializing it."""
     from .core import iter_export_sections
@@ -1360,6 +1410,7 @@ def _history_stage(path, connection, graph_metadata, expected_count):
             'unmatched_pages': expected_count - matched, 'input_sha256': digest.hexdigest()}
 
 
+@operational_phase('analysis.join_quality')
 def _quality_stage(path, connection, graph_metadata, expected_count, raw_checksum=None):
     from .core import iter_export_sections, quality_metadata
     metadata = quality_metadata(_read_first_metadata(path), graph_metadata, expected_count, raw_checksum)
@@ -1409,6 +1460,7 @@ def _quality_stage(path, connection, graph_metadata, expected_count, raw_checksu
     return {**metadata, 'input_sha256': digest.hexdigest()}
 
 
+@operational_phase('refresh.measures')
 def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
     """Refresh approved observations, retaining exact degrees, topics and edges.
 
@@ -1517,6 +1569,7 @@ def refresh_measures(raw_path, history_path, data_dir, quality_path=None):
     return name
 
 
+@operational_phase('analysis.join_topics')
 def _topic_stage(path, connection, graph_metadata, expected_count, raw_checksum):
     """Index a complete, exact-graph topic checkpoint without loading it in RAM."""
     from .core import iter_export_sections
@@ -1569,6 +1622,7 @@ def _topic_stage(path, connection, graph_metadata, expected_count, raw_checksum)
     return {**metadata, 'status': 'predicted', 'input_checksum_verified': True}
 
 
+@operational_phase('topics.sql')
 def predict_imported_topics(raw_path, output, model, spec, batch_size=256, deadline=None, work_dir=None):
     """Infer all SQL-dump topics from indexed outlinks, with bounded edge batches.
 
@@ -1586,6 +1640,7 @@ def predict_imported_topics(raw_path, output, model, spec, batch_size=256, deadl
         raise ValueError('Dimensione del blocco non valida')
     metadata = _read_first_metadata(raw_path)
     language = metadata.get('language')
+    phase_counts(language=language)
     database = wiki_database(language, metadata.get('database'))
     if (metadata.get('complete') is not True
             or metadata.get('item_mapping') != {'source': 'page_props.wikibase_item', 'complete': True}
@@ -1664,8 +1719,9 @@ def predict_imported_topics(raw_path, output, model, spec, batch_size=256, deadl
                     eligible = [position for position, (tokens, _, _) in enumerate(results) if tokens]
                     selected = []
                     if eligible:
-                        predicted, probabilities = model.predict(
-                            [results[position][0] for position in eligible], k=-1, threshold=0.0)
+                        with operational_span('model.predict', rows=len(eligible)):
+                            predicted, probabilities = model.predict(
+                                [results[position][0] for position in eligible], k=-1, threshold=0.0)
                         if len(predicted) != len(eligible) or len(probabilities) != len(eligible):
                             raise ValueError('Risposta del modello incompleta')
                         selected = threshold_topics(labels, [list(row) for row in predicted],
@@ -1716,6 +1772,7 @@ def predict_imported_topics(raw_path, output, model, spec, batch_size=256, deadl
             return topic_metadata
 
 
+@operational_phase('analysis.sql')
 def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, topic_path=None,
                           comparison_connection=None, quality_path=None):
     """Analyze a complete imported SQL edition with bounded Python/Rust batches.
@@ -1734,6 +1791,7 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
     raw_path, output = Path(raw_path), Path(output)
     graph_meta = _read_first_metadata(raw_path)
     language = graph_meta.get('language')
+    phase_counts(language=language)
     database = wiki_database(language, graph_meta.get('database'))
     if (graph_meta.get('complete') is not True
             or graph_meta.get('source') != 'Wikimedia SQL dumps / ' + database
@@ -1781,28 +1839,29 @@ def analyze_imported_dump(raw_path, history_path, output, rules, work_dir=None, 
         del eligible
         categories = CategoryBatchClassifier(expected, parents, native_rules(rules))
         del titles, redirects, parents
-        position = 0
-        for batch in _stage_page_batches(source, 512, include_links=True):
-            ids = [page_id for page_id, _, _, _ in batch]
-            if ids != identifiers[position:position + len(ids)]:
-                raise ValueError('Staging con ordine o identificativi delle pagine diversi dal dump')
-            links = [targets for _, _, targets, _ in batch]
-            if comparison_connection is None:
-                graph.add_batch(links)
-            else:
-                edges = graph.add_batch_edges(links)
-                with comparison_connection:
-                    comparison_connection.executemany('INSERT INTO edges VALUES(?,?,?)',
-                        ((language, identifiers[target], identifiers[origin])
-                         for target, origin in edges))
-            categories.add_support_batch([labels for _, _, _, labels in batch])
-            position += len(batch)
-            if position % 100000 < len(batch):
-                print(f'Analisi SQL {language}: {position:,}/{expected:,} voci e collegamenti', flush=True)
-        incoming, outgoing, unresolved = graph.finish()
-        del graph
-        if position != expected:
-            raise ValueError('Analisi SQL non completa')
+        with operational_span('analysis.graph', language=language, rows=expected):
+            position = 0
+            for batch in _stage_page_batches(source, 512, include_links=True):
+                ids = [page_id for page_id, _, _, _ in batch]
+                if ids != identifiers[position:position + len(ids)]:
+                    raise ValueError('Staging con ordine o identificativi delle pagine diversi dal dump')
+                links = [targets for _, _, targets, _ in batch]
+                if comparison_connection is None:
+                    graph.add_batch(links)
+                else:
+                    edges = graph.add_batch_edges(links)
+                    with comparison_connection:
+                        comparison_connection.executemany('INSERT INTO edges VALUES(?,?,?)',
+                            ((language, identifiers[target], identifiers[origin])
+                             for target, origin in edges))
+                categories.add_support_batch([labels for _, _, _, labels in batch])
+                position += len(batch)
+                if position % 100000 < len(batch):
+                    print(f'Analisi SQL {language}: {position:,}/{expected:,} voci e collegamenti', flush=True)
+            incoming, outgoing, unresolved = graph.finish()
+            del graph
+            if position != expected:
+                raise ValueError('Analisi SQL non completa')
         print(f'Grafo SQL {language} completo; preparazione della cronologia e degli export', flush=True)
 
         output.parent.mkdir(parents=True, exist_ok=True)
