@@ -1,7 +1,8 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    aggregate_index, comparison_filename, export_csv, prepare_dashboard_exports, rebuild_dashboard,
-    write_aggregate_summary, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
+    aggregate_index, comparison_filename, export_csv, prepare_dashboard_exports,
+    publish_available_aggregate, rebuild_dashboard, write_aggregate_summary, ARTICLE_INDEX_COLUMNS,
+    CSV_COLUMNS, OBSERVATION_COLUMNS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1111,4 +1112,78 @@ fn comparison_names_keep_utf8_float_identity_and_every_reference_source() {
         comparison_filename("vec", &metadata, &languages).unwrap(),
         "vec-demo.json"
     );
+}
+
+#[test]
+fn available_aggregates_label_partial_comparison_reuse_verified_summaries_and_repair_stale_members()
+{
+    let w = Workspace::new();
+    let mut manifest = Vec::new();
+    for language in ["vec", "lmo"] {
+        let metadata = json!({"language":language,"database":format!("{language}wiki"),"source":format!("Wikimedia SQL dumps / {language}wiki"),"complete":true,"sql_release":"20261001","dump_manifest_sha256":"a".repeat(64),"started_at":"2026-10-01T00:00:00Z","finished_at":"2026-10-02T00:00:00Z","measures_rule":"creation_quality_creators_v3"});
+        let source = w.0.join(format!("{language}.json"));
+        fs::write(&source,format!("{{\"metadata\":{metadata},\"pages\":[{{\"page_id\":1,\"title\":\"Same\",\"orphan\":true}},{{\"page_id\":2,\"title\":\"ß\",\"orphan\":false}}]}}")).unwrap();
+        let prepared = w.0.join(format!("prepare-{language}"));
+        let names = prepare_dashboard_exports(&source, &prepared, None, None).unwrap();
+        for name in names.as_object().unwrap().values() {
+            let name = name.as_str().unwrap();
+            fs::rename(prepared.join(name), w.0.join(name)).unwrap();
+        }
+        fs::remove_dir(prepared).unwrap();
+        let mut entry = json!({"file":format!("{language}.json"),"language":language,"kind":"wiki","date":metadata["finished_at"]});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(names.as_object().unwrap().clone());
+        manifest.push(entry);
+    }
+    fs::write(w.0.join("manifest.json"), json!(manifest).to_string()).unwrap();
+    let before = snapshot(&w.0);
+    let index = publish_available_aggregate(&w.0).unwrap().unwrap();
+    assert_eq!(index["metadata"]["comparison_coverage"], "partial");
+    let first = read_json(w.0.join("manifest.json"));
+    assert_eq!(first.as_array().unwrap().len(), 3);
+    let aggregate = first.as_array().unwrap().last().unwrap();
+    let summary_name = aggregate["summary_file"].clone();
+    let creators_name = aggregate["creator_index_file"].clone();
+    let summary = read_json(w.0.join(summary_name.as_str().unwrap()));
+    assert_eq!(summary["census_page_count"], 4);
+    assert_eq!(summary["reports"]["overview"]["orphans"], 2);
+    assert_eq!(summary["metadata"]["comparison_coverage"], "partial");
+    for (path, bytes) in &before {
+        if path != "manifest.json" {
+            assert_eq!(fs::read(w.0.join(path)).unwrap(), *bytes);
+        }
+    }
+    publish_available_aggregate(&w.0).unwrap();
+    let reused = read_json(w.0.join("manifest.json"));
+    assert_eq!(
+        reused.as_array().unwrap().last().unwrap()["summary_file"],
+        summary_name
+    );
+    assert_eq!(
+        reused.as_array().unwrap().last().unwrap()["creator_index_file"],
+        creators_name
+    );
+    let old_summary = first[0]["summary_file"].as_str().unwrap();
+    let mut stale = read_json(w.0.join(old_summary));
+    stale["sources"][0]["size"] = json!(0);
+    fs::write(w.0.join(old_summary), stale.to_string()).unwrap();
+    publish_available_aggregate(&w.0).unwrap();
+    let repaired = read_json(w.0.join("manifest.json"));
+    assert_ne!(repaired[0]["summary_file"], first[0]["summary_file"]);
+    assert_eq!(
+        repaired.as_array().unwrap().last().unwrap()["summary_file"],
+        summary_name
+    );
+    let repaired_summary = read_json(w.0.join(repaired[0]["summary_file"].as_str().unwrap()));
+    assert!(repaired_summary["sources"][0]["size"].as_u64().unwrap() > 0);
+    assert!(w.0.join(old_summary).is_file());
+    let approved = fs::read(w.0.join("manifest.json")).unwrap();
+    let source = w.0.join("vec.json");
+    let mut bad = read_json(&source);
+    bad["metadata"]["source"] = json!("Unapproved enrichment");
+    fs::write(source, bad.to_string()).unwrap();
+    assert!(publish_available_aggregate(&w.0).is_err());
+    assert_eq!(fs::read(w.0.join("manifest.json")).unwrap(), approved);
 }

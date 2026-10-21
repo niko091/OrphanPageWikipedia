@@ -1,4 +1,4 @@
-//! Standalone command contracts. Each backend stage is enabled as it is ported.
+//! Standalone dump workflow with validated arguments and native execution.
 #![forbid(unsafe_code)]
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::path::{Path, PathBuf};
@@ -204,6 +204,77 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "compare" {
+            let mut paths = if let Some(inputs) = self.args.get_many::<String>("inputs") {
+                inputs.map(|p| self.root.join(p)).collect::<Vec<_>>()
+            } else {
+                std::fs::read_dir(self.path("input-dir")?)
+                    .map_err(|e| e.to_string())?
+                    .map(|entry| entry.map(|e| e.path()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|p| {
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.ends_with("-raw.json"))
+                    })
+                    .collect()
+            };
+            paths.sort();
+            if paths.is_empty() {
+                return Err("Nessuna raccolta completa *-raw.json nella cartella dati".into());
+            }
+            let allowed = self
+                .editions
+                .iter()
+                .map(|(code, _)| code.clone())
+                .collect::<Vec<_>>();
+            let output = self.path("output-dir")?;
+            let (paths, published) =
+                _native::dumps::comparison_collections(&paths, &output, &allowed)
+                    .map_err(|e| e.to_string())?;
+            let work = self
+                .args
+                .get_one::<String>("work-dir")
+                .map(|p| self.root.join(p))
+                .unwrap_or_else(|| paths[0].parent().unwrap_or(&self.root).join("staging"));
+            let files = |name: &str| {
+                self.args
+                    .get_many::<String>(name)
+                    .map(|values| values.map(|p| self.root.join(p)).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            };
+            let topics = files("topics");
+            let histories = files("histories");
+            let qualities = files("qualities");
+            let rules: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(self.path("rules")?).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let connection = _native::dumps::compare_files(
+                &paths,
+                &_native::dumps::ComparisonOptions {
+                    rules: &rules,
+                    work_dir: &work,
+                    topics: &topics,
+                    histories: &histories,
+                    qualities: &qualities,
+                    allowed_languages: Some(&allowed),
+                    published: Some(&published),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let index = _native::dumps::publish_comparison(&connection, &output)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Confronto pubblicato: {} edizioni; {}",
+                index["members"].as_array().map_or(0, Vec::len),
+                output.display()
+            );
+            return Ok(());
+        }
         if self.name == "analyze" {
             let raw = self.path("input")?;
             let metadata = _native::dumps::first_metadata(&raw).map_err(|e| e.to_string())?;
@@ -411,7 +482,7 @@ impl Invocation {
             }
             return Ok(());
         }
-        Err(format!("Il backend Rust del comando {} non è ancora migrato; usare il percorso Python verificato. Nessun output pubblicato.", self.name))
+        Err(format!("Comando non riconosciuto: {}", self.name))
     }
 }
 

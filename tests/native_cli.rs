@@ -241,3 +241,127 @@ fn standalone_analysis_publishes_every_output_and_preserves_previous_generations
         .to_string_lossy()
         .starts_with("orphanwiki-export-")));
 }
+
+#[test]
+fn standalone_compare_publishes_all_members_and_retains_every_previous_generation() {
+    use serde_json::{json, Value};
+    let w = Workspace::new();
+    fs::create_dir(w.0.join("config")).unwrap();
+    fs::write(
+        w.0.join("config/languages.json"),
+        r#"{"version":1,"languages":["vec","lmo","fr"]}"#,
+    )
+    .unwrap();
+    fs::write(w.0.join("rules.json"), "{}").unwrap();
+    let graph = |language: &str, links: &[(usize, usize)]| {
+        let meta = json!({"language":language,"database":format!("{language}wiki"),"source":format!("Wikimedia SQL dumps / {language}wiki"),"complete":true,"started_at":"2026-10-01T00:00:00Z","finished_at":"2026-10-02T00:00:00Z","sql_release":"20261001","dump_manifest_sha256":"a".repeat(64),"item_mapping":{"source":"page_props.wikibase_item","complete":true}});
+        let pages=(1..=6).map(|id|json!({"page_id":id,"title":format!("{language}-{id}"),"wikibase_item":format!("Q{id}"),"links":links.iter().filter(|(s,_)|*s==id).map(|(_,t)|format!("{language}-{t}")).collect::<Vec<_>>()})).collect::<Vec<_>>();
+        fs::write(
+            w.0.join(format!("{language}-raw.json")),
+            format!("{{\"metadata\":{meta},\"pages\":{}}}", json!(pages)),
+        )
+        .unwrap();
+    };
+    graph("vec", &[(2, 4)]);
+    graph("lmo", &[(2, 1)]);
+    graph("fr", &[(2, 1)]);
+    let run = |inputs: &[&str]| {
+        let mut args = vec![
+            "compare",
+            "--rules",
+            "rules.json",
+            "--work-dir",
+            "work",
+            "--output-dir",
+            "exports",
+        ];
+        args.extend(inputs);
+        let result = w.run(&args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let read =
+        |path: PathBuf| -> Value { serde_json::from_slice(&fs::read(path).unwrap()).unwrap() };
+    run(&["vec-raw.json", "lmo-raw.json"]);
+    let original = read(w.0.join("exports/manifest.json"));
+    assert_eq!(original.as_array().unwrap().len(), 4);
+    let old = original
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let p = w.0.join("exports").join(e["file"].as_str().unwrap());
+            let b = fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect::<Vec<_>>();
+    run(&["fr-raw.json"]);
+    let expanded = read(w.0.join("exports/manifest.json"));
+    assert_eq!(expanded.as_array().unwrap().len(), 9);
+    let vec = expanded
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["language"] == "vec")
+        .unwrap();
+    let result = read(w.0.join("exports").join(vec["file"].as_str().unwrap()));
+    assert_eq!(result["link_candidates"]["1"]["candidate_count"], 1);
+    assert_eq!(
+        result["link_candidates"]["1"]["candidates"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let aggregate = expanded
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "aggregate")
+        .unwrap();
+    let summary = read(
+        w.0.join("exports")
+            .join(aggregate["summary_file"].as_str().unwrap()),
+    );
+    assert_eq!(summary["census_page_count"], 18);
+    assert_eq!(
+        summary["metadata"]["languages"],
+        json!(["fr", "lmo", "vec"])
+    );
+    let checkpoint = fs::read(w.0.join("work/comparison-cache/manifest.json")).unwrap();
+    run(&["fr-raw.json"]);
+    assert_eq!(
+        fs::read(w.0.join("work/comparison-cache/manifest.json")).unwrap(),
+        checkpoint
+    );
+    let next = read(w.0.join("exports/manifest.json"));
+    assert_eq!(next.as_array().unwrap().len(), 9);
+    for (path, bytes) in old {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    for entry in next
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] != "aggregate")
+    {
+        let canonical = w.0.join("exports").join(entry["file"].as_str().unwrap());
+        let info = fs::metadata(&canonical).unwrap();
+        let mtime = info
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        for key in ["summary_file", "creator_index_file"] {
+            let report = read(w.0.join("exports").join(entry[key].as_str().unwrap()));
+            assert_eq!(report["sources"][0]["mtime_ns"], mtime);
+            assert_eq!(report["sources"][0]["size"], info.len());
+        }
+    }
+}
