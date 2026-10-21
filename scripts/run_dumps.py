@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import threading
@@ -370,7 +371,7 @@ def log_line(log, message):
     log.flush()
 
 
-def linux_resources(pid):
+def linux_resources(pid, include_root_memory=True):
     """Read live tree RSS (shared pages may repeat), swap and host pressure.
 
     Missing /proc data stays null. Short-lived processes and between-sample
@@ -386,9 +387,9 @@ def linux_resources(pid):
         root = Path('/proc') / str(current)
         try:
             status = dict(line.split(':', 1) for line in (root / 'status').read_text().splitlines())
-            if 'VmRSS' in status:
+            if 'VmRSS' in status and (include_root_memory or current != pid):
                 rss.append(int(status['VmRSS'].split()[0]) * 1024)
-            if 'VmSwap' in status:
+            if 'VmSwap' in status and (include_root_memory or current != pid):
                 swap.append(int(status['VmSwap'].split()[0]) * 1024)
             fields = (root / 'stat').read_text().rsplit(')', 1)[1].split()
             # Own CPU plus waited-for descendants; still-live descendants are
@@ -433,8 +434,9 @@ def linux_resources(pid):
 class PipelineBenchmark:
     """Local operational measurements, separate from all research exports."""
 
-    def __init__(self, log, path, args):
+    def __init__(self, log, path, args, include_controller_memory=True):
         self.log, self.path, self.args = log, path, args
+        self.include_controller_memory = include_controller_memory
         self.events = path.with_suffix('.metrics.jsonl').open('x', encoding='utf-8', buffering=1)
         self.lock, self.stop = threading.Lock(), threading.Event()
         self.started = time.monotonic()
@@ -559,7 +561,9 @@ class PipelineBenchmark:
                          'measurement': {'interval_seconds': self.args.metrics_interval,
                              'spans_file': None if self.args.no_phase_spans else self.spans_path.name,
                              'spans': 'inclusive monotonic intervals; subtract child interval unions for exclusive time; abrupt ends are detection bounds',
-                             'rss': 'sampled sum of controller and live descendants; shared pages may repeat; not PSS',
+                             'rss': ('sampled sum of controller and live descendants' if self.include_controller_memory
+                                     else 'sampled sum of live descendants only; benchmark controller excluded')
+                                    + '; shared pages may repeat; not PSS',
                              'cpu': 'getrusage children deltas per completed step; 100 percent = one core',
                              'io': 'controller plus reaped descendants; physical storage bytes, excludes network and cache hits',
                              'host': 'load, pressure and available memory include unrelated workloads; cgroup files are mount-root limits'}}
@@ -570,7 +574,7 @@ class PipelineBenchmark:
     def sample(self):
         with self.lock:
             active = self.active
-        values = linux_resources(os.getpid())
+        values = linux_resources(os.getpid(), include_root_memory=self.include_controller_memory)
         now, cpu = time.monotonic(), values['tree_cpu_seconds']
         percent = None
         if self.last_cpu_sample is not None and cpu is not None:
@@ -655,19 +659,19 @@ class PipelineBenchmark:
             self.events.close()
 
 
-def run_step(log, name, command, benchmark=None):
+def run_step(log, name, command, benchmark=None, cwd=None):
     from orphanwiki.core import operational_span
     with operational_span('pipeline.step', step=name) as phase:
-        _run_step(log, name, command, benchmark, phase)
+        _run_step(log, name, command, benchmark, phase, cwd)
 
 
-def _run_step(log, name, command, benchmark, phase):
+def _run_step(log, name, command, benchmark, phase, cwd=None):
     from orphanwiki.core import operational_environment
     log_line(log, f'INIZIO {name}: {shlex.join(str(value) for value in command)}')
     baseline = benchmark.begin_step(name, command, phase) if benchmark else None
     process = None
     try:
-        process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+        process = subprocess.Popen(command, cwd=cwd or PROJECT_ROOT, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, bufsize=1,
                                    env={**operational_environment(), 'PYTHONUNBUFFERED': '1'})
         for line in process.stdout:
@@ -703,6 +707,258 @@ def require_file(path, description):
 
 def interrupt_for_shutdown(_signum, _frame):
     raise InterruptedError('SIGTERM')
+
+
+def benchmark_outputs(folder, outputs):
+    """Fingerprint complete canonical records; ignore only named operational metadata."""
+    from orphanwiki.core import iter_export_sections, _json_chunks
+
+    def local(name):
+        if not isinstance(name, str) or not name or Path(name).is_absolute() or '..' in Path(name).parts:
+            raise ValueError('Percorso di output benchmark non valido')
+        path = (folder / name).resolve()
+        if not path.is_relative_to(folder.resolve()):
+            raise ValueError('Output benchmark esterno alla prova')
+        return path
+
+    def canonical(path, language=None):
+        digest = hashlib.sha256()
+        counts = dict(pages=0, targets=0, candidates=0, reference_edges=0)
+        with closing(iter_export_sections(path)) as records:
+            for section, identifier, value in records:
+                if section == 'metadata':
+                    if value.get('complete') is not True or not isinstance(value.get('language'), str):
+                        raise ValueError('Il benchmark richiede un censimento completo')
+                    if language is not None and value['language'] != language:
+                        raise ValueError('Lingua del manifest benchmark non corrispondente')
+                    value = dict(value)
+                    for key in ('engine', 'dump_manifest'):
+                        value.pop(key, None)
+                    # Topic inference timestamps describe execution, whereas the
+                    # top-level census interval and graph_finished_at are scientific.
+                    if value.get('source') in ('local_model_on_synthetic_outlinks',
+                                               'local_model_on_verified_SQL_dump_outlinks'):
+                        for key in ('started_at', 'finished_at', 'timing'):
+                            value.pop(key, None)
+                    if isinstance(value.get('topics'), dict):
+                        value['topics'] = {key: item for key, item in value['topics'].items()
+                                           if key not in ('started_at', 'finished_at', 'timing')}
+                elif section == 'pages':
+                    counts['pages'] += 1
+                else:
+                    counts['targets'] += 1
+                    candidates = value.get('candidates', [])
+                    counts['candidates'] += len(candidates)
+                    counts['reference_edges'] += sum(len(candidate.get('evidence', [])) for candidate in candidates)
+                for chunk in _json_chunks([section, identifier, value], ensure_ascii=True, sort_keys=True):
+                    digest.update(chunk.encode('utf-8'))
+                digest.update(b'\n')
+        if not counts['pages']:
+            raise ValueError('Output benchmark senza voci')
+        return {'sha256': digest.hexdigest(), **counts}
+
+    result = {}
+    for output in outputs:
+        name, kind = output['path'], output['kind']
+        path = local(name)
+        if kind == 'manifest':
+            entries = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                raise ValueError('Manifest benchmark non valido')
+            members = [entry for entry in entries if entry.get('kind', 'wiki') == 'wiki']
+            if not members or len({entry['language'] for entry in members}) != len(members):
+                raise ValueError('Serve esattamente un export per lingua nel benchmark')
+            for entry in members:
+                filename = entry['file']
+                if not isinstance(filename, str) or Path(filename).name != filename:
+                    raise ValueError('Nome export benchmark non valido')
+                result[f'{name}:{entry["language"]}'] = canonical(local(str(Path(name).parent / filename)), entry['language'])
+        elif kind == 'canonical':
+            result[name] = canonical(path)
+        elif kind == 'bytes':
+            result[name] = {'sha256': checksum(path), 'bytes': path.stat().st_size}
+        else:
+            raise ValueError('Tipo di output benchmark non valido')
+    return result
+
+
+def benchmark_summary(samples, min_speedup, max_rss_ratio):
+    """Paired comparisons keep warmups and missing measurements out of claims."""
+    trials = {}
+    for sample in samples:
+        if not sample['warmup']:
+            trials.setdefault(sample['pair'], {})[sample['variant']] = sample
+    if len(trials) < 3 or any(set(pair) != {'baseline', 'candidate'} for pair in trials.values()):
+        raise ValueError('Servono almeno tre coppie complete di misure')
+
+    def distribution(values):
+        if any(value is None for value in values):
+            return None
+        return {'median': statistics.median(values), 'min': min(values), 'max': max(values)}
+
+    metrics = {}
+    for metric in ('wall_seconds', 'cpu_seconds', 'sampled_peak_tree_rss_bytes'):
+        before = [pair['baseline'][metric] for pair in trials.values()]
+        after = [pair['candidate'][metric] for pair in trials.values()]
+        ratios = [b / a if a is not None and a > 0 and b is not None else None
+                  for a, b in zip(before, after)]
+        metrics[metric] = {'baseline': distribution(before), 'candidate': distribution(after),
+                           'candidate_over_baseline': distribution(ratios)}
+    speedups = [pair['baseline']['wall_seconds'] / pair['candidate']['wall_seconds']
+                for pair in trials.values()]
+    speedup = distribution(speedups)
+    memory = metrics['sampled_peak_tree_rss_bytes']['candidate_over_baseline']
+    if speedup['median'] < min_speedup or (memory is not None and memory['max'] > max_rss_ratio):
+        status = 'no_improvement'
+    elif memory is None or speedup['min'] <= 1:
+        status = 'inconclusive'
+    else:
+        status = 'passed'
+    return {'status': status, 'metrics': metrics, 'paired_speedup': speedup,
+            'thresholds': {'minimum_median_speedup': min_speedup, 'maximum_paired_rss_ratio': max_rss_ratio,
+                           'every_pair_must_be_faster': True},
+            'interpretation': 'observed paired repetitions, not a statistical confidence interval'}
+
+
+def migration_benchmark(argv):
+    """Run both implementations against frozen inputs in independent work folders."""
+    from orphanwiki.core import write_json
+    parser = argparse.ArgumentParser(description='Benchmark ripetuto della migrazione, con parità completa degli output dichiarati')
+    parser.add_argument('--spec', required=True, help='Specifica JSON di input, comandi e output da confrontare')
+    parser.add_argument('--output-dir', required=True, help='Directory nuova per prove e report; usare benchmarks/')
+    parser.add_argument('--repetitions', type=int, default=5)
+    parser.add_argument('--warmups', type=int, default=1)
+    parser.add_argument('--metrics-interval', type=float, default=0.1)
+    parser.add_argument('--min-speedup', type=float, default=1.10)
+    parser.add_argument('--max-rss-ratio', type=float, default=1.10)
+    args = parser.parse_args(argv)
+    if args.repetitions < 3 or args.warmups < 0:
+        parser.error('Usare almeno 3 ripetizioni e un numero non negativo di warmup')
+    for key, minimum in (('metrics_interval', 0.1), ('min_speedup', 1.0), ('max_rss_ratio', 1.0)):
+        if not math.isfinite(getattr(args, key)) or getattr(args, key) < minimum:
+            parser.error(f'Valore non valido: {key}')
+    output = project_path(args.output_dir)
+    samples = []
+    report = {'format': 'migration_benchmark_v1', 'status': 'failed', 'samples': samples,
+              'arguments': vars(args), 'cache_policy': 'input verification and copies before timing; OS cache not flushed',
+              'timing_scope': 'sum of sequential commands, including startup; excludes copies, hashes and output validation'}
+    created = False
+    previous_handler = signal.signal(signal.SIGTERM, interrupt_for_shutdown)
+    try:
+        spec_path = project_path(args.spec)
+        spec = json.loads(spec_path.read_text(encoding='utf-8'))
+        if (spec.get('version') != 1 or not spec.get('inputs') or not spec.get('outputs') or
+                len({item['path'] for item in spec['outputs']}) != len(spec['outputs'])):
+            raise ValueError('Specifica benchmark incompleta o output duplicati')
+        for item in spec['outputs']:
+            path = Path(item['path'])
+            if (item['kind'] not in ('canonical', 'manifest', 'bytes') or path.is_absolute() or
+                    '..' in path.parts or str(path) == '.'):
+                raise ValueError('Output benchmark non valido')
+        expand = lambda value: value.replace('{repo}', str(PROJECT_ROOT))
+        inputs = [project_path(expand(path)) for path in spec['inputs']]
+        variants = {}
+        for name in ('baseline', 'candidate'):
+            variant = spec[name]
+            commands = variant['commands']
+            if (not isinstance(commands, list) or not commands or
+                    any(not isinstance(command, list) or not command or
+                        any(not isinstance(token, str) or not token for token in command) for command in commands)):
+                raise ValueError('I comandi devono essere liste di argomenti, senza shell')
+            cwd = project_path(expand(variant.get('cwd', '.')))
+            if not cwd.is_dir():
+                raise ValueError(f'Directory della variante mancante: {cwd}')
+            git = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=cwd, capture_output=True, text=True, check=False)
+            diff = subprocess.run(['git', 'diff', 'HEAD'], cwd=cwd, capture_output=True, check=False)
+            executables = {}
+            for command in commands:
+                executable = expand(command[0])
+                executable = (cwd / executable if '/' in executable else shutil.which(executable))
+                if not executable or not Path(executable).is_file():
+                    raise ValueError('Eseguibile benchmark mancante')
+                executables[str(executable)] = checksum(executable)
+            variants[name] = {'cwd': str(cwd), 'commands': commands,
+                              'git_revision': git.stdout.strip() if git.returncode == 0 else None,
+                              'tracked_diff_sha256': hashlib.sha256(diff.stdout).hexdigest() if diff.returncode == 0 else None,
+                              'executables_sha256': executables}
+        fingerprints = {str(path): checksum(path) for path in inputs}
+        if len(fingerprints) != len(inputs):
+            raise ValueError('Input benchmark duplicati')
+        frozen = dict(fingerprints)
+        for variant in variants.values():
+            frozen.update(variant['executables_sha256'])
+        for item in spec.get('copies', []):
+            if str(project_path(expand(item['source']))) not in fingerprints:
+                raise ValueError('Ogni copia deve provenire dagli input verificati')
+            target = Path(item['destination'])
+            if target.is_absolute() or '..' in target.parts or str(target) == '.':
+                raise ValueError('Destinazione copia benchmark non valida')
+        output.mkdir(parents=True, exist_ok=False)
+        created = True
+        report.update(spec=spec, spec_sha256=checksum(spec_path), inputs_sha256=fingerprints, variants=variants)
+        reference = None
+        for pair in range(args.warmups + args.repetitions):
+            warmup = pair < args.warmups
+            order = ('baseline', 'candidate') if pair % 2 == 0 else ('candidate', 'baseline')
+            for variant_name in order:
+                variant = variants[variant_name]
+                for path, digest in frozen.items():
+                    if checksum(path) != digest:
+                        raise ValueError(f'Input benchmark modificato: {path}')
+                run = output / f'{pair:02d}-{variant_name}'
+                work = run / 'work'
+                work.mkdir(parents=True)
+                for item in spec.get('copies', []):
+                    destination = work / item['destination']
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(project_path(expand(item['source'])), destination)
+                controls = argparse.Namespace(no_phase_spans=True, metrics_interval=args.metrics_interval,
+                    dump_root=str(work), import_dir=str(work), output_dir=str(work), work_dir=str(work),
+                    languages_file='config/languages.json', model_config='config/topics.json')
+                with (run / 'command.log').open('x', encoding='utf-8') as log:
+                    measured = PipelineBenchmark(log, run / 'run.benchmark.json', controls,
+                                                 include_controller_memory=False)
+                    status = 'failed'
+                    try:
+                        with measured.tracing():
+                            measured.start()
+                            for number, command in enumerate(variant['commands']):
+                                command = [expand(token).replace('{run}', str(work)) for token in command]
+                                run_step(log, f'command-{number}', command, measured, cwd=variant['cwd'])
+                        status = 'completed'
+                    finally:
+                        if hasattr(measured, 'metadata'):
+                            measured.finish(status)
+                        else:
+                            measured.events.close()
+                if measured.monitor_error is not None:
+                    raise ValueError(f'Monitoraggio benchmark fallito: {measured.monitor_error}')
+                sample = {'pair': pair, 'variant': variant_name, 'warmup': warmup,
+                          'wall_seconds': sum(step['wall_seconds'] for step in measured.steps),
+                          'cpu_seconds': sum(step['user_cpu_seconds'] + step['system_cpu_seconds'] for step in measured.steps),
+                          'sampled_peak_tree_rss_bytes': (max(step['sampled_peak_tree_rss_bytes'] for step in measured.steps)
+                              if all(step['sampled_peak_tree_rss_bytes'] is not None for step in measured.steps) else None),
+                          'report': str((run / 'run.benchmark.json').relative_to(output))}
+                samples.append(sample)
+                for path, digest in frozen.items():
+                    if checksum(path) != digest:
+                        raise ValueError(f'Input benchmark modificato: {path}')
+                sample['outputs'] = benchmark_outputs(work, spec['outputs'])
+                if reference is None:
+                    reference = sample['outputs']
+                if sample['outputs'] != reference:
+                    raise ValueError(f'Output differenti nella prova {pair}, variante {variant_name}')
+        report.update(benchmark_summary(samples, args.min_speedup, args.max_rss_ratio), correctness='matched')
+        return 0 if report['status'] == 'passed' else 2
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError, KeyboardInterrupt, InterruptedError) as error:
+        report.update(status='failed', error=f'{type(error).__name__}: {error}')
+        print(report['error'], file=sys.stderr)
+        return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+        if created:
+            write_json(output / 'comparison.json', report)
+            print(f'Benchmark {report["status"]}: {output / "comparison.json"}', flush=True)
 
 
 def run_pipeline(args, log, benchmark=None):
@@ -944,6 +1200,9 @@ def run_pipeline(args, log, benchmark=None):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == 'benchmark':
+        return migration_benchmark(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--languages-file', default='config/languages.json',
                         help='Unico elenco delle Wikipedie complete da elaborare')

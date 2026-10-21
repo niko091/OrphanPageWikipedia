@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -251,6 +252,188 @@ elif command == 'refresh-measures':
 
 
 class DumpPipelineTests(unittest.TestCase):
+    def test_migration_fingerprints_preserve_science_and_all_evidence(self):
+        fingerprint = runpy.run_path(str(SCRIPT))['benchmark_outputs']
+        path = self.root / 'result.json'
+        record = {'metadata': {'complete': True, 'language': 'vec', 'engine': 'python',
+                               'started_at': '2026-10-01', 'dump_manifest': '/old/location',
+                               'topics': {'model_sha512': 'frozen', 'started_at': 'execution-one'}},
+                  'pages': [{'id': 1, 'age': None, 'orphan': True}],
+                  'link_candidates': {'1': {'candidate_count': 1, 'candidates': [
+                      {'id': 2, 'evidence': [{'language': 'lmo', 'source_id': 3},
+                                             {'language': 'it', 'source_id': 4}]}]}}}
+        outputs = [{'kind': 'canonical', 'path': 'result.json'}]
+        path.write_text(json.dumps(record))
+        expected = fingerprint(self.root, outputs)
+        self.assertEqual(expected['result.json']['reference_edges'], 2)
+        equivalent = copy.deepcopy(record)
+        equivalent['metadata'].update(engine='rust', dump_manifest='/new/location')
+        equivalent['metadata']['topics']['started_at'] = 'execution-two'
+        equivalent['pages'][0] = dict(reversed(list(equivalent['pages'][0].items())))
+        path.write_text(json.dumps(equivalent, indent=2))
+        self.assertEqual(fingerprint(self.root, outputs), expected)
+        for change in ('missing', 'evidence', 'interval', 'model'):
+            changed = copy.deepcopy(record)
+            if change == 'missing':
+                changed['pages'][0]['age'] = 0
+            elif change == 'evidence':
+                changed['link_candidates']['1']['candidates'][0]['evidence'].pop()
+            elif change == 'interval':
+                changed['metadata']['started_at'] = '2026-10-02'
+            else:
+                changed['metadata']['topics']['model_sha512'] = 'changed'
+            path.write_text(json.dumps(changed))
+            with self.subTest(change=change):
+                self.assertNotEqual(fingerprint(self.root, outputs), expected)
+        record['metadata']['complete'] = False
+        path.write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, 'completo'):
+            fingerprint(self.root, outputs)
+        with self.assertRaises(ValueError):
+            fingerprint(self.root, [{'kind': 'bytes', 'path': '../outside'}])
+        binary = [{'kind': 'bytes', 'path': 'result.json'}]
+        before = fingerprint(self.root, binary)
+        path.write_text(path.read_text() + '\n')
+        self.assertNotEqual(fingerprint(self.root, binary), before)
+
+    def test_migration_manifest_matches_language_and_rejects_duplicates(self):
+        fingerprint = runpy.run_path(str(SCRIPT))['benchmark_outputs']
+        record = {'metadata': {'complete': True, 'language': 'vec'}, 'pages': [{'id': 1}]}
+        (self.root / 'first.json').write_text(json.dumps(record))
+        (self.root / 'second.json').write_text(json.dumps(record))
+        manifest = self.root / 'index.json'
+        manifest.write_text(json.dumps([{'language': 'vec', 'file': 'first.json'}]))
+        outputs = [{'kind': 'manifest', 'path': 'index.json'}]
+        expected = fingerprint(self.root, outputs)
+        manifest.write_text(json.dumps([{'language': 'vec', 'file': 'second.json'}]))
+        self.assertEqual(fingerprint(self.root, outputs), expected)
+        for entries in ([], [{'language': 'lmo', 'file': 'first.json'}],
+                        [{'language': 'vec', 'file': '../first.json'}],
+                        [{'language': 'vec', 'file': 'first.json'}] * 2):
+            manifest.write_text(json.dumps(entries))
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                fingerprint(self.root, outputs)
+
+    def test_migration_verdict_requires_paired_time_and_memory_evidence(self):
+        summarize = runpy.run_path(str(SCRIPT))['benchmark_summary']
+        samples = [{'pair': pair, 'variant': variant, 'warmup': pair == 0,
+                    'wall_seconds': 10 if variant == 'baseline' else 5,
+                    'cpu_seconds': 8, 'sampled_peak_tree_rss_bytes': 100}
+                   for pair in range(4) for variant in ('baseline', 'candidate')]
+        samples[1]['wall_seconds'] = 1000  # Warmup must not affect the verdict.
+        result = summarize(samples, 1.1, 1.1)
+        self.assertEqual(result['status'], 'passed')
+        self.assertEqual(result['paired_speedup']['median'], 2)
+        for metric, value, status in (('wall_seconds', 12, 'inconclusive'),
+                                       ('sampled_peak_tree_rss_bytes', 120, 'no_improvement'),
+                                       ('sampled_peak_tree_rss_bytes', None, 'inconclusive')):
+            changed = copy.deepcopy(samples)
+            changed[-1][metric] = value
+            with self.subTest(metric=metric, value=value):
+                self.assertEqual(summarize(changed, 1.1, 1.1)['status'], status)
+        self.assertEqual(summarize(samples, 3, 1.1)['status'], 'no_improvement')
+        with self.assertRaises(ValueError):
+            summarize(samples[:-1], 1.1, 1.1)
+
+    def migration_spec(self, candidate_code=None):
+        source = self.root / 'frozen.json'
+        source.write_text(json.dumps({'metadata': {'complete': True, 'language': 'vec'},
+                                      'pages': [{'id': 1, 'age': None}]}))
+        code = ('import pathlib,sys; root=pathlib.Path(sys.argv[1]); '
+                'assert pathlib.Path.cwd() == pathlib.Path(sys.argv[2]); '
+                'assert not (root/"result.json").exists(); '
+                '(root/"result.json").write_bytes((root/"seed.json").read_bytes()); '
+                '(root/"seed.json").write_text("private copy changed")')
+        command = [sys.executable, '-c', code, '{run}', str(self.root)]
+        spec = {'version': 1, 'inputs': [str(source)],
+                'copies': [{'source': str(source), 'destination': 'seed.json'}],
+                'baseline': {'cwd': str(self.root), 'commands': [command]},
+                'candidate': {'cwd': str(self.root), 'commands': [
+                    command if candidate_code is None else [sys.executable, '-c', candidate_code, '{run}']]},
+                'outputs': [{'kind': 'canonical', 'path': 'result.json'}]}
+        path = self.root / 'spec.json'
+        path.write_text(json.dumps(spec))
+        return path, source
+
+    def invoke_migration(self, spec, output, *extra):
+        return subprocess.run([sys.executable, str(SCRIPT), 'benchmark', '--spec', str(spec),
+                               '--output-dir', str(output), '--repetitions', '3',
+                               '--min-speedup', '10000', *extra], cwd=ROOT,
+                              capture_output=True, text=True)
+
+    def test_migration_runner_isolates_repeats_and_keeps_inputs_unchanged(self):
+        spec, source = self.migration_spec()
+        original = source.read_bytes()
+        output = self.root / 'measurements'
+        result = self.invoke_migration(spec, output)
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        report = json.loads((output / 'comparison.json').read_text())
+        self.assertEqual(report['correctness'], 'matched')
+        self.assertEqual(report['status'], 'no_improvement')
+        self.assertEqual([sample['variant'] for sample in report['samples']],
+                         ['baseline', 'candidate', 'candidate', 'baseline'] * 2)
+        self.assertEqual(sum(sample['warmup'] for sample in report['samples']), 2)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(report['inputs_sha256'][str(source)], hashlib.sha256(original).hexdigest())
+        for sample in report['samples']:
+            measured = json.loads((output / sample['report']).read_text())
+            self.assertEqual(measured['status'], 'completed')
+            self.assertEqual(sample['wall_seconds'], measured['steps'][0]['wall_seconds'])
+        saved = (output / 'comparison.json').read_bytes()
+        self.assertEqual(self.invoke_migration(spec, output).returncode, 1)
+        self.assertEqual((output / 'comparison.json').read_bytes(), saved)
+
+    def test_migration_runner_rejects_changed_results_and_child_failure(self):
+        changed = ('import json,pathlib,sys; root=pathlib.Path(sys.argv[1]); '
+                   'data=json.loads((root/"seed.json").read_text()); '
+                   'data["pages"][0]["age"]=0; (root/"result.json").write_text(json.dumps(data))')
+        for name, code, message in (('different', changed, 'Output differenti'),
+                                     ('failed', 'raise SystemExit(7)', 'CalledProcessError')):
+            spec, _ = self.migration_spec(code)
+            output = self.root / name
+            result = self.invoke_migration(spec, output, '--warmups', '0')
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            report = json.loads((output / 'comparison.json').read_text())
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn(message, report['error'])
+            self.assertNotIn('correctness', report)
+            self.assertFalse((output / '01-candidate').exists())
+
+    def test_migration_runner_detects_modified_input_and_invalid_destinations(self):
+        spec_path, source = self.migration_spec()
+        spec = json.loads(spec_path.read_text())
+        spec['candidate']['commands'] = [[sys.executable, '-c',
+            'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("changed")', str(source)]]
+        spec_path.write_text(json.dumps(spec))
+        output = self.root / 'mutated'
+        result = self.invoke_migration(spec_path, output, '--warmups', '0')
+        self.assertEqual(result.returncode, 1)
+        report = json.loads((output / 'comparison.json').read_text())
+        self.assertIn('Input benchmark modificato', report['error'])
+        spec['copies'][0]['destination'] = '../escape'
+        spec_path.write_text(json.dumps(spec))
+        output = self.root / 'invalid'
+        self.assertEqual(self.invoke_migration(spec_path, output).returncode, 1)
+        self.assertFalse(output.exists())
+
+    def test_migration_rss_excludes_controller_but_keeps_descendants(self):
+        resources = runpy.run_path(str(SCRIPT))['linux_resources']
+        def read(path, *args, **kwargs):
+            if str(path) in ('/proc/100/status', '/proc/101/status'):
+                return 'VmRSS: 4096 kB\nVmSwap: 0 kB\n'
+            if str(path) in ('/proc/100/stat', '/proc/101/stat'):
+                return '100 (synthetic) ' + ' '.join(['0'] * 20)
+            if str(path) == '/proc/100/task/100/children':
+                return '101'
+            if str(path) == '/proc/101/task/101/children':
+                return ''
+            raise OSError('unavailable')
+        def children(path):
+            return iter([path / path.parent.name])
+        with patch.object(Path, 'read_text', read), patch.object(Path, 'iterdir', children):
+            self.assertEqual(resources(100)['tree_rss_bytes'], 8 * 1024**2)
+            self.assertEqual(resources(100, include_root_memory=False)['tree_rss_bytes'], 4 * 1024**2)
+
     def test_configured_selection_retains_pool_order_and_validates_every_edition(self):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / 'languages.json'
