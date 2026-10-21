@@ -35,6 +35,8 @@ jobs:
           rustup target add wasm32-unknown-unknown
       - name: Install build tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config
           python -m venv .venv
           .venv/bin/python -m pip install 'maturin>=1.12,<2'
           cargo install wasm-bindgen-cli --version 0.2.105 --locked
