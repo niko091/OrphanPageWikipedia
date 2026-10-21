@@ -2748,48 +2748,152 @@ pub fn run_topics(
     Ok(report)
 }
 
-// Existing quality checkpoint identities use Python's sorted ASCII JSON with
-// default separators. Numeric model constants retain their frozen spellings.
+/// Write the existing sorted, ASCII JSON identity contract in bounded leaves.
+/// Objects retain only sorted key references; arrays/evidence are traversed
+/// directly. The sink can buffer writes independently of the largest scalar.
 #[cfg(feature = "cli")]
-fn python_json(value: &serde_json::Value) -> DumpResult<String> {
+pub fn write_canonical_json(
+    value: &serde_json::Value,
+    writer: &mut impl std::io::Write,
+) -> DumpResult<()> {
     use serde_json::Value;
-    Ok(match value {
-        Value::String(_) => {
-            let mut output = String::new();
-            for c in serde_json::to_string(value)?.chars() {
-                if c.is_ascii() && c != '\u{7f}' {
-                    output.push(c);
-                } else {
-                    let mut units = [0; 2];
-                    for unit in c.encode_utf16(&mut units) {
-                        output.push_str(&format!("\\u{unit:04x}"));
-                    }
+    fn string(value: &str, writer: &mut impl std::io::Write) -> DumpResult<()> {
+        for c in serde_json::to_string(value)?.chars() {
+            if c.is_ascii() && c != '\u{7f}' {
+                writer.write_all(&[c as u8])?;
+            } else {
+                let mut units = [0; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    writer.write_all(format!("\\u{unit:04x}").as_bytes())?;
                 }
             }
-            output
         }
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(python_json)
-                .collect::<DumpResult<Vec<_>>>()?
-                .join(", ")
-        ),
-        Value::Object(values) => format!(
-            "{{{}}}",
-            values
-                .iter()
-                .map(|(key, value)| Ok(format!(
-                    "{}: {}",
-                    python_json(&Value::String(key.clone()))?,
-                    python_json(value)?
-                )))
-                .collect::<DumpResult<Vec<_>>>()?
-                .join(", ")
-        ),
-        _ => serde_json::to_string(value)?,
-    })
+        Ok(())
+    }
+    match value {
+        Value::String(value) => string(value, writer)?,
+        Value::Array(values) => {
+            writer.write_all(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b", ")?;
+                }
+                write_canonical_json(value, writer)?;
+            }
+            writer.write_all(b"]")?;
+        }
+        Value::Object(values) => {
+            writer.write_all(b"{")?;
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b", ")?;
+                }
+                string(key, writer)?;
+                writer.write_all(b": ")?;
+                write_canonical_json(value, writer)?;
+            }
+            writer.write_all(b"}")?;
+        }
+        Value::Number(number) if number.is_f64() => {
+            writer.write_all(python_float(number)?.as_bytes())?
+        }
+        _ => serde_json::to_writer(writer, value)?,
+    }
+    Ok(())
+}
+
+// serde_json's shortest digits use nearest/even ties, matching Python repr.
+// Rust Debug's tie policy differs (e.g. 1255183068570128.25), so do not use it.
+#[cfg(feature = "cli")]
+fn python_float(number: &serde_json::Number) -> DumpResult<String> {
+    let encoded = number.to_string();
+    let (sign, encoded) = encoded
+        .strip_prefix('-')
+        .map_or(("", encoded.as_str()), |s| ("-", s));
+    if number.as_f64() == Some(0.0) {
+        return Ok(format!("{sign}0.0"));
+    }
+    let (mantissa, exponent) = encoded.split_once('e').unwrap_or((encoded, "0"));
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let digits = mantissa.replace('.', "");
+    let leading = digits.len() - digits.trim_start_matches('0').len();
+    let exponent = exponent.parse::<i32>()? + i32::try_from(decimal)? - i32::try_from(leading)? - 1;
+    let digits = digits.trim_matches('0');
+    if digits.is_empty() {
+        return Err("Rappresentazione numerica non valida".into());
+    }
+    if (-4..16).contains(&exponent) {
+        let position = exponent + 1;
+        if position <= 0 {
+            return Ok(format!(
+                "{sign}0.{}{digits}",
+                "0".repeat(usize::try_from(-position)?)
+            ));
+        }
+        let position = usize::try_from(position)?;
+        if position >= digits.len() {
+            return Ok(format!(
+                "{sign}{digits}{}.0",
+                "0".repeat(position - digits.len())
+            ));
+        }
+        Ok(format!(
+            "{sign}{}.{}",
+            &digits[..position],
+            &digits[position..]
+        ))
+    } else {
+        let fraction = if digits.len() > 1 {
+            format!(".{}", &digits[1..])
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "{sign}{}{fraction}e{}{:02}",
+            &digits[..1],
+            if exponent >= 0 { '+' } else { '-' },
+            exponent.unsigned_abs()
+        ))
+    }
+}
+
+#[cfg(feature = "cli")]
+#[derive(Default)]
+struct CanonicalDigest(sha2::Sha256);
+
+#[cfg(feature = "cli")]
+impl std::io::Write for CanonicalDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hash the canonical value without serializing the complete document in RAM.
+#[cfg(feature = "cli")]
+pub fn canonical_json_sha256(value: &serde_json::Value) -> DumpResult<String> {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut digest = CanonicalDigest::default();
+    {
+        let mut writer = std::io::BufWriter::with_capacity(65536, &mut digest);
+        write_canonical_json(value, &mut writer)?;
+        writer.flush()?;
+    }
+    Ok(format!("{:x}", digest.0.finalize()))
+}
+
+#[cfg(feature = "cli")]
+fn python_json(value: &serde_json::Value) -> DumpResult<String> {
+    let mut bytes = Vec::new();
+    write_canonical_json(value, &mut bytes)?;
+    Ok(String::from_utf8(bytes)?)
 }
 
 #[cfg(feature = "cli")]
