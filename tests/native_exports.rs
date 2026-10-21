@@ -1,6 +1,6 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    export_csv, prepare_browser_indices, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
+    export_csv, prepare_dashboard_exports, ARTICLE_INDEX_COLUMNS, CSV_COLUMNS, OBSERVATION_COLUMNS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -238,7 +238,7 @@ fn malformed_sections_and_duplicate_or_foreign_ids_preserve_the_approved_csv() {
         fs::write(&output, "approved").unwrap();
         assert!(export_csv(&source, &output).is_err(), "accepted {text}");
         let prepared = w.0.join("prepared");
-        assert!(prepare_browser_indices(&source, &prepared, None, None).is_err());
+        assert!(prepare_dashboard_exports(&source, &prepared, None, None).is_err());
         assert!(!prepared.exists());
         assert_eq!(fs::read_to_string(&output).unwrap(), "approved");
         assert_eq!(fs::read_to_string(&source).unwrap(), text);
@@ -357,8 +357,8 @@ fn browser_indices_keep_every_display_value_candidate_count_and_topic_lookup() {
     let source = w.source(&json!(pages), Some(&candidates));
     let before = fs::read(&source).unwrap();
     let folder = w.0.join("prepared");
-    let names = prepare_browser_indices(&source, &folder, None, None).unwrap();
-    assert_eq!(names.as_object().unwrap().len(), 3);
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    assert_eq!(names.as_object().unwrap().len(), 7);
     assert!(!folder.join("manifest.json").exists());
     for (key, format, columns) in [
         ("observations_file", "observations_v1", OBSERVATION_COLUMNS),
@@ -451,11 +451,11 @@ fn source_fingerprints_and_explicit_generations_preserve_all_prior_index_shard_p
         {"page_id":1,"title":"Known topic","orphan":false,"topic_status":"predicted","topic_labels":["Culture.Media.Music"]}
     ]),None);
     let first = w.0.join("first");
-    let old = prepare_browser_indices(&source, &first, None, None).unwrap();
+    let old = prepare_dashboard_exports(&source, &first, None, None).unwrap();
     let frozen = snapshot(&first);
     let same = w.0.join("same");
     assert_eq!(
-        prepare_browser_indices(&source, &same, None, None).unwrap(),
+        prepare_dashboard_exports(&source, &same, None, None).unwrap(),
         old
     );
     assert_eq!(snapshot(&same), frozen);
@@ -468,13 +468,13 @@ fn source_fingerprints_and_explicit_generations_preserve_all_prior_index_shard_p
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
     let next = w.0.join("next");
-    let changed = prepare_browser_indices(&source, &next, None, None).unwrap();
-    for key in ["observations_file", "articles_file", "profile_topics_dir"] {
+    let changed = prepare_dashboard_exports(&source, &next, None, None).unwrap();
+    for key in old.as_object().unwrap().keys() {
         assert_ne!(old[key], changed[key]);
     }
     assert_eq!(snapshot(&first), frozen);
     let explicit = w.0.join("explicit");
-    let names = prepare_browser_indices(
+    let names = prepare_dashboard_exports(
         &source,
         &explicit,
         None,
@@ -506,7 +506,7 @@ fn manifest_mismatches_invalid_generations_and_existing_directories_do_not_write
         json!({"language":"vec","date":"different"}),
         json!({"language":"vec","date":null,"demo":true}),
     ] {
-        assert!(prepare_browser_indices(&source, &prepared, Some(&expected), None).is_err());
+        assert!(prepare_dashboard_exports(&source, &prepared, Some(&expected), None).is_err());
         assert!(!prepared.exists());
     }
     for generation in [
@@ -516,23 +516,23 @@ fn manifest_mismatches_invalid_generations_and_existing_directories_do_not_write
         "../0123456789abcdef0123456789abcd",
         "g123456789abcdef0123456789abcdef",
     ] {
-        assert!(prepare_browser_indices(&source, &prepared, None, Some(generation)).is_err());
+        assert!(prepare_dashboard_exports(&source, &prepared, None, Some(generation)).is_err());
         assert!(!prepared.exists());
     }
     fs::create_dir(&prepared).unwrap();
     fs::write(prepared.join("approved"), "old").unwrap();
-    assert!(prepare_browser_indices(&source, &prepared, None, None).is_err());
+    assert!(prepare_dashboard_exports(&source, &prepared, None, None).is_err());
     assert_eq!(
         fs::read_to_string(prepared.join("approved")).unwrap(),
         "old"
     );
-    assert!(prepare_browser_indices(&source, &source, None, None).is_err());
-    assert!(prepare_browser_indices(&source, &w.0, None, None).is_err());
+    assert!(prepare_dashboard_exports(&source, &source, None, None).is_err());
+    assert!(prepare_dashboard_exports(&source, &w.0, None, None).is_err());
     fs::create_dir(w.0.join("empty")).unwrap();
-    assert!(prepare_browser_indices(&source, &w.0.join("empty"), None, None).is_err());
+    assert!(prepare_dashboard_exports(&source, &w.0.join("empty"), None, None).is_err());
     assert!(w.0.join("empty").is_dir());
     let accepted = w.0.join("accepted");
-    assert!(prepare_browser_indices(
+    assert!(prepare_dashboard_exports(
         &source,
         &accepted,
         Some(&json!({"language":"vec","date":null,"demo":false})),
@@ -546,7 +546,7 @@ fn empty_browser_indices_retain_the_census_and_a_complete_empty_topic_directory(
     let w = Workspace::new();
     let source = w.source(&json!([]), Some(&json!({})));
     let folder = w.0.join("prepared");
-    let names = prepare_browser_indices(&source, &folder, None, None).unwrap();
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
     for key in ["observations_file", "articles_file"] {
         let index = read_json(folder.join(names[key].as_str().unwrap()));
         assert_eq!(index["rows"], json!([]));
@@ -557,6 +557,191 @@ fn empty_browser_indices_retain_the_census_and_a_complete_empty_topic_directory(
     assert_eq!(index["census_page_count"], 0);
     assert_eq!(index["shards"], json!([]));
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    for key in ["cards_dir", "connections_dir"] {
+        let path = folder.join(names[key].as_str().unwrap());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+    }
+    let cards = read_json(folder.join(names["cards_file"].as_str().unwrap()));
+    assert_eq!(cards["census_page_count"], 0);
+    assert_eq!(cards["rows"], json!([]));
+    assert_eq!(cards["link_candidates"], json!({}));
+}
+
+#[test]
+fn editorial_cards_bound_shortlists_while_details_keep_all_candidates_and_reference_edges() {
+    let w = Workspace::new();
+    let pages = json!([
+        {"page_id":29,"title":"Explicit empty record","orphan":true},
+        {"page_id":17,"title":"È 🌙 target","orphan":true,"topic_labels":[],"topic_status":"predicted"},
+        {"page_id":1,"title":"Non orphan","orphan":false},
+        {"page_id":23,"title":"No comparison","orphan":true}
+    ]);
+    let valid_edge = json!({"language":"lmo","source_page_id":101,"source_title":"Source È 🌙",
+        "target_page_id":301,"target_title":"Reference target","extra":0.9859704508633369});
+    let mut candidates = vec![
+        json!({"page_id":17,"title":"Self","evidence":[valid_edge]}),
+        json!({"page_id":true,"title":"Boolean","evidence":[valid_edge]}),
+        json!({"page_id":1.0,"title":"Float","evidence":[valid_edge]}),
+        json!({"page_id":0,"title":"Zero","evidence":[valid_edge]}),
+        json!({"page_id":91,"title":"\u{1c}\u{1d}\u{1e}\u{1f}","evidence":[valid_edge]}),
+        json!({"page_id":92,"title":"No evidence"}),
+        json!({"page_id":93,"title":"Unsafe evidence","evidence":[
+            {"language":"../bad","source_title":"A","target_title":"B"},
+            {"language":"vec","source_title":"A","target_title":"B"},
+            {"language":"all","source_title":"A","target_title":"B"},
+            {"language":"lmo\n","source_title":"A","target_title":"B"},
+            {"language":"lmo","source_title":"\u{1c}","target_title":"B"}]}),
+    ];
+    for i in 0..20 {
+        let mut evidence = vec![
+            json!({"language":"lmo","source_title":" ","target_title":"invalid"}),
+            valid_edge.clone(),
+        ];
+        if i == 0 {
+            evidence.extend((0..6001).map(|j|json!({"language":"fur","source_page_id":j+1,
+                "source_title":"x".repeat(40),"target_page_id":301,"target_title":"Reference target"})));
+        }
+        candidates.push(
+            json!({"page_id":100+i,"title":format!("Candidate {i}"),"dead_end":i<8,
+            "out_degree":if i<8 {0} else {2},"evidence":evidence,"additional":"retained"}),
+        );
+        if i == 0 {
+            candidates
+                .push(json!({"page_id":100,"title":"Duplicate selected","evidence":[valid_edge]}));
+        }
+    }
+    // Saturated groups must not inspect discarded evidence.
+    candidates.push(json!({"page_id":999,"title":"Already full","dead_end":true,"evidence":null}));
+    let record = json!({"status":"compared","candidate_count":candidates.len(),"candidates":candidates,
+        "counterparts":[{"language":"lmo","status":"non_orphan"}],"extra":"full detail retained"});
+    let source = w.source(&pages, Some(&json!({"17":record,"29":{}})));
+    let before = fs::read(&source).unwrap();
+    let folder = w.0.join("prepared");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let cards = read_json(folder.join(names["cards_file"].as_str().unwrap()));
+    let metadata = read_json(folder.join(names["connections_metadata_file"].as_str().unwrap()));
+    assert_eq!(cards["format"], "orphan_cards_v2");
+    assert_eq!(cards["census_page_count"], 4);
+    assert_eq!(
+        cards["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![29, 17, 23]
+    );
+    assert_eq!(
+        cards["link_candidates"]["17"]["candidate_ids"],
+        json!([100, 101, 102, 103, 104, 108, 109, 110, 111, 112])
+    );
+    assert_eq!(
+        cards["link_candidates"]["29"],
+        json!({"status":null,"candidate_count":null,"candidate_ids":[]})
+    );
+    assert!(cards["link_candidates"].get("23").is_none());
+    assert_eq!(metadata["format"], "connections_metadata_v1");
+    assert_eq!(metadata["census_page_count"], 4);
+    assert_eq!(metadata["metadata"], read_json(&source)["metadata"]);
+    assert_eq!(metadata["connection_identity"].as_str().unwrap().len(), 64);
+    for id in [17, 23, 29] {
+        let card = read_json(
+            folder
+                .join(names["cards_dir"].as_str().unwrap())
+                .join(format!("{id}.json")),
+        );
+        let detail = read_json(
+            folder
+                .join(names["connections_dir"].as_str().unwrap())
+                .join(format!("{id}.json")),
+        );
+        assert_eq!(card["format"], "orphan_card_v1");
+        assert_eq!(card["card_identity"], cards["card_identity"]);
+        assert_eq!(card["census_page_count"], 4);
+        assert_eq!(detail["format"], "connections_v2");
+        assert_eq!(
+            detail["connection_identity"],
+            metadata["connection_identity"]
+        );
+        assert_eq!(detail["census_page_count"], 4);
+        assert!(detail.get("metadata").is_none());
+        assert_eq!(detail["pages"], json!([card["page"]]));
+        if id == 17 {
+            assert_eq!(detail["link_candidates"]["17"], record);
+            let selected = card["candidate_record"]["candidates"].as_array().unwrap();
+            assert_eq!(selected.len(), 10);
+            for candidate in selected {
+                assert_eq!(candidate["evidence"], json!([valid_edge]));
+                assert_eq!(candidate["additional"], "retained");
+            }
+        } else {
+            assert_eq!(detail["link_candidates"][id.to_string()], json!({}));
+            if id == 23 {
+                assert!(card["candidate_record"].is_null());
+            } else {
+                assert_eq!(
+                    card["candidate_record"],
+                    json!({"status":null,"candidate_count":null,"candidates":[]})
+                );
+            }
+        }
+    }
+    for key in ["cards_dir", "connections_dir"] {
+        let directory = folder.join(names[key].as_str().unwrap());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 3);
+    }
+    assert_eq!(fs::read(&source).unwrap(), before);
+}
+
+#[test]
+fn editorial_parse_failures_after_an_earlier_detail_remove_all_private_products() {
+    let w = Workspace::new();
+    let pages =
+        json!([{"page_id":1,"title":"A","orphan":true},{"page_id":2,"title":"B","orphan":true}]);
+    for record in [
+        json!({"candidates":null}),
+        json!({"candidates":{}}),
+        json!({"candidates":[0]}),
+        json!({"candidates":[{"page_id":3,"title":"Valid","evidence":null}]}),
+        json!({"candidates":[{"page_id":3,"title":"Valid","evidence":[0]}]}),
+    ] {
+        let source = w.source(
+            &pages,
+            Some(
+                &json!({"1":{"status":"compared","candidate_count":0,"candidates":[]},"2":record}),
+            ),
+        );
+        let before = fs::read(&source).unwrap();
+        let folder = w.0.join("prepared");
+        assert!(prepare_dashboard_exports(&source, &folder, None, None).is_err());
+        assert!(!folder.exists());
+        assert_eq!(fs::read(&source).unwrap(), before);
+        w.assert_files(&["canonical.json"]);
+    }
+}
+
+#[test]
+fn a_census_without_orphans_still_prepares_empty_editorial_directories() {
+    let w = Workspace::new();
+    let source = w.source(
+        &json!([{"page_id":1,"title":"A","orphan":false},{"page_id":2,"title":"B","orphan":false}]),
+        None,
+    );
+    let folder = w.0.join("prepared");
+    let names = prepare_dashboard_exports(&source, &folder, None, None).unwrap();
+    let cards = read_json(folder.join(names["cards_file"].as_str().unwrap()));
+    assert_eq!(cards["census_page_count"], 2);
+    assert_eq!(cards["rows"], json!([]));
+    assert_eq!(cards["link_candidates"], json!({}));
+    for key in ["cards_dir", "connections_dir"] {
+        assert_eq!(
+            fs::read_dir(folder.join(names[key].as_str().unwrap()))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -568,7 +753,7 @@ fn failed_index_writes_remove_only_the_owned_preparation_directory() {
     fs::rename(&source, &long_source).unwrap();
     let before = fs::read(&long_source).unwrap();
     let folder = w.0.join("prepared");
-    assert!(prepare_browser_indices(&long_source, &folder, None, None).is_err());
+    assert!(prepare_dashboard_exports(&long_source, &folder, None, None).is_err());
     assert!(!folder.exists());
     assert_eq!(fs::read(&long_source).unwrap(), before);
     assert_eq!(fs::read_dir(&w.0).unwrap().count(), 1);
