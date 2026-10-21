@@ -1,5 +1,5 @@
 //! Bounded MySQL decoding and optional standalone verified dump acquisition,
-//! SQL graph import, MediaWiki History reconstruction and XML structural quality.
+//! SQL/History imports, XML structural quality and local fastText topic inference.
 
 pub fn parse_insert(statement: &str) -> Result<Vec<Vec<Option<String>>>, String> {
     let offset = if statement.trim_start().starts_with('(') {
@@ -1865,6 +1865,887 @@ fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
             Err("Metadati JSON mancanti".into())
         }
     }
+}
+
+/// Complete native model response, before the strict scientific threshold.
+#[cfg(feature = "cli")]
+pub struct TopicPrediction {
+    pub labels: Vec<String>,
+    pub probabilities: Vec<f64>,
+}
+
+/// The inference boundary also permits deterministic synthetic test engines.
+#[cfg(feature = "cli")]
+pub trait TopicModel {
+    fn labels(&self) -> Result<Vec<String>, String>;
+    fn word_id(&self, word: &str) -> Result<i32, String>;
+    fn predict(&mut self, inputs: &[String]) -> Result<Vec<TopicPrediction>, String>;
+}
+
+#[cfg(feature = "cli")]
+unsafe extern "C" {
+    fn ow_topic_load(
+        path: *const std::ffi::c_char,
+        handle: *mut *mut std::ffi::c_void,
+        error: *mut std::ffi::c_char,
+        capacity: usize,
+    ) -> i32;
+    fn ow_topic_free(handle: *mut std::ffi::c_void);
+    fn ow_topic_labels(
+        handle: *mut std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        receive: extern "C" fn(*mut std::ffi::c_void, *const u8, usize, f32),
+        error: *mut std::ffi::c_char,
+        capacity: usize,
+    ) -> i32;
+    fn ow_topic_word(handle: *mut std::ffi::c_void, word: *const std::ffi::c_char) -> i32;
+    fn ow_topic_predict(
+        handle: *mut std::ffi::c_void,
+        text: *const std::ffi::c_char,
+        context: *mut std::ffi::c_void,
+        receive: extern "C" fn(*mut std::ffi::c_void, *const u8, usize, f32),
+        error: *mut std::ffi::c_char,
+        capacity: usize,
+    ) -> i32;
+}
+
+/// An owned fastText 0.9.3 handle. It is deliberately neither Send nor Sync.
+#[cfg(feature = "cli")]
+pub struct NativeTopicModel(std::ptr::NonNull<std::ffi::c_void>);
+
+#[cfg(feature = "cli")]
+impl Drop for NativeTopicModel {
+    fn drop(&mut self) {
+        // SAFETY: load transfers one owned C++ handle; Drop frees it once.
+        unsafe { ow_topic_free(self.0.as_ptr()) };
+    }
+}
+
+#[cfg(feature = "cli")]
+struct TopicResponse {
+    prediction: TopicPrediction,
+    invalid: bool,
+}
+
+#[cfg(feature = "cli")]
+extern "C" fn receive_topic(
+    context: *mut std::ffi::c_void,
+    label: *const u8,
+    size: usize,
+    score: f32,
+) {
+    // SAFETY: C++ invokes this synchronously with our live context and a string
+    // valid for this callback only. All bytes are copied before returning.
+    let response = unsafe { &mut *context.cast::<TopicResponse>() };
+    if response.prediction.labels.len() >= 64 {
+        response.invalid = true;
+        return;
+    }
+    match std::str::from_utf8(unsafe { std::slice::from_raw_parts(label, size) }) {
+        Ok(label) => {
+            response.prediction.labels.push(label.to_owned());
+            response.prediction.probabilities.push(f64::from(score));
+        }
+        Err(_) => response.invalid = true,
+    }
+}
+
+#[cfg(feature = "cli")]
+fn topic_error(buffer: &[std::ffi::c_char]) -> String {
+    String::from_utf8_lossy(
+        &buffer
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<_>>(),
+    )
+    .into_owned()
+}
+
+#[cfg(feature = "cli")]
+impl NativeTopicModel {
+    /// Load a checksum-verified artifact with the same C++ engine as Python.
+    pub fn load(path: &std::path::Path, spec: &serde_json::Value) -> DumpResult<Self> {
+        use sha2::Digest;
+        use std::io::Read;
+        validate_topic_spec(spec)?;
+        let mut digest = sha2::Sha512::new();
+        let mut file = std::fs::File::open(path)?;
+        let mut block = [0; 1024 * 1024];
+        loop {
+            let size = file.read(&mut block)?;
+            if size == 0 {
+                break;
+            }
+            digest.update(&block[..size]);
+        }
+        if spec["model_sha512"] != format!("{:x}", digest.finalize()) {
+            return Err("Checksum dei pesi del modello non corrispondente".into());
+        }
+        let path = std::ffi::CString::new(path.to_str().ok_or("Percorso del modello non UTF-8")?)?;
+        let mut error = [0; 4096];
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: valid terminated path, writable handle/error; C++ catches exceptions.
+        let status =
+            unsafe { ow_topic_load(path.as_ptr(), &mut handle, error.as_mut_ptr(), error.len()) };
+        if status != 0 {
+            return Err(topic_error(&error).into());
+        }
+        let model = Self(std::ptr::NonNull::new(handle).ok_or("Handle fastText mancante")?);
+        validate_topic_labels(&model.labels()?, spec)?;
+        Ok(model)
+    }
+
+    fn response(&self, input: Option<&str>) -> Result<TopicPrediction, String> {
+        let mut response = TopicResponse {
+            prediction: TopicPrediction {
+                labels: Vec::with_capacity(64),
+                probabilities: Vec::with_capacity(64),
+            },
+            invalid: false,
+        };
+        let mut error = [0; 4096];
+        let context = std::ptr::from_mut(&mut response).cast();
+        // SAFETY: the owned handle is live, callbacks synchronously copy strings
+        // into our context, and no C++ exception crosses the ABI.
+        let status = if let Some(input) = input {
+            if input.contains('\n') {
+                return Err("Il modello accetta una riga per input".into());
+            }
+            let input = std::ffi::CString::new(input).map_err(|e| e.to_string())?;
+            unsafe {
+                ow_topic_predict(
+                    self.0.as_ptr(),
+                    input.as_ptr(),
+                    context,
+                    receive_topic,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
+        } else {
+            unsafe {
+                ow_topic_labels(
+                    self.0.as_ptr(),
+                    context,
+                    receive_topic,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
+        };
+        if status != 0 {
+            return Err(topic_error(&error));
+        }
+        if response.invalid {
+            return Err("Etichette fastText non valide o incomplete".into());
+        }
+        Ok(response.prediction)
+    }
+}
+
+#[cfg(feature = "cli")]
+impl TopicModel for NativeTopicModel {
+    fn labels(&self) -> Result<Vec<String>, String> {
+        Ok(self.response(None)?.labels)
+    }
+    fn word_id(&self, word: &str) -> Result<i32, String> {
+        let word = std::ffi::CString::new(word).map_err(|e| e.to_string())?;
+        // SAFETY: live handle, valid terminated word, read-only dictionary query.
+        Ok(unsafe { ow_topic_word(self.0.as_ptr(), word.as_ptr()) })
+    }
+    fn predict(&mut self, inputs: &[String]) -> Result<Vec<TopicPrediction>, String> {
+        inputs
+            .iter()
+            .map(|input| self.response(Some(input)))
+            .collect()
+    }
+}
+
+#[cfg(feature = "cli")]
+fn validate_topic_spec(spec: &serde_json::Value) -> DumpResult<()> {
+    use std::collections::HashSet;
+    let labels = spec["labels"]
+        .as_array()
+        .ok_or("Tassonomia del modello mancante")?;
+    if spec["version"] != 1
+        || spec["threshold"] != 0.5
+        || labels.len() != 64
+        || labels
+            .iter()
+            .any(|label| !label.as_str().is_some_and(|s| s.contains('.')))
+        || labels
+            .iter()
+            .map(|label| label.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            != 64
+        || !spec["model_sha512"].as_str().is_some_and(|s| {
+            s.len() == 128
+                && s.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+    {
+        return Err("Configurazione del modello dei temi non valida".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn validate_topic_labels(labels: &[String], spec: &serde_json::Value) -> DumpResult<()> {
+    let actual = labels
+        .iter()
+        .map(|label| {
+            label
+                .strip_prefix("__label__")
+                .unwrap_or(label)
+                .replace('_', " ")
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let expected = spec["labels"]
+        .as_array()
+        .ok_or("Tassonomia mancante")?
+        .iter()
+        .filter_map(|label| label.as_str().map(str::to_owned))
+        .collect();
+    if labels.len() != 64 || actual != expected {
+        return Err("Il modello non contiene la tassonomia completa prevista".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn topic_deadline(deadline: Option<std::time::Instant>) -> DumpResult<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Budget di tempo esaurito; nessun supplemento incompleto pubblicato",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn topic_time() -> String {
+    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
+}
+
+#[cfg(feature = "cli")]
+fn predict_topic_batch(
+    inputs: &[(String, usize, bool)],
+    identities: &[(i64, serde_json::Value)],
+    model: &mut impl TopicModel,
+    spec: &serde_json::Value,
+) -> DumpResult<(Vec<serde_json::Value>, usize)> {
+    use serde_json::json;
+    let texts = inputs
+        .iter()
+        .filter(|(text, _, _)| !text.is_empty())
+        .map(|(text, _, _)| text.clone())
+        .collect::<Vec<_>>();
+    let predictions = if texts.is_empty() {
+        Vec::new()
+    } else {
+        model.predict(&texts)?
+    };
+    if predictions.len() != texts.len() || identities.len() != inputs.len() {
+        return Err("Risposta del modello incompleta".into());
+    }
+    let taxonomy = spec["labels"]
+        .as_array()
+        .ok_or("Tassonomia mancante")?
+        .iter()
+        .filter_map(|label| label.as_str().map(str::to_owned))
+        .collect();
+    let (labels, scores) = predictions
+        .into_iter()
+        .map(|p| (p.labels, p.probabilities))
+        .unzip();
+    let selected = crate::threshold_topics(taxonomy, labels, scores)?;
+    let mut selected = selected.into_iter();
+    let records = inputs.iter().zip(identities).map(|((text, count, mapped), (id, revision))| {
+        let (labels, status) = if text.is_empty() {
+            (None, if *mapped { "no_model_vocabulary" } else { "no_mapped_outlinks" })
+        } else { (selected.next(), "predicted") };
+        json!({"page_id":id,"revision_id":revision,"topic_labels":labels,"topic_input_count":count,"topic_status":status})
+    }).collect();
+    Ok((records, texts.len()))
+}
+
+#[cfg(feature = "cli")]
+struct TopicSpool(std::path::PathBuf);
+
+#[cfg(feature = "cli")]
+impl Drop for TopicSpool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(feature = "cli")]
+impl TopicSpool {
+    fn new(output: &std::path::Path) -> DumpResult<(Self, std::fs::File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = output.parent().ok_or("Directory dei temi mancante")?;
+        std::fs::create_dir_all(parent)?;
+        let path = parent.join(format!(
+            ".orphanwiki-topics-{}-{}.jsonl",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok((Self(path), file))
+    }
+
+    fn publish(&self, output: &std::path::Path, metadata: &serde_json::Value) -> DumpResult<()> {
+        use std::io::{BufRead, Write};
+        write_atomic(output, |file| {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            writer.write_all(b"{\"metadata\":")?;
+            serde_json::to_writer(&mut writer, metadata)?;
+            writer.write_all(b",\"pages\":[")?;
+            for (position, line) in std::io::BufReader::new(std::fs::File::open(&self.0)?)
+                .lines()
+                .enumerate()
+            {
+                if position != 0 {
+                    writer.write_all(b",")?;
+                }
+                writer.write_all(line?.as_bytes())?;
+            }
+            writer.write_all(b"]}")?;
+            writer.flush()?;
+            Ok(())
+        })
+    }
+}
+
+/// Infer a full SQL edition with the verified staging's three indexed streams.
+/// Only titles, QIDs, redirects, category hierarchy and one edge batch reside
+/// in memory; an expired budget never publishes a partial edition.
+#[cfg(feature = "cli")]
+pub fn predict_imported_topics(
+    raw_path: &std::path::Path,
+    output: &std::path::Path,
+    model: &mut impl TopicModel,
+    spec: &serde_json::Value,
+    batch_size: usize,
+    deadline: Option<std::time::Instant>,
+    work_dir: Option<&std::path::Path>,
+) -> DumpResult<serde_json::Value> {
+    use rusqlite::OpenFlags;
+    use serde_json::{json, Value};
+    use sha2::Digest;
+    use std::{collections::HashMap, io::Write, path::Path, time::Instant};
+    validate_topic_spec(spec)?;
+    validate_topic_labels(&model.labels()?, spec)?;
+    if !(1..=10000).contains(&batch_size) {
+        return Err("Dimensione del blocco non valida".into());
+    }
+    let metadata = first_metadata(raw_path)?;
+    if metadata.get("finished_at").is_none() {
+        return Err("Identità temporale del grafo mancante".into());
+    }
+    let language = metadata["language"]
+        .as_str()
+        .ok_or("Lingua del grafo mancante")?;
+    let database = crate::wiki_database(language, metadata["database"].as_str())?;
+    if metadata["complete"] != true
+        || metadata["item_mapping"] != json!({"source":"page_props.wikibase_item","complete":true})
+        || metadata["source"] != format!("Wikimedia SQL dumps / {database}")
+    {
+        return Err("Serve un grafo SQL verificato con QID completi".into());
+    }
+    let manifest_path = Path::new(
+        metadata["dump_manifest"]
+            .as_str()
+            .ok_or("Manifest SQL mancante")?,
+    );
+    let manifest: Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+    let hash = |path: &Path| -> DumpResult<String> {
+        DumpClient::<WikimediaHttp>::verified_sha256(path, None, None)?
+            .ok_or_else(|| "Input dei temi mancante".into())
+    };
+    if hash(manifest_path)? != metadata["dump_manifest_sha256"]
+        || manifest["language"] != language
+        || manifest["database"] != database
+        || manifest["sql_release"] != metadata["sql_release"]
+    {
+        return Err("Manifest SQL non corrispondente al grafo importato".into());
+    }
+    let release = metadata["sql_release"]
+        .as_str()
+        .ok_or("Release SQL mancante")?;
+    if release.len() != 8 || !release.bytes().all(|c| c.is_ascii_digit()) {
+        return Err("Release SQL non valida".into());
+    }
+    let parent = manifest_path.parent().unwrap_or(Path::new("."));
+    let default_work = parent.parent().unwrap_or(parent).join("staging");
+    let stage = work_dir
+        .unwrap_or(&default_work)
+        .join(format!("{database}-{release}.sqlite"));
+    if !stage.is_file() {
+        return Err("Staging SQL mancante".into());
+    }
+    for input in [raw_path, stage.as_path(), manifest_path]
+        .into_iter()
+        .chain(
+            manifest["files"]
+                .as_object()
+                .ok_or("File SQL mancanti")?
+                .values()
+                .filter_map(|record| record["path"].as_str().map(Path::new)),
+        )
+    {
+        if resolved_path(input)? == resolved_path(output)? {
+            return Err("Output dei temi sovrapposto agli input".into());
+        }
+    }
+    topic_deadline(deadline)?;
+    let started = topic_time();
+    let begin = Instant::now();
+    let raw_signature = file_signature(raw_path)?;
+    let source = rusqlite::Connection::open_with_flags(&stage, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Keep all cursors and the identity index on one consistent snapshot.
+    source.execute_batch("BEGIN")?;
+    let imported = source
+        .prepare("SELECT table_name,sha256 FROM imported")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    if SQL_TABLES.iter().any(
+        |table| match manifest["files"][table]["sha256_local"].as_str() {
+            Some(expected) => imported.get(*table).map(String::as_str) != Some(expected),
+            None => true,
+        },
+    ) {
+        return Err("Staging SQL incompleto o non corrispondente al manifest".into());
+    }
+    let expected = source.query_row(
+        "SELECT COUNT(*) FROM dump_page WHERE ns=0 AND redirect=0",
+        [],
+        |r| r.get::<_, usize>(0),
+    )?;
+    if expected == 0
+        || source.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get::<_, usize>(0))? != expected
+    {
+        return Err("Popolazione dello staging SQL incompleta".into());
+    }
+    let mut identities = Vec::with_capacity(expected);
+    let mut titles = Vec::with_capacity(expected);
+    let mut items = Vec::with_capacity(expected);
+    {
+        let mut query = source.prepare("SELECT id,data FROM pages ORDER BY id")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let page: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if page["page_id"] != id {
+                return Err("Identità delle pagine SQL non corrispondenti".into());
+            }
+            titles.push(
+                page["title"]
+                    .as_str()
+                    .ok_or("Titolo SQL mancante")?
+                    .to_owned(),
+            );
+            items.push(page["wikibase_item"].as_str().map(str::to_owned));
+            identities.push((id, page["revision_id"].clone()));
+        }
+    }
+    if identities.len() != expected || identities.windows(2).any(|rows| rows[0].0 >= rows[1].0) {
+        return Err("Identità delle pagine SQL incomplete".into());
+    }
+    let (unique, _) = crate::unique_items(&items);
+    let mut known = std::collections::HashSet::new();
+    for item in unique.into_keys() {
+        if model.word_id(&item)? >= 0 {
+            known.insert(item);
+        }
+    }
+    let redirects = source.prepare("SELECT p.title,r.title FROM dump_redirect r JOIN dump_page p ON p.id=r.page_id WHERE p.ns=0 AND p.redirect=1 AND r.ns=0 AND COALESCE(r.interwiki,'')=''")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<HashMap<_,_>,_>>()?;
+    let mut parents = std::collections::BTreeMap::<String, Vec<String>>::new();
+    {
+        let mut query = source.prepare("SELECT p.title,COALESCE(t.title,c.title) FROM dump_category c JOIN dump_page p ON p.id=c.source_id LEFT JOIN dump_target t ON t.id=c.target_id WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM dump_page h JOIN dump_prop hp ON hp.page_id=h.id WHERE h.ns=14 AND hp.name='hiddencat' AND h.title=COALESCE(t.title,c.title))")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            parents.entry(row.get(0)?).or_default().push(row.get(1)?);
+        }
+    }
+    let mut inputs = crate::TopicInputAccumulator::new(titles, items, redirects.clone(), known)?;
+    let graph_seconds = begin.elapsed().as_secs_f64();
+    topic_deadline(deadline)?;
+    let (spool, file) = TopicSpool::new(output)?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"{\"category_parents\": ");
+    digest.update(python_json(&json!(parents))?.as_bytes());
+    digest.update(b", \"metadata\": ");
+    digest.update(python_json(&metadata)?.as_bytes());
+    digest.update(b", \"pages\": [");
+    let mut pages_query = source.prepare("SELECT id,data FROM pages ORDER BY id")?;
+    let mut links_query = source.prepare("SELECT id,target FROM links ORDER BY id,rowid")?;
+    let mut cats_query = source.prepare("SELECT id,target FROM categories ORDER BY id,rowid")?;
+    let mut pages = pages_query.query([])?;
+    let mut links = links_query.query([])?;
+    let mut cats = cats_query.query([])?;
+    let mut link = next_relation(&mut links)?;
+    let mut cat = next_relation(&mut cats)?;
+    let mut processed = 0;
+    let mut predicted = 0;
+    loop {
+        topic_deadline(deadline)?;
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut outlinks = Vec::with_capacity(batch_size);
+        while batch.len() < batch_size {
+            let Some(row) = pages.next()? else {
+                break;
+            };
+            let id: i64 = row.get(0)?;
+            if link.as_ref().is_some_and(|(source, _)| *source < id)
+                || cat.as_ref().is_some_and(|(source, _)| *source < id)
+            {
+                return Err("Staging con relazione senza la voce sorgente".into());
+            }
+            let mut targets = Vec::new();
+            while link.as_ref().is_some_and(|(source, _)| *source == id) {
+                if let Some((_, title)) = link.take() {
+                    targets.push(title);
+                }
+                link = next_relation(&mut links)?;
+            }
+            let mut categories = Vec::new();
+            while cat.as_ref().is_some_and(|(source, _)| *source == id) {
+                if let Some((_, title)) = cat.take() {
+                    categories.push(title);
+                }
+                cat = next_relation(&mut cats)?;
+            }
+            let mut page: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            page["links"] = json!(targets);
+            page["categories"] = json!(categories);
+            batch.push((id, page));
+            outlinks.push(targets);
+        }
+        if batch.is_empty() {
+            break;
+        }
+        let results = inputs.add_batch(outlinks)?;
+        let end = processed + batch.len();
+        let expected_ids = identities
+            .get(processed..end)
+            .ok_or("Troppi record nello staging")?;
+        let (records, count) = predict_topic_batch(&results, expected_ids, model, spec)?;
+        for (((id, page), record), (expected_id, _)) in
+            batch.into_iter().zip(records).zip(expected_ids)
+        {
+            if id != *expected_id {
+                return Err("Staging con ordine delle pagine diverso dal dump".into());
+            }
+            if processed != 0 {
+                digest.update(b", ");
+            }
+            digest.update(python_json(&page)?.as_bytes());
+            serde_json::to_writer(&mut writer, &record)?;
+            writer.write_all(b"\n")?;
+            processed += 1;
+        }
+        predicted += count;
+        if processed % 100000 < results.len() {
+            println!("Temi SQL {language}: {processed}/{expected} voci");
+        }
+    }
+    if link.is_some() || cat.is_some() {
+        return Err("Staging con relazioni non associate a voci".into());
+    }
+    inputs.finish()?;
+    if processed != expected {
+        return Err("Predizioni incomplete rispetto al censimento SQL".into());
+    }
+    writer.flush()?;
+    drop(writer);
+    digest.update(b"], \"redirects\": ");
+    digest.update(python_json(&json!(redirects))?.as_bytes());
+    digest.update(b"}");
+    topic_deadline(deadline)?;
+    let raw_checksum = hash(raw_path)?;
+    if file_signature(raw_path)? != raw_signature
+        || hash(manifest_path)? != metadata["dump_manifest_sha256"]
+    {
+        return Err("Input dei temi modificati durante l'inferenza".into());
+    }
+    topic_deadline(deadline)?;
+    let topic_metadata = json!({"language":language,"source":"local_model_on_verified_SQL_dump_outlinks","demo":false,"complete":true,
+        "started_at":started,"finished_at":topic_time(),"input_sha256":format!("{:x}",digest.finalize()),"input_file_sha256":raw_checksum,
+        "graph_finished_at":metadata["finished_at"],"model":spec,"top_level_rule":"any_child_probability_gt_0.5",
+        "scope":"model topic labels, not biographical gender observations","timing":{"native_graph_seconds":graph_seconds,"prediction_seconds":begin.elapsed().as_secs_f64()-graph_seconds},"predicted_pages":predicted,"missing_pages":expected-predicted});
+    spool.publish(output, &topic_metadata)?;
+    Ok(topic_metadata)
+}
+
+/// In-memory parity path for explicitly synthetic graphs. Production imports
+/// always use predict_imported_topics, regardless of their edition's size.
+#[cfg(feature = "cli")]
+pub fn predict_topics(
+    raw: &serde_json::Value,
+    model: &mut impl TopicModel,
+    spec: &serde_json::Value,
+    batch_size: usize,
+    deadline: Option<std::time::Instant>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::json;
+    use sha2::Digest;
+    use std::collections::{HashMap, HashSet};
+    validate_topic_spec(spec)?;
+    validate_topic_labels(&model.labels()?, spec)?;
+    if !(1..=10000).contains(&batch_size) {
+        return Err("Dimensione del blocco non valida".into());
+    }
+    let metadata = &raw["metadata"];
+    if metadata.get("finished_at").is_none() {
+        return Err("Identità temporale del grafo mancante".into());
+    }
+    let language = metadata["language"].as_str().ok_or("Lingua mancante")?;
+    crate::wiki_database(language, metadata["database"].as_str())?;
+    if metadata["complete"] != true
+        || metadata["demo"] != true
+        || metadata["item_mapping"] != json!({"source":"page_props.wikibase_item","complete":true})
+    {
+        return Err("Il percorso in memoria richiede un grafo sintetico completo con QID".into());
+    }
+    topic_deadline(deadline)?;
+    let started = topic_time();
+    let begin = std::time::Instant::now();
+    let pages = raw["pages"].as_array().ok_or("Pagine mancanti")?;
+    let mut identities = Vec::with_capacity(pages.len());
+    let mut titles = Vec::with_capacity(pages.len());
+    let mut links = Vec::with_capacity(pages.len());
+    let mut items = Vec::with_capacity(pages.len());
+    for page in pages {
+        identities.push((
+            page["page_id"].as_i64().ok_or("ID di pagina non valido")?,
+            page["revision_id"].clone(),
+        ));
+        titles.push(page["title"].as_str().ok_or("Titolo mancante")?.to_owned());
+        links.push(match page.get("links") {
+            None => Vec::new(),
+            Some(links) => links
+                .as_array()
+                .ok_or("Collegamenti non validi")?
+                .iter()
+                .map(|link| {
+                    link.as_str()
+                        .map(str::to_owned)
+                        .ok_or("Collegamento non valido")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        });
+        items.push(page["wikibase_item"].as_str().map(str::to_owned));
+    }
+    if identities
+        .iter()
+        .map(|(id, _)| id)
+        .collect::<HashSet<_>>()
+        .len()
+        != identities.len()
+    {
+        return Err("Identificativi di pagina duplicati".into());
+    }
+    let redirects: HashMap<String, String> =
+        serde_json::from_value(raw.get("redirects").cloned().unwrap_or(json!({})))?;
+    let (_, _, _, incoming) = crate::graph_details(titles, links, redirects)?;
+    let graph_seconds = begin.elapsed().as_secs_f64();
+    topic_deadline(deadline)?;
+    let (unique, _) = crate::unique_items(&items);
+    let mut known = HashSet::new();
+    for item in unique.keys() {
+        if model.word_id(item)? >= 0 {
+            known.insert(item.clone());
+        }
+    }
+    let inputs = crate::topic_inputs(pages.len(), unique, known, incoming)?;
+    let mapping_seconds = begin.elapsed().as_secs_f64() - graph_seconds;
+    let prediction_start = std::time::Instant::now();
+    let mut records = Vec::with_capacity(pages.len());
+    let mut predicted = 0;
+    // Select batches of eligible pages as in the Python synthetic path; retain
+    // the original page order, including known negatives and missing records.
+    let eligible = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, (text, _, _))| !text.is_empty())
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let mut selected = HashMap::new();
+    for indexes in eligible.chunks(batch_size) {
+        topic_deadline(deadline)?;
+        let batch = indexes
+            .iter()
+            .map(|&i| inputs[i].clone())
+            .collect::<Vec<_>>();
+        let ids = indexes
+            .iter()
+            .map(|&i| identities[i].clone())
+            .collect::<Vec<_>>();
+        let (rows, count) = predict_topic_batch(&batch, &ids, model, spec)?;
+        predicted += count;
+        selected.extend(indexes.iter().copied().zip(rows));
+    }
+    for (position, ((_, count, mapped), (id, revision))) in
+        inputs.iter().zip(&identities).enumerate()
+    {
+        records.push(selected.remove(&position).unwrap_or_else(|| json!({"page_id":id,"revision_id":revision,"topic_labels":null,"topic_input_count":count,"topic_status":if *mapped {"no_model_vocabulary"} else {"no_mapped_outlinks"}})));
+    }
+    topic_deadline(deadline)?;
+    Ok(
+        json!({"metadata":{"language":language,"source":"local_model_on_synthetic_outlinks","demo":true,"complete":true,
+        "started_at":started,"finished_at":topic_time(),"input_sha256":format!("{:x}",sha2::Sha256::digest(python_json(raw)?.as_bytes())),
+        "graph_finished_at":metadata["finished_at"],"model":spec,"top_level_rule":"any_child_probability_gt_0.5",
+        "scope":"model topic labels, not biographical gender observations","timing":{"native_graph_seconds":graph_seconds,"mapping_seconds":mapping_seconds,"prediction_seconds":prediction_start.elapsed().as_secs_f64()},
+        "predicted_pages":predicted,"missing_pages":pages.len()-predicted},"pages":records}),
+    )
+}
+
+#[cfg(feature = "cli")]
+pub struct TopicRunOptions<'a> {
+    pub input_dir: &'a std::path::Path,
+    pub output_dir: &'a std::path::Path,
+    pub model_path: &'a std::path::Path,
+    pub spec_path: &'a std::path::Path,
+    pub work_dir: Option<&'a std::path::Path>,
+    pub batch_size: usize,
+    pub budget_seconds: f64,
+}
+
+/// One verified model, the entire selected pool, and a total inference budget.
+#[cfg(feature = "cli")]
+pub fn run_topics(
+    languages: &[String],
+    options: TopicRunOptions<'_>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    if !options.budget_seconds.is_finite() || options.budget_seconds <= 0.0 {
+        return Err("Il budget deve essere un numero positivo finito".into());
+    }
+    if !(1..=10000).contains(&options.batch_size) {
+        return Err("Dimensione del blocco non valida".into());
+    }
+    let began = Instant::now();
+    let deadline = began
+        .checked_add(Duration::try_from_secs_f64(options.budget_seconds)?)
+        .ok_or("Budget troppo grande")?;
+    let paths = languages
+        .iter()
+        .map(|code| options.input_dir.join(format!("{code}-raw.json")))
+        .collect::<Vec<_>>();
+    if paths.iter().any(|path| !path.is_file()) {
+        return Err("Manca un censimento completo: importare prima i dump".into());
+    }
+    let outputs = languages
+        .iter()
+        .map(|code| options.output_dir.join(format!("{code}-topics.json")))
+        .chain(std::iter::once(options.output_dir.join("topic-run.json")))
+        .collect::<Vec<_>>();
+    for output in &outputs {
+        for input in paths
+            .iter()
+            .map(|p| p.as_path())
+            .chain([options.model_path, options.spec_path])
+        {
+            if resolved_path(output)? == resolved_path(input)? {
+                return Err("Output dei temi sovrapposto agli input".into());
+            }
+        }
+    }
+    let spec: Value = serde_json::from_slice(&std::fs::read(options.spec_path)?)?;
+    let mut model = NativeTopicModel::load(options.model_path, &spec)?;
+    let mut report = json!({"time_budget_seconds":options.budget_seconds,"completed_languages":[],"deferred_languages":[],"wikis":[]});
+    let mut completed = Vec::new();
+    let mut deferred = Vec::new();
+    let mut wikis = Vec::new();
+    let mut rate: Option<f64> = None;
+    for (position, path) in paths.iter().enumerate() {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64();
+        if remaining == 0.0
+            || rate.is_some_and(|rate| {
+                path.metadata()
+                    .map(|m| m.len() as f64 * rate * 2.0 > remaining)
+                    .unwrap_or(false)
+            })
+        {
+            deferred = languages[position..].to_vec();
+            break;
+        }
+        let before = Instant::now();
+        let output = &outputs[position];
+        let metadata = first_metadata(path)?;
+        if metadata["language"] != languages[position] {
+            return Err("Lingua del censimento non corrispondente al file selezionato".into());
+        }
+        let result = if metadata["source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("Wikimedia SQL dumps / "))
+        {
+            predict_imported_topics(
+                path,
+                output,
+                &mut model,
+                &spec,
+                options.batch_size,
+                Some(deadline),
+                options.work_dir,
+            )
+        } else {
+            let raw = serde_json::from_slice(&std::fs::read(path)?)?;
+            predict_topics(&raw, &mut model, &spec, options.batch_size, Some(deadline)).and_then(
+                |supplement| {
+                    DumpClient::<WikimediaHttp>::write_json(output, &supplement)?;
+                    Ok(supplement["metadata"].clone())
+                },
+            )
+        };
+        let metadata = match result {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut) =>
+            {
+                deferred = languages[position..].to_vec();
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let elapsed = before.elapsed().as_secs_f64();
+        rate = Some(
+            rate.unwrap_or(0.0)
+                .max(elapsed / path.metadata()?.len().max(1) as f64),
+        );
+        completed.push(languages[position].clone());
+        wikis.push(json!({"language":languages[position],"seconds":elapsed,
+            "census_pages":metadata["predicted_pages"].as_u64().ok_or("Conteggio predetto mancante")?+metadata["missing_pages"].as_u64().ok_or("Conteggio mancante")?,
+            "predicted_pages":metadata["predicted_pages"],"timing":metadata["timing"]}));
+        println!("Temi salvati: {}; {elapsed:.1}s", output.display());
+    }
+    report["completed_languages"] = json!(completed);
+    report["deferred_languages"] = json!(deferred);
+    report["wikis"] = json!(wikis);
+    report["elapsed_seconds"] = json!(began.elapsed().as_secs_f64());
+    DumpClient::<WikimediaHttp>::write_json(&options.output_dir.join("topic-run.json"), &report)?;
+    if !deferred.is_empty() {
+        println!("Rinviate senza campionamento: {}", deferred.join(" "));
+    }
+    Ok(report)
 }
 
 // Existing quality checkpoint identities use Python's sorted ASCII JSON with

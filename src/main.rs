@@ -203,6 +203,36 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "topics" {
+            let work = self
+                .args
+                .get_one::<String>("work-dir")
+                .map(|path| self.root.join(path));
+            _native::dumps::run_topics(
+                &self
+                    .editions
+                    .iter()
+                    .map(|(code, _)| code.clone())
+                    .collect::<Vec<_>>(),
+                _native::dumps::TopicRunOptions {
+                    input_dir: &self.path("input-dir")?,
+                    output_dir: &self.path("output-dir")?,
+                    model_path: &self.path("model")?,
+                    spec_path: &self.path("model-config")?,
+                    work_dir: work.as_deref(),
+                    batch_size: *self
+                        .args
+                        .get_one::<u32>("batch-size")
+                        .ok_or("Batch mancante")? as usize,
+                    budget_seconds: *self
+                        .args
+                        .get_one::<f64>("time-budget-seconds")
+                        .ok_or("Budget mancante")?,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if matches!(self.name.as_str(), "fetch-dumps" | "fetch-content") {
             use _native::dumps::{DumpClient, WikimediaHttp};
             let mut client = DumpClient::new(WikimediaHttp::new()?);

@@ -36,7 +36,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev pkg-config
+          sudo apt-get install -y libsqlite3-dev pkg-config g++ curl tar
           python -m venv .venv
           .venv/bin/python -m pip install 'maturin>=1.12,<2'
           cargo install wasm-bindgen-cli --version 0.2.105 --locked
@@ -45,6 +45,7 @@ jobs:
         run: .venv/bin/maturin develop --release --locked
       - name: Check Rust
         run: |
+          sh scripts/prepare-fasttext.sh
           cargo fmt --check
           cargo test --locked
           cargo test --locked --no-default-features

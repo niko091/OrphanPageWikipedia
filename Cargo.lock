@@ -807,6 +807,7 @@ name = "orphanwiki-native"
 version = "0.1.0"
 dependencies = [
  "bzip2",
+ "cc",
  "chrono",
  "clap",
  "flate2",

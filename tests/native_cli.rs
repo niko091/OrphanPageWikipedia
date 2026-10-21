@@ -97,7 +97,7 @@ fn explicit_repository_root_loads_only_its_configured_pool() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8(output.stderr)
         .unwrap()
-        .contains("non è ancora migrato"));
+        .contains("Manca un censimento completo"));
     assert_eq!(fs::read_dir(&repository.0).unwrap().count(), 1);
     assert_eq!(fs::read_dir(&workspace.0).unwrap().count(), 0);
 }
