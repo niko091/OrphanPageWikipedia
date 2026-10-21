@@ -1,7 +1,7 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    comparison_schema, export_comparison_member, match_comparison, stage_comparison_graph,
-    AnalysisOptions,
+    compare_files, comparison_schema, export_comparison_member, match_comparison,
+    seed_comparison_pairs, stage_comparison_graph, AnalysisOptions, ComparisonOptions,
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -236,4 +236,250 @@ fn comparison_export_streams_original_order_and_preserves_an_approved_file_on_fa
         .unwrap();
     assert!(export_comparison_member(&db, "vec", &output).is_err());
     assert_eq!(fs::read(&output).unwrap(), bytes);
+}
+
+fn cache_options(work: &std::path::Path) -> ComparisonOptions<'_> {
+    ComparisonOptions {
+        rules: options().rules,
+        work_dir: work,
+        topics: &[],
+        histories: &[],
+        qualities: &[],
+        allowed_languages: None,
+        published: None,
+    }
+}
+fn write_graph(w: &Workspace, raw: &Value) -> PathBuf {
+    let path = w.0.join(format!(
+        "{}-raw.json",
+        raw["metadata"]["language"].as_str().unwrap()
+    ));
+    fs::write(&path, raw.to_string()).unwrap();
+    path
+}
+fn cache_manifest(work: &std::path::Path) -> (Vec<u8>, PathBuf, Vec<u8>) {
+    let bytes = fs::read(work.join("comparison-cache/manifest.json")).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let path = work
+        .join("comparison-cache")
+        .join(value["file"].as_str().unwrap());
+    let database = fs::read(&path).unwrap();
+    (bytes, path, database)
+}
+fn pairs(db: &Connection) -> Vec<(String, String, String, String)> {
+    db.prepare("SELECT * FROM comparison_pairs ORDER BY language,reference")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+fn matches(db: &Connection) -> Vec<(String, String, i64, i64, i64, i64)> {
+    db.prepare("SELECT * FROM comparison_matches ORDER BY language,reference,target,source")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn persistent_cache_reuses_generations_and_invalidates_only_incident_graph_pairs() {
+    let w = Workspace::new();
+    let work = w.0.join("work");
+    let opts = cache_options(&work);
+    let vec = write_graph(&w, &graph("vec", &[(2, vec![4])], 8));
+    let lmo = write_graph(&w, &graph("lmo", &[(2, vec![1]), (3, vec![1])], 8));
+    let db = compare_files(&[vec.clone(), lmo.clone()], &opts).unwrap();
+    let initial = cache_manifest(&work);
+    let original_pairs = pairs(&db);
+    let original_matches = matches(&db);
+    assert!(db.execute("DELETE FROM wikis", []).is_err());
+    db.close().unwrap();
+    let db = compare_files(std::slice::from_ref(&vec), &opts).unwrap();
+    assert_eq!(cache_manifest(&work).0, initial.0);
+    assert_eq!(pairs(&db), original_pairs);
+    db.close().unwrap();
+    let fr = write_graph(&w, &graph("fr", &[(4, vec![1])], 8));
+    let db = compare_files(std::slice::from_ref(&fr), &opts).unwrap();
+    assert_eq!(census(&db, "wikis"), 3);
+    assert_eq!(census(&db, "comparison_pairs"), 6);
+    assert_eq!(
+        matches(&db)
+            .into_iter()
+            .filter(|r| r.0 != "fr" && r.1 != "fr")
+            .collect::<Vec<_>>(),
+        original_matches
+    );
+    assert_eq!(
+        pairs(&db)
+            .into_iter()
+            .filter(|r| r.0 != "fr" && r.1 != "fr")
+            .collect::<Vec<_>>(),
+        original_pairs
+    );
+    let all_pairs = pairs(&db);
+    let all_matches = matches(&db);
+    let expanded = cache_manifest(&work);
+    db.close().unwrap();
+    let changed_rules = json!({"min_support":2});
+    let mut measures = cache_options(&work);
+    measures.rules = &changed_rules;
+    let db = compare_files(std::slice::from_ref(&fr), &measures).unwrap();
+    assert_eq!(pairs(&db), all_pairs);
+    assert_eq!(matches(&db), all_matches);
+    let refreshed = cache_manifest(&work);
+    db.close().unwrap();
+    write_graph(&w, &graph("lmo", &[(5, vec![1])], 8));
+    let db = compare_files(std::slice::from_ref(&fr), &measures).unwrap();
+    assert_eq!(
+        pairs(&db)
+            .into_iter()
+            .filter(|r| r.0 != "lmo" && r.1 != "lmo")
+            .collect::<Vec<_>>(),
+        all_pairs
+            .into_iter()
+            .filter(|r| r.0 != "lmo" && r.1 != "lmo")
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        matches(&db)
+            .into_iter()
+            .filter(|r| r.0 != "lmo" && r.1 != "lmo")
+            .collect::<Vec<_>>(),
+        all_matches
+            .into_iter()
+            .filter(|r| r.0 != "lmo" && r.1 != "lmo")
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(candidate(&db, "vec", 1)["candidates"][0]["page_id"], 3);
+    for old in [initial, expanded, refreshed] {
+        assert_eq!(fs::read(old.1).unwrap(), old.2);
+    }
+    let sources: Vec<String> = db
+        .prepare("SELECT sources FROM comparison_inputs")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for source in sources {
+        let value: Value = serde_json::from_str(&source).unwrap();
+        for path in value
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_str)
+        {
+            assert!(!std::path::Path::new(path).is_absolute());
+        }
+    }
+}
+
+#[test]
+fn incomplete_cache_updates_and_corruption_cannot_approve_a_new_generation() {
+    let w = Workspace::new();
+    let work = w.0.join("work");
+    let opts = cache_options(&work);
+    let vec = write_graph(&w, &graph("vec", &[], 8));
+    let lmo = write_graph(&w, &graph("lmo", &[(2, vec![1])], 8));
+    compare_files(&[vec.clone(), lmo.clone()], &opts)
+        .unwrap()
+        .close()
+        .unwrap();
+    let approved = cache_manifest(&work);
+    write_graph(&w, &graph("vec", &[(3, vec![4])], 8));
+    let mut invalid = graph("lmo", &[], 8);
+    invalid["pages"][7]["page_id"] = json!(0);
+    write_graph(&w, &invalid);
+    assert!(compare_files(std::slice::from_ref(&vec), &opts).is_err());
+    assert_eq!(cache_manifest(&work).0, approved.0);
+    assert_eq!(fs::read(&approved.1).unwrap(), approved.2);
+    assert!(fs::read_dir(&work).unwrap().all(|p| !p
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("orphanwiki-export-")));
+    write_graph(&w, &graph("lmo", &[(2, vec![1])], 8));
+    fs::write(&approved.1, b"corrupt").unwrap();
+    assert!(compare_files(std::slice::from_ref(&vec), &opts).is_err());
+    assert_eq!(
+        fs::read(work.join("comparison-cache/manifest.json")).unwrap(),
+        approved.0
+    );
+}
+
+#[test]
+fn cache_retirement_obeys_the_configured_language_pool() {
+    let w = Workspace::new();
+    let work = w.0.join("work");
+    let mut opts = cache_options(&work);
+    let paths = [
+        write_graph(&w, &graph("vec", &[], 8)),
+        write_graph(&w, &graph("lmo", &[(2, vec![1])], 8)),
+        write_graph(&w, &graph("fr", &[(3, vec![1])], 8)),
+    ];
+    compare_files(&paths, &opts).unwrap().close().unwrap();
+    let pool = vec!["vec".to_owned(), "lmo".to_owned()];
+    opts.allowed_languages = Some(&pool);
+    assert!(compare_files(std::slice::from_ref(&paths[2]), &opts).is_err());
+    let db = compare_files(std::slice::from_ref(&paths[0]), &opts).unwrap();
+    assert_eq!(census(&db, "wikis"), 2);
+    assert_eq!(census(&db, "comparison_pairs"), 2);
+    assert!(pairs(&db).iter().all(|r| r.0 != "fr" && r.1 != "fr"));
+}
+
+#[test]
+fn prior_publications_seed_only_verified_complete_pairs_and_reject_tampered_evidence() {
+    let w = Workspace::new();
+    let mut first = Connection::open("").unwrap();
+    comparison_schema(&first).unwrap();
+    let raws = [graph("vec", &[], 8), graph("lmo", &[(2, vec![1])], 8)];
+    for raw in &raws {
+        w.stage(&mut first, raw);
+    }
+    match_comparison(&mut first).unwrap();
+    let mut published = std::collections::BTreeMap::new();
+    for lang in ["vec", "lmo"] {
+        let path = w.0.join(format!("{lang}.json"));
+        export_comparison_member(&first, lang, &path).unwrap();
+        published.insert(lang.to_owned(), path);
+    }
+    let mut next = Connection::open("").unwrap();
+    comparison_schema(&next).unwrap();
+    for raw in &raws {
+        w.stage(&mut next, raw);
+    }
+    seed_comparison_pairs(&mut next, &published).unwrap();
+    assert_eq!(pairs(&next), pairs(&first));
+    assert_eq!(matches(&next), matches(&first));
+    next.execute_batch("CREATE TRIGGER no_rematching BEFORE INSERT ON comparison_matches BEGIN SELECT RAISE(ABORT,'seed ignored');END;").unwrap();
+    match_comparison(&mut next).unwrap();
+    assert_eq!(candidate(&next, "vec", 1), candidate(&first, "vec", 1));
+    let path = &published["vec"];
+    let mut canonical: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    canonical["link_candidates"]["1"]["candidates"][0]["evidence"][0]["source_title"] =
+        json!("Tampered");
+    fs::write(path, canonical.to_string()).unwrap();
+    let mut invalid = Connection::open("").unwrap();
+    comparison_schema(&invalid).unwrap();
+    for raw in &raws {
+        w.stage(&mut invalid, raw);
+    }
+    assert!(seed_comparison_pairs(
+        &mut invalid,
+        &std::collections::BTreeMap::from([("vec".into(), path.clone())])
+    )
+    .is_err());
+    assert_eq!(census(&invalid, "comparison_pairs"), 0);
+    assert_eq!(census(&invalid, "comparison_matches"), 0);
 }

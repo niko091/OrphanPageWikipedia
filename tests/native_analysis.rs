@@ -1,7 +1,7 @@
 #![cfg(feature = "cli")]
 use _native::dumps::{
-    analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, AnalysisOptions,
-    SQL_TABLES,
+    analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, comparison_schema,
+    stage_comparison_graph, AnalysisOptions, SQL_TABLES,
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -398,4 +398,57 @@ fn memory_analysis_rejects_partial_censuses_stale_supplements_and_external_enric
         false
     )
     .is_err());
+}
+
+#[test]
+fn large_sql_comparison_builds_complete_eligible_edges_from_verified_staging() {
+    use std::io::Write;
+    let w = Workspace::new(523);
+    let mut raw = w.read("raw.json");
+    raw["metadata"]["item_mapping"] = json!({"source":"page_props.wikibase_item","complete":true});
+    let path = w.0.join("raw.json");
+    fs::write(
+        &path,
+        format!(
+            "{{\"metadata\":{},\"pages\":{},\"redirects\":{},\"category_parents\":{}}}",
+            raw["metadata"], raw["pages"], raw["redirects"], raw["category_parents"]
+        ),
+    )
+    .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let padding = [b' '; 65536];
+    for _ in 0..2048 {
+        file.write_all(&padding).unwrap();
+    }
+    drop(file);
+    let mut db = Connection::open("").unwrap();
+    comparison_schema(&db).unwrap();
+    stage_comparison_graph(
+        &path,
+        &mut db,
+        &AnalysisOptions {
+            rules: &json!({}),
+            work_dir: Some(&w.0),
+            history: None,
+            quality: None,
+            topics: None,
+            batch_size: 7,
+        },
+    )
+    .unwrap();
+    let count = |table: &str| -> usize {
+        db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("pages"), 523);
+    assert_eq!(count("items"), 523);
+    assert_eq!(count("edges"), 131);
+    let meta: Value = serde_json::from_str(
+        &db.query_row("SELECT metadata FROM wikis", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["analysis_source"], "verified_import_stage");
+    assert_eq!(meta["input_checksum_format"], "raw_file_bytes_v1");
+    assert_eq!(meta["input_sha256"], hash(&fs::read(path).unwrap()));
 }
