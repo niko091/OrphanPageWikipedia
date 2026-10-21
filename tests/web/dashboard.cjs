@@ -1186,6 +1186,67 @@ async function checkEditorialTransports() {
   assert.equal(JSON.stringify(files),before);
   console.log('Editorial transports: eleven-language cards without canonical downloads, focused detail, all evidence, prompt parity, stale/unsafe rejection and unchanged inputs passed.');
   await checkCardIndex();
+  await checkSharedConnectionMetadata();
+}
+async function checkSharedConnectionMetadata() {
+  const raw=fixture();raw.metadata.demo=false;
+  const entries=JSON.parse(fs.readFileSync(path.join(fixtureDir,'manifest.json')));
+  const entry={...entries.find(entry=>entry.file==='fixture.json'),demo:false};
+  const shared=fixtureTransport('connections_metadata_file');shared.metadata.demo=false;
+  const key=Object.keys(raw.link_candidates).find(key=>raw.link_candidates[key].candidates?.length);
+  assert(key);
+  const detail=JSON.parse(fs.readFileSync(path.join(fixtureDir,entry.connections_dir,key+'.json')));
+  assert.equal(detail.format,'connections_v2');assert.equal(detail.metadata,undefined);
+  const {connection_identity,...body}=detail;
+  const legacyDetail={...body,format:'connections_v1',metadata:shared.metadata};
+  const oldEntry={...entry,connections_dir:'legacy-details'};delete oldEntry.connections_metadata_file;
+  const lmoMetadata=fixtureTransport('connections_metadata_file','lmo-demo.json').metadata;lmoMetadata.demo=false;
+  const lmo={...entries.find(entry=>entry.file==='lmo-demo.json'),demo:false};
+  const index={metadata:{language:'all',kind:'aggregate',complete:true,demo:false,languages:['vec','lmo'],
+    started_at:raw.metadata.started_at,finished_at:raw.metadata.finished_at},members:[
+      {language:'vec',file:entry.file,page_count:shared.census_page_count,metadata:shared.metadata},
+      {language:'lmo',file:lmo.file,page_count:240,metadata:lmoMetadata}]};
+  const all={language:'all',file:'all.json',date:index.metadata.finished_at,kind:'aggregate'};
+  const detailFile=entry.connections_dir+'/'+key+'.json';
+  const files={'all.json':index,[detailFile]:detail,[entry.connections_metadata_file]:shared,
+    ['legacy-details/'+key+'.json']:legacyDetail};
+  const search=`?dataset=all.json&page=${key}&language=vec`;
+  const old=await harness('connections',raw,search,[all,oldEntry,lmo],{},files);
+  const next=await harness('connections',raw,search,[all,entry,lmo],{},files);
+  const logical=result=>vm.runInContext('JSON.stringify({metadata:data.metadata,pages:data.pages,link_candidates:data.link_candidates})',result.context);
+  assert.equal(logical(next),logical(old));
+  assert.deepEqual(next.requests.filter(request=>request.url.startsWith('data/')).map(request=>request.url),
+    ['data/manifest.json','data/all.json','data/'+detailFile,'data/'+entry.connections_metadata_file]);
+  assert(!next.requests.some(request=>request.url.startsWith('https://')));
+  const oldPrompt=await preparePrompt(old,old.nodes['connection-copy-prompt']);
+  const nextPrompt=await preparePrompt(next,next.nodes['connection-copy-prompt']);
+  const stable=prompt=>prompt.replace(/"retrieved_at": "[^"]+"/g,'"retrieved_at": "<retrieval>"');
+  assert.equal(stable(nextPrompt),stable(oldPrompt));assert.equal(next.copied.length,0);
+  for(const mutate of [
+    documents=>documents[entry.connections_metadata_file].connection_identity='b'.repeat(64),
+    documents=>documents[entry.connections_metadata_file].census_page_count++,
+    documents=>documents[entry.connections_metadata_file].metadata.language='lmo',
+    documents=>documents[entry.connections_metadata_file].metadata.finished_at='old',
+    documents=>documents[entry.connections_metadata_file].format='wrong',
+    documents=>documents[detailFile].connection_identity='b'.repeat(64),
+    documents=>documents[detailFile].metadata=shared.metadata,
+    documents=>documents[detailFile].census_page_count++,
+    documents=>documents[detailFile].format='connections_v1',
+    documents=>delete documents[entry.connections_metadata_file]
+  ]) {
+    const bad=JSON.parse(JSON.stringify(files));mutate(bad);
+    const rejected=await harness('connections',raw,search,[all,entry,lmo],{},bad);
+    assert.match(rejected.nodes.status.textContent,/Impossibile caricare/);
+    assert.equal(rejected.nodes['connection-copy-prompt'].disabled,true);
+    assert(!rejected.requests.some(request=>request.url.startsWith('https://')));
+  }
+  const unsafe=await harness('connections',raw,search,[all,{...entry,connections_metadata_file:'../outside.json'},lmo],{},files);
+  assert.match(unsafe.nodes.status.textContent,/Nome dataset non valido/);
+  assert(!unsafe.requests.some(request=>request.url.includes('outside')));
+  const undeclared={...entry};delete undeclared.connections_metadata_file;
+  const rejected=await harness('connections',raw,search,[all,undeclared,lmo],{},files);
+  assert.match(rejected.nodes.status.textContent,/Impossibile caricare/);
+  console.log('Shared connection metadata: generated v2 details reconstruct v1 pages/evidence and prompts, focused aggregate loads only its own metadata, stale/mixed/unsafe sources rejected.');
 }
 async function checkCardIndex() {
   const raw=fixture(),template=raw.pages[0],columns=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'];

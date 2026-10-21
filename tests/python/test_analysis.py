@@ -16,6 +16,21 @@ from orphanwiki.categories import classify
 from orphanwiki.core import analyze, write_json, json_sha256, write_observations, iter_export_sections, write_dashboard_exports, prepared_summaries_match, OBSERVATION_COLUMNS
 
 
+def reconstructed_connection(root, entry, identifier):
+    detail = json.loads((root / entry['connections_dir'] / f'{identifier}.json').read_text())
+    if detail['format'] == 'connections_v1':
+        return detail
+    shared = json.loads((root / entry['connections_metadata_file']).read_text())
+    assert detail['format'] == 'connections_v2'
+    assert shared['format'] == 'connections_metadata_v1'
+    assert detail['connection_identity'] == shared['connection_identity']
+    assert detail['census_page_count'] == shared['census_page_count']
+    assert 'metadata' not in detail
+    return {'format': 'connections_v1', 'metadata': shared['metadata'],
+            'census_page_count': detail['census_page_count'], 'pages': detail['pages'],
+            'link_candidates': detail['link_candidates']}
+
+
 def reconstructed_cards(root, entry):
     index = json.loads((root / entry['cards_file']).read_text())
     assert index['format'] == 'orphan_cards_v2'
@@ -211,9 +226,13 @@ class ExportTests(unittest.TestCase):
                                                        'evidence': evidence}]}}}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'detail.json'
-            write_json(path, detail)
-            self.assertEqual(path.read_bytes(), json.dumps(
-                detail, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+            version2 = {key: value for key, value in detail.items() if key != 'metadata'}
+            version2.update(format='connections_v2', connection_identity='a' * 64, census_page_count=2)
+            for value in (detail, version2):
+                with self.subTest(format=value['format']):
+                    write_json(path, value)
+                    self.assertEqual(path.read_bytes(), json.dumps(
+                        value, ensure_ascii=False, allow_nan=False).encode('utf-8'))
 
     def test_legacy_quality_summary_keeps_its_measure_identity(self):
         result = analyze(demo())
@@ -544,7 +563,7 @@ class ExportTests(unittest.TestCase):
             rebuild_dashboard(root)
             entry = json.loads((root / 'manifest.json').read_text())[0]
             for key in ('observations_file', 'articles_file', 'summary_file', 'creator_index_file',
-                        'cards_file', 'cards_dir', 'connections_dir', 'profile_topics_dir'):
+                        'cards_file', 'cards_dir', 'connections_dir', 'connections_metadata_file', 'profile_topics_dir'):
                 self.assertNotEqual(entry[key], old_entry[key])
                 self.assertTrue((root / entry[key]).exists())
                 self.assertTrue((root / old_entry[key]).exists())
@@ -586,7 +605,7 @@ class ExportTests(unittest.TestCase):
             self.assertEqual([c['page_id'] for c in overview['candidates']],
                              [c['page_id'] for c in candidates[:5] + candidates[8:13]])
             self.assertTrue(all(len(c['evidence']) == 1 for c in overview['candidates']))
-            detail = json.loads((root / entry['connections_dir'] / (identifier + '.json')).read_text())
+            detail = reconstructed_connection(root, entry, identifier)
             self.assertEqual(detail['pages'], [orphan])
             self.assertEqual(detail['metadata'], result['metadata'])
             self.assertEqual(detail['census_page_count'], len(result['pages']))
@@ -594,13 +613,13 @@ class ExportTests(unittest.TestCase):
             # A missing comparison stays missing, and still has a valid detail route.
             other = next((p for p in cards['pages'] if p['page_id'] != orphan['page_id']), None)
             if other:
-                missing = json.loads((root / entry['connections_dir'] / f"{other['page_id']}.json").read_text())
+                missing = reconstructed_connection(root, entry, other['page_id'])
                 self.assertEqual(missing['link_candidates'][str(other['page_id'])], {})
             canonical = (root / 'wiki.json').read_bytes()
             rebuild_dashboard(root)
             self.assertEqual((root / 'wiki.json').read_bytes(), canonical)
             self.assertEqual(reconstructed_cards(root, entry), cards)
-            self.assertEqual(json.loads((root / entry['connections_dir'] / (identifier + '.json')).read_text()), detail)
+            self.assertEqual(reconstructed_connection(root, entry, identifier), detail)
         self.assertEqual(result, before)
 
     def test_empty_editorial_index_keeps_the_full_census_and_empty_directories(self):
@@ -644,7 +663,7 @@ class ExportTests(unittest.TestCase):
             entry = json.loads((root / 'manifest.json').read_text())[0]
             cards = reconstructed_cards(root, entry)
             self.assertEqual(cards['link_candidates'][identifier]['candidates'], [valid])
-            detail = json.loads((root / entry['connections_dir'] / (identifier + '.json')).read_text())
+            detail = reconstructed_connection(root, entry, identifier)
             self.assertEqual(detail['link_candidates'][identifier], record)
             with self.assertRaisesRegex(ValueError, 'Ordine'):
                 write_dashboard_exports(root / entry['cards_file'], root)

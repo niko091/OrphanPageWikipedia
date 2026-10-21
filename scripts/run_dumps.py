@@ -203,8 +203,7 @@ def approved_outputs(output_dir, files):
         if not prepared_summary_matches(output_dir, entry, [filename]):
             return None
         transport_keys = ['file', 'observations_file', 'cards_file']
-        if 'articles_file' in entry:
-            transport_keys.append('articles_file')
+        transport_keys.extend(key for key in ('articles_file', 'connections_metadata_file') if key in entry)
         for key in transport_keys:
             name = entry.get(key)
             if not isinstance(name, str) or not name or Path(name).name != name:

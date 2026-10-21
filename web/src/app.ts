@@ -44,6 +44,7 @@ interface CandidateRecord {
   candidate_ids?: number[];
 }
 interface CardTransport { directory: string; identity: string; metadata: DatasetMetadata; census_page_count: number; }
+interface ConnectionMetadata { format: string; metadata: DatasetMetadata; census_page_count: number; connection_identity: string; }
 interface Dataset {
   metadata: DatasetMetadata; pages: PageObservation[];
   format?: string; census_page_count?: number;
@@ -57,7 +58,7 @@ interface AggregateMember {
 interface ManifestEntry {
   language: string; file: string; date: string; published_at?: string; kind?: string; demo?: boolean;
   observations_file?: string; articles_file?: string; summary_file?: string; creator_index_file?: string;
-  cards_file?: string; cards_dir?: string; connections_dir?: string; profile_topics_dir?: string;
+  cards_file?: string; cards_dir?: string; connections_dir?: string; connections_metadata_file?: string; profile_topics_dir?: string;
 }
 interface CompactObservations {
   format: string; metadata: DatasetMetadata; columns: string[]; rows: unknown[][];
@@ -315,6 +316,7 @@ const translations: Record<string, string> = {
   "Caricamento {language}: {current}/{total} lingue…": "Loading {language}: {current}/{total} languages…",
   "Osservazioni compatte non valide": "Invalid compact observations",
   "Indice degli articoli non valido": "Invalid article index",
+  "Metadati dei collegamenti non validi": "Invalid connection metadata",
   "Dataset troppo grande per il browser: esegui python -m orphanwiki dashboard --data-dir web/data": "Dataset too large for the browser: run python -m orphanwiki dashboard --data-dir web/data",
   "Classificazione": "Classification",
   "Categorie Wikipedia": "Wikipedia categories",
@@ -1611,6 +1613,19 @@ function unpackObservations(next: CompactObservations, expectedFormat: 'observat
   });
   return {format:next.format,metadata:next.metadata,pages,census_page_count:next.census_page_count,link_candidates:next.link_candidates||{}};
 }
+async function readConnectionMetadata(entry: ManifestEntry): Promise<ConnectionMetadata | null> {
+  const filename=entry.connections_metadata_file;
+  if(filename===undefined)return null;
+  if(typeof filename!=='string'||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome dataset non valido');
+  const response=await fetch('data/'+filename,{cache:'no-store'});
+  if(!response.ok)throw new Error('Dataset non disponibile');
+  const shared=await response.json() as ConnectionMetadata;
+  if(shared?.format!=='connections_metadata_v1'||typeof shared.connection_identity!=='string'||!/^[a-f0-9]{64}$/.test(shared.connection_identity)||
+    !Number.isSafeInteger(shared.census_page_count)||shared.census_page_count<0||shared.metadata?.language!==entry.language||
+    shared.metadata.finished_at!==entry.date||shared.metadata.complete!==true||Boolean(shared.metadata.demo)!==Boolean(entry.demo))
+    throw new Error('Metadati dei collegamenti non validi');
+  return shared;
+}
 async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promise<Dataset> {
   const articleIndex=forArticleExplorer&&!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&entry.articles_file;
   const compact=!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&(articleIndex||entry.observations_file);
@@ -1625,13 +1640,19 @@ async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promi
     if(!/^[1-9][0-9]*$/.test(pageID||''))throw new Error('Identificativo della pagina non valido');
     filename=`${detail}/${pageID}.json`;
   }
-  const response=await fetch('data/'+filename,{cache:'no-store'});
+  const [response,shared]=await Promise.all([fetch('data/'+filename,{cache:'no-store'}),
+    detail?readConnectionMetadata(entry):Promise.resolve(null)]);
   if(!response.ok)throw new Error('Dataset non disponibile');
   // Legacy canonical exports may exceed the browser's single-string limit.
   // Reject an advertised oversized file before buffering it; never sample it.
   if(!compact&&!cards&&!detail&&Number(response.headers?.get('Content-Length'))>=512*1024*1024)
     throw new Error('Dataset troppo grande per il browser: esegui python -m orphanwiki dashboard --data-dir web/data');
-  const next=await response.json();
+  let next=await response.json();
+  if(shared) {
+    if(!next||next.format!=='connections_v2'||next.metadata!==undefined||next.connection_identity!==shared.connection_identity||
+      next.census_page_count!==shared.census_page_count)throw new Error('Metadati dei collegamenti non validi');
+    next={...next,format:'connections_v1',metadata:shared.metadata};
+  }
   if(articleIndex&&(next.metadata?.language!==entry.language||next.metadata?.finished_at!==entry.date||
     next.metadata?.complete!==true||Boolean(next.metadata?.demo)!==Boolean(entry.demo)))throw new Error('Indice degli articoli non valido');
   if(cards&&next.format==='orphan_cards_v2') {

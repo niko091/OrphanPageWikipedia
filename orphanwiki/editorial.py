@@ -122,10 +122,33 @@ class ReviewApplication:
         if not path.is_file():
             raise ReviewError(422, 'Coppia non presente nella raccolta')
         detail = json.loads(path.read_text(encoding='utf-8'))
+        shared_metadata = 'connections_metadata_file' in entry
+        if not isinstance(detail, dict) or detail.get('format') != (
+                'connections_v2' if shared_metadata else 'connections_v1'):
+            raise ReviewError(422, 'Dettagli della coppia non disponibili')
         metadata = detail.get('metadata', {})
+        if shared_metadata:
+            name = entry['connections_metadata_file']
+            if not isinstance(name, str) or not FILENAME.fullmatch(name):
+                raise ReviewError(422, 'Metadati della coppia non disponibili')
+            metadata_path = (self.web_root / 'data' / name).resolve()
+            if not metadata_path.is_relative_to((self.web_root / 'data').resolve()):
+                raise ReviewError(400, 'Percorso non valido')
+            if not metadata_path.is_file():
+                raise ReviewError(422, 'Metadati della coppia non disponibili')
+            shared = json.loads(metadata_path.read_text(encoding='utf-8'))
+            if (not isinstance(shared, dict) or shared.get('format') != 'connections_metadata_v1' or
+                    not isinstance(shared.get('connection_identity'), str) or
+                    not re.fullmatch(r'[a-f0-9]{64}', shared['connection_identity']) or
+                    shared['connection_identity'] != detail.get('connection_identity') or
+                    not valid_id(shared.get('census_page_count')) or
+                    not valid_id(detail.get('census_page_count')) or
+                    shared['census_page_count'] != detail.get('census_page_count') or 'metadata' in detail):
+                raise ReviewError(422, 'Metadati della coppia non corrispondenti')
+            metadata = shared.get('metadata', {})
         pages = detail.get('pages', [])
         record = detail.get('link_candidates', {}).get(str(body['target_id']), {})
-        if detail.get('format') != 'connections_v1' or metadata.get('language') != body['language'] or \
+        if not isinstance(metadata, dict) or metadata.get('language') != body['language'] or \
                 metadata.get('finished_at') != entry['date'] or metadata.get('complete') is not True or \
                 metadata.get('demo') or len(pages) != 1 or pages[0].get('page_id') != body['target_id'] or \
                 pages[0].get('orphan') is not True or not any(

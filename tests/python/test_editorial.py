@@ -1,5 +1,6 @@
 """Isolated WSGI/SQL tests; no Wikimedia, providers or production databases."""
 import io
+import copy
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,20 @@ class EditorialTests(unittest.TestCase):
 
     def write_manifest(self):
         (self.web / 'data' / 'manifest.json').write_text(json.dumps(self.entries))
+
+    def shared_detail(self):
+        entry = self.entries[0]
+        path = self.web / 'data' / entry['connections_dir'] / '1.json'
+        detail = json.loads(path.read_text())
+        shared = {'format': 'connections_metadata_v1', 'connection_identity': 'a' * 64,
+                  'metadata': detail.pop('metadata'), 'census_page_count': 3}
+        detail.update(format='connections_v2', connection_identity=shared['connection_identity'], census_page_count=3)
+        metadata_path = self.web / 'data' / 'vec-connections-metadata.json'
+        metadata_path.write_text(json.dumps(shared))
+        path.write_text(json.dumps(detail))
+        entry['connections_metadata_file'] = metadata_path.name
+        self.write_manifest()
+        return path, detail, metadata_path, shared
 
     def request(self, method='GET', path='/api/reviews', body=None, query='dataset=vec.json', app=None, **headers):
         encoded = json.dumps(body).encode() if body is not None else b''
@@ -107,6 +122,51 @@ class EditorialTests(unittest.TestCase):
         for update in [{'finished_at': 'old'}, {'language': 'en'}, {'demo': True}, {'complete': False}]:
             path.write_text(json.dumps({**original, 'metadata': {**original['metadata'], **update}}))
             self.assertEqual(self.request('POST', body=self.body)[0], 422)
+        self.assertFalse(self.database.exists())
+
+    def test_shared_connection_metadata_keeps_review_scope_and_legacy_members(self):
+        self.shared_detail()
+        before = {str(path): path.read_bytes() for path in self.web.rglob('*') if path.is_file()}
+        self.assertEqual(self.request('POST', body=self.body)[0], 200)
+        self.assertEqual(self.request('POST', body={**self.body, 'dataset': 'all.json', 'language': 'lmo'})[0], 200)
+        self.assertEqual(len(self.request(query='dataset=all.json')[1]['reviews']), 2)
+        self.assertEqual({str(path): path.read_bytes() for path in self.web.rglob('*') if path.is_file()}, before)
+
+    def test_shared_connection_metadata_rejects_mixed_stale_missing_and_unsafe_sources(self):
+        path, detail, metadata_path, shared = self.shared_detail()
+        invalid_shared = [
+            {**shared, 'format': 'wrong'}, {**shared, 'connection_identity': 'b' * 64},
+            {**shared, 'census_page_count': 4}, {**shared, 'census_page_count': True},
+            {**shared, 'metadata': None},
+            *[{**shared, 'metadata': {**shared['metadata'], **update}} for update in
+              ({'language': 'lmo'}, {'finished_at': 'old'}, {'complete': False}, {'demo': True})],
+        ]
+        for payload in invalid_shared:
+            with self.subTest(shared=payload):
+                metadata_path.write_text(json.dumps(payload))
+                self.assertEqual(self.request('POST', body=self.body)[0], 422)
+        metadata_path.write_text(json.dumps(shared))
+        for update in ({'connection_identity': 'b' * 64}, {'census_page_count': 4}, {'census_page_count': 3.0},
+                       {'metadata': copy.deepcopy(shared['metadata'])}, {'format': 'connections_v1'}):
+            with self.subTest(detail=update):
+                path.write_text(json.dumps({**detail, **update}))
+                self.assertEqual(self.request('POST', body=self.body)[0], 422)
+        path.write_text(json.dumps(detail))
+        metadata_path.unlink()
+        self.assertEqual(self.request('POST', body=self.body)[0], 422)
+        outside = self.root / 'outside.json'
+        outside.write_text(json.dumps(shared))
+        metadata_path.symlink_to(outside)
+        self.assertEqual(self.request('POST', body=self.body)[0], 400)
+        metadata_path.unlink()
+        metadata_path.write_text(json.dumps(shared))
+        for name in ('../outside.json', None):
+            self.entries[0]['connections_metadata_file'] = name
+            self.write_manifest()
+            self.assertEqual(self.request('POST', body=self.body)[0], 422)
+        del self.entries[0]['connections_metadata_file']
+        self.write_manifest()
+        self.assertEqual(self.request('POST', body=self.body)[0], 422)
         self.assertFalse(self.database.exists())
 
     def test_cross_origin_forms_large_bodies_and_static_path_escape_are_rejected(self):

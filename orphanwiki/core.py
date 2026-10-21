@@ -16,7 +16,7 @@ MEASURES_RULE = 'creation_quality_creators_v3'
 QUALITY_REVISION_RULE = 'selected_official_xml_revision_v1'
 ARTICLE_PREVIEW_LIMIT = 25
 TOPIC_LOOKUP_SHARD_SIZE = 1024
-TRANSPORT_RULE = 'dashboard_transports_v2'
+TRANSPORT_RULE = 'dashboard_transports_v3'
 SUMMARY_FIELDS = (
     'page_id', 'title', 'orphan', 'category', 'topic_status', 'topic_labels',
     'page_created_at', 'age_days', 'length_bytes', 'quality_score', 'quality_status',
@@ -948,13 +948,16 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
         directory = stem + '-connections'
         card_identity = json_sha256(['orphan_cards_v2', metadata, initial.st_size,
                                      initial.st_mtime_ns, transport_generation])
+        connection_identity = json_sha256(['connections_v2', metadata, initial.st_size,
+                                           initial.st_mtime_ns, transport_generation])
         card_directory = stem + '-cards'
         filenames = {'observations_file': stem + '-observations.json',
                      'articles_file': stem + '-articles.json',
                      'summary_file': stem + '-summary.json',
                      'creator_index_file': stem + '-creators.json',
                      'cards_file': stem + '-cards-v2.json', 'cards_dir': card_directory,
-                     'connections_dir': directory}
+                     'connections_dir': directory,
+                     'connections_metadata_file': stem + '-connections-metadata.json'}
         topic_directory = stem + '-profile-topics'
         filenames['profile_topics_dir'] = topic_directory
         if source.resolve() in {(folder / name).resolve() for name in filenames.values()}:
@@ -973,7 +976,7 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
 
         def detail(identifier, record):
             write_json(folder / directory / (identifier + '.json'),
-                       {'format': 'connections_v1', 'metadata': metadata,
+                       {'format': 'connections_v2', 'connection_identity': connection_identity,
                         'census_page_count': len(seen), 'pages': [orphans[identifier]],
                         'link_candidates': {identifier: record}})
 
@@ -1058,6 +1061,9 @@ def write_dashboard_exports(source, folder, expected=None, *, transport_generati
         summary_count, summary_json = summary.finish()
         if summary_count != len(seen):
             raise ValueError('Riepilogo del censimento incompleto')
+        write_json(folder / filenames['connections_metadata_file'],
+                   {'format': 'connections_metadata_v1', 'connection_identity': connection_identity,
+                    'metadata': metadata, 'census_page_count': len(seen)})
         write_json(folder / filenames['articles_file'],
                    {'format': 'article_index_v1', 'metadata': metadata, 'census_page_count': len(seen),
                     'columns': ARTICLE_INDEX_COLUMNS, 'rows': None, 'link_candidates': None},
@@ -1273,7 +1279,7 @@ def write_json(path, value, arrays=None, embedded_paths=None, mappings=None):
             created = True
             record_encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
             if not arrays and not embedded_paths and not mappings:
-                if (isinstance(value, dict) and value.get('format') == 'connections_v1'
+                if (isinstance(value, dict) and value.get('format') in ('connections_v1', 'connections_v2')
                         and isinstance(value.get('link_candidates'), dict)):
                     stream.writelines(_detail_chunks(value, record_encoder))
                 else:
