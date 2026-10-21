@@ -139,3 +139,89 @@ fn explicit_repository_root_loads_only_its_configured_pool() {
     assert_eq!(fs::read_dir(&repository.0).unwrap().count(), 1);
     assert_eq!(fs::read_dir(&workspace.0).unwrap().count(), 0);
 }
+
+#[test]
+fn standalone_analysis_publishes_every_output_and_preserves_previous_generations() {
+    let w = Workspace::new();
+    let input = r#"{"metadata":{"language":"vec","complete":true,"demo":true,"finished_at":"2026-10-02T00:00:00Z"},"pages":[{"page_id":1,"title":"A","created_at":"2000-01-01T00:00:00Z","links":["R","R","missing"]},{"page_id":2,"title":"B"},{"page_id":3,"title":"Isolated"}],"redirects":{"R":"B"}}"#;
+    fs::write(w.0.join("raw.json"), input).unwrap();
+    fs::write(w.0.join("rules.json"), "{}").unwrap();
+    let args = [
+        "analyze",
+        "raw.json",
+        "--rules",
+        "rules.json",
+        "--output",
+        "exports/vec.json",
+    ];
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(w.0.join(name)).unwrap()).unwrap()
+    };
+    let run = || {
+        let output = w.run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run();
+    let canonical = fs::read(w.0.join("exports/vec.json")).unwrap();
+    let csv = fs::read(w.0.join("exports/vec.csv")).unwrap();
+    let first = read("exports/manifest.json");
+    let rows = read("exports/vec.json");
+    assert_eq!(rows["pages"][0]["out_degree"], 1);
+    assert_eq!(rows["pages"][1]["in_degree"], 1);
+    assert_eq!(rows["pages"][2]["orphan"], true);
+    run();
+    let next = read("exports/manifest.json");
+    assert_ne!(first[0]["articles_file"], next[0]["articles_file"]);
+    for manifest in [&first, &next] {
+        for (key, value) in manifest[0].as_object().unwrap() {
+            if key.ends_with("_file") || key.ends_with("_dir") {
+                assert!(w.0.join("exports").join(value.as_str().unwrap()).exists());
+            }
+        }
+    }
+    assert_eq!(fs::read(w.0.join("exports/vec.json")).unwrap(), canonical);
+    assert_eq!(fs::read(w.0.join("exports/vec.csv")).unwrap(), csv);
+    let approved = fs::read(w.0.join("exports/manifest.json")).unwrap();
+    fs::write(w.0.join("raw.json"), input.replace("Isolated", "Changed")).unwrap();
+    assert!(!w.run(&args).status.success());
+    assert_eq!(
+        fs::read(w.0.join("exports/manifest.json")).unwrap(),
+        approved
+    );
+    assert_eq!(fs::read(w.0.join("exports/vec.json")).unwrap(), canonical);
+    assert_eq!(fs::read(w.0.join("exports/vec.csv")).unwrap(), csv);
+    assert!(!w
+        .run(&[
+            "analyze",
+            "raw.json",
+            "--rules",
+            "rules.json",
+            "--quality",
+            "missing.json",
+            "--output",
+            "new/vec.json"
+        ])
+        .status
+        .success());
+    assert!(!w.0.join("new").exists());
+    assert!(!w
+        .run(&[
+            "analyze",
+            "raw.json",
+            "--rules",
+            "rules.json",
+            "--output",
+            "raw.json"
+        ])
+        .status
+        .success());
+    assert!(fs::read_dir(&w.0).unwrap().all(|p| !p
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("orphanwiki-export-")));
+}

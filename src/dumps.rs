@@ -1833,7 +1833,7 @@ fn check_xml_characters(text: &str) -> DumpResult<()> {
 }
 
 #[cfg(feature = "cli")]
-fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
+pub fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
     struct First<'a>(&'a mut Option<serde_json::Value>);
     impl<'de> serde::de::Visitor<'de> for First<'_> {
         type Value = ();
@@ -2511,6 +2511,7 @@ fn publish_prepared(
     prepared: &std::path::Path,
     destination: &std::path::Path,
     original_manifest: Option<&[u8]>,
+    reused: &[(std::path::PathBuf, String)],
     mut rename: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> DumpResult<()> {
     let _lock = PublicationLock::acquire(destination)?;
@@ -2522,6 +2523,11 @@ fn publish_prepared(
     };
     if current.as_deref() != original_manifest {
         return Err("Manifest modificato da un altro writer".into());
+    }
+    for (path, checksum) in reused {
+        if file_sha256(path)? != *checksum {
+            return Err("Export riutilizzato modificato da un altro writer".into());
+        }
     }
     if !prepared.join("manifest.json").is_file() {
         return Err("Manifest preparato mancante".into());
@@ -2557,6 +2563,162 @@ fn dataset_filename(value: &serde_json::Value) -> DumpResult<&str> {
         return Err("Nome dataset non valido".into());
     }
     Ok(name)
+}
+
+/// Publish a prepared canonical member, its CSV and all dashboard transports.
+/// Existing scientific files are reusable only when their exact bytes agree.
+/// Changed results require a distinct filename so every old manifest remains
+/// usable throughout preparation and interrupted publication.
+#[cfg(feature = "cli")]
+fn publish_member(
+    prepared: &PreparedDirectory,
+    output: &std::path::Path,
+    generation: &str,
+    original_manifest: Option<&[u8]>,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::{json, Value};
+    let folder = output.parent().ok_or("Directory output mancante")?;
+    let name = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Nome output non valido")?;
+    dataset_filename(&json!(name))?;
+    let source = prepared.path.join(name);
+    let meta = first_metadata(&source)?;
+    let csv = source.with_extension("csv");
+    export_csv(&source, &csv)?;
+    let transports = prepared.path.join("transports");
+    let names = prepare_dashboard_exports(&source, &transports, None, Some(generation))?;
+    for name in names.as_object().ok_or("Trasporti non validi")?.values() {
+        let name = name.as_str().ok_or("Nome trasporto mancante")?;
+        std::fs::rename(transports.join(name), prepared.path.join(name))?;
+    }
+    std::fs::remove_dir(transports)?;
+    let mut reused = Vec::new();
+    for path in [&source, &csv] {
+        let target = folder.join(path.file_name().ok_or("Nome export mancante")?);
+        if target.try_exists()? {
+            if file_sha256(path)? != file_sha256(&target)? {
+                return Err(format!("Export già esistente con contenuto diverso: {}. Usare un nome distinto per conservare la generazione approvata",target.display()).into());
+            }
+            reused.push((target, file_sha256(path)?));
+            std::fs::remove_file(path)?;
+        }
+    }
+    let mut manifest: Vec<Value> = original_manifest
+        .map(serde_json::from_slice)
+        .transpose()?
+        .unwrap_or_default();
+    let mut files = std::collections::HashSet::new();
+    for entry in &manifest {
+        if !files.insert(dataset_filename(&entry["file"])?.to_owned()) {
+            return Err("Dataset duplicato nel manifest".into());
+        }
+    }
+    manifest
+        .retain(|entry| entry["file"] != name && (meta["demo"] == true || entry["demo"] != true));
+    let mut entry = json!({"file":name,"language":meta["language"],"date":meta["finished_at"],
+        "published_at":topic_time(),"demo":meta.get("demo").cloned().unwrap_or(json!(false)),
+        "kind":meta.get("kind").cloned().unwrap_or(json!("wiki"))});
+    entry
+        .as_object_mut()
+        .ok_or("Voce manifest non valida")?
+        .extend(names.as_object().ok_or("Trasporti non validi")?.clone());
+    manifest.push(entry);
+    DumpClient::<WikimediaHttp>::write_json(
+        &prepared.path.join("manifest.json"),
+        &json!(manifest),
+    )?;
+    publish_prepared(
+        &prepared.path,
+        folder,
+        original_manifest,
+        &reused,
+        |from, to| std::fs::rename(from, to),
+    )?;
+    Ok(meta)
+}
+
+/// Analyze a frozen input and publish one complete member without Python.
+/// The 128 MiB switch preserves the prior operational path and checksum rules.
+#[cfg(feature = "cli")]
+pub fn analyze_file(
+    raw: &std::path::Path,
+    output: &std::path::Path,
+    options: &AnalysisOptions<'_>,
+) -> DumpResult<serde_json::Value> {
+    use std::io::{BufReader, BufWriter, Write};
+    if !(1..=512).contains(&options.batch_size) {
+        return Err("Dimensione blocco non valida".into());
+    }
+    let output = resolved_path(output)?;
+    let folder = output.parent().ok_or("Directory output mancante")?;
+    let filename = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Nome output non valido")?;
+    dataset_filename(&serde_json::json!(filename))?;
+    let inputs = [Some(raw), options.history, options.quality, options.topics];
+    let signatures = inputs
+        .into_iter()
+        .flatten()
+        .map(|p| Ok((p, file_signature(p)?)))
+        .collect::<DumpResult<Vec<_>>>()?;
+    for (input, _) in &signatures {
+        let input = resolved_path(input)?;
+        if input == output
+            || input == output.with_extension("csv")
+            || input == folder.join("manifest.json")
+        {
+            return Err("Output sovrapposto a un input".into());
+        }
+    }
+    let manifest = match std::fs::read(folder.join("manifest.json")) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let (prepared, generation) =
+        export_directory(folder.parent().ok_or("Directory dati non valida")?)?;
+    let source = prepared.path.join(filename);
+    let meta = first_metadata(raw)?;
+    if file_signature(raw)?.0 >= 128 * 1024 * 1024
+        && meta["source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("Wikimedia SQL dumps / "))
+    {
+        analyze_imported_graph(raw, &source, options)?;
+    } else {
+        let read = |path: &std::path::Path| -> DumpResult<serde_json::Value> {
+            Ok(serde_json::from_reader(BufReader::new(
+                std::fs::File::open(path)?,
+            ))?)
+        };
+        let graph = read(raw)?;
+        let history = options.history.map(read).transpose()?;
+        let quality = options.quality.map(read).transpose()?;
+        let topics = options.topics.map(read).transpose()?;
+        let result = analyze_memory_graph(
+            &graph,
+            options.rules,
+            history.as_ref(),
+            quality.as_ref(),
+            topics.as_ref(),
+            false,
+        )?;
+        write_atomic(&source, |file| {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &result)?;
+            writer.flush()?;
+            Ok(())
+        })?;
+    }
+    for (path, signature) in signatures {
+        if file_signature(path)? != signature {
+            return Err("Input modificato durante l'analisi".into());
+        }
+    }
+    publish_member(&prepared, &output, &generation, manifest.as_deref())
 }
 
 /// Regenerate every approved member's transports, retaining aggregate entries
@@ -2613,7 +2775,7 @@ pub fn rebuild_dashboard(folder: &std::path::Path) -> DumpResult<()> {
         &prepared.path.join("manifest.json"),
         &serde_json::json!(manifest),
     )?;
-    publish_prepared(&prepared.path, folder, Some(&original), |from, to| {
+    publish_prepared(&prepared.path, folder, Some(&original), &[], |from, to| {
         std::fs::rename(from, to)
     })
 }
@@ -4141,6 +4303,277 @@ impl<'a> StagedRecords<'a> {
     }
 }
 
+#[cfg(feature = "cli")]
+fn analysis_rules(rules: &serde_json::Value) -> DumpResult<crate::CategoryRules> {
+    use serde_json::json;
+    if !rules.is_object() {
+        return Err("Regole delle categorie non valide".into());
+    }
+    Ok(serde_json::from_value(json!([
+        rules.get("exclude_patterns").cloned().unwrap_or(json!([])),
+        rules
+            .get("exclude_categories")
+            .cloned()
+            .unwrap_or(json!([])),
+        rules.get("category_priority").cloned().unwrap_or(json!({})),
+        rules.get("page_overrides").cloned().unwrap_or(json!({})),
+        rules.get("min_support").cloned().unwrap_or(json!(5))
+    ]))?)
+}
+
+#[cfg(feature = "cli")]
+fn supplement_records(
+    supplement: &serde_json::Value,
+) -> DumpResult<std::collections::HashMap<i64, serde_json::Value>> {
+    let mut records = std::collections::HashMap::new();
+    for record in supplement["pages"]
+        .as_array()
+        .ok_or("Pagine del supplemento mancanti")?
+    {
+        let id = record["page_id"]
+            .as_i64()
+            .ok_or("ID del supplemento non valido")?;
+        if records.insert(id, record.clone()).is_some() {
+            return Err("ID duplicato nel supplemento".into());
+        }
+    }
+    Ok(records)
+}
+
+/// Analyze a complete small or synthetic census with the same scientific rows
+/// as the bounded SQL path. This preserves the legacy canonical graph checksum
+/// and the separate metadata of the in-memory path; size selects execution only.
+#[cfg(feature = "cli")]
+pub fn analyze_memory_graph(
+    raw: &serde_json::Value,
+    rules: &serde_json::Value,
+    history: Option<&serde_json::Value>,
+    quality: Option<&serde_json::Value>,
+    topics: Option<&serde_json::Value>,
+    include_sources: bool,
+) -> DumpResult<serde_json::Value> {
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+    let mut meta = raw["metadata"].clone();
+    let language = meta["language"].as_str().ok_or("Lingua mancante")?;
+    let database = crate::wiki_database(language, meta["database"].as_str())?;
+    let pages = raw["pages"].as_array().ok_or("Pagine mancanti")?;
+    if meta["complete"] != true
+        || meta.get("biographies").is_some()
+        || pages.iter().any(|p| p.get("biography").is_some())
+    {
+        return Err("Serve un censimento completo senza arricchimenti esterni".into());
+    }
+    let mut ids = HashSet::new();
+    let mut titles = Vec::with_capacity(pages.len());
+    let mut links = Vec::with_capacity(pages.len());
+    let mut labels = Vec::with_capacity(pages.len());
+    for page in pages {
+        let id = page["page_id"].as_i64().ok_or("ID pagina non valido")?;
+        if !ids.insert(id) {
+            return Err("ID pagina duplicato".into());
+        }
+        titles.push(page["title"].as_str().ok_or("Titolo mancante")?.to_owned());
+        links.push(serde_json::from_value(
+            page.get("links").cloned().unwrap_or(json!([])),
+        )?);
+        labels.push((
+            id,
+            serde_json::from_value(page.get("categories").cloned().unwrap_or(json!([])))?,
+        ));
+    }
+    let redirects: HashMap<String, String> =
+        serde_json::from_value(raw.get("redirects").cloned().unwrap_or(json!({})))?;
+    let (incoming, outgoing, unresolved, sources) = if include_sources {
+        let (a, b, c, d) = crate::graph_details(titles, links, redirects)?;
+        (a, b, c, Some(d))
+    } else {
+        let (a, b, c) = crate::graph_counts(titles, links, redirects)?;
+        (a, b, c, None)
+    };
+    let choices = crate::classify_categories(
+        &labels,
+        &serde_json::from_value(raw.get("category_parents").cloned().unwrap_or(json!({})))?,
+        analysis_rules(rules)?,
+    )?;
+    let creation_events = meta["creation_date_rule"] == "creation_event_v1";
+    let mut rows = pages
+        .iter()
+        .zip(choices)
+        .zip(incoming)
+        .zip(outgoing)
+        .map(|(((p, c), i), o)| crate::observation_row(p, &c, i, o, creation_events))
+        .collect::<Result<Vec<_>, _>>()?;
+    let creators = crate::initialize_creator_rows(&mut rows)?;
+    let history_meta = if let Some(supplement) = history {
+        let m = &supplement["metadata"];
+        if m["language"] != meta["language"]
+            || m["database"] != database
+            || m["source"] != format!("MediaWiki History dumps / {database}")
+            || m["complete"] != true
+            || !m["history_release"].is_string()
+            || (meta["source"] == format!("Wikimedia SQL dumps / {database}")
+                && m["sql_release"] != meta["sql_release"])
+        {
+            return Err("Cronologia non corrispondente al grafo".into());
+        }
+        let matched =
+            crate::join_history_rows(&mut rows, &supplement_records(supplement)?, "missing_page")?;
+        let mut m = m.clone();
+        m["status"] = json!("collected");
+        m["matched_pages"] = json!(matched);
+        m["unmatched_pages"] = json!(rows.len() - matched);
+        m["input_sha256"] = json!(canonical_json_sha256(supplement)?);
+        m
+    } else {
+        crate::join_history_rows(&mut rows, &HashMap::new(), "not_collected")?;
+        json!({"status":"not_collected","matched_pages":0})
+    };
+    if let Some(supplement) = quality {
+        let mut m = supplement_metadata(
+            SupplementKind::Quality,
+            supplement["metadata"].clone(),
+            &meta,
+            rows.len() as u64,
+            None,
+        )?;
+        let records = supplement_records(supplement)?;
+        if records.len() != ids.len() || records.keys().any(|id| !ids.contains(id)) {
+            return Err("Censimento qualità incompleto".into());
+        }
+        crate::join_quality_rows(&mut rows, &records)?;
+        for (field, value, key) in [
+            ("quality_status", "scored", "scored_pages"),
+            ("quality_revision_relation", "same", "same_revision_pages"),
+            (
+                "quality_revision_relation",
+                "different",
+                "different_revision_pages",
+            ),
+            (
+                "quality_revision_relation",
+                "unavailable",
+                "unavailable_revision_pages",
+            ),
+        ] {
+            if m[key].as_u64() != Some(rows.iter().filter(|r| r[field] == value).count() as u64) {
+                return Err("Copertura qualità incoerente".into());
+            }
+        }
+        m["input_sha256"] = json!(canonical_json_sha256(supplement)?);
+        meta["quality"] = m;
+    }
+    let reconstructed = history_meta["creation_rule"] == HISTORY_RULE;
+    crate::observation_ages(
+        &mut rows,
+        meta["finished_at"]
+            .as_str()
+            .ok_or("Fine del censimento mancante")?,
+        creation_events || reconstructed,
+    )?;
+    let raw_checksum = canonical_json_sha256(raw)?;
+    if let Some(supplement) = topics {
+        let mut m = supplement["metadata"].clone();
+        let demo = meta["demo"].as_bool().unwrap_or(false);
+        let labels = m["model"]["labels"]
+            .as_array()
+            .ok_or("Tassonomia mancante")?;
+        let taxonomy = labels
+            .iter()
+            .map(|l| {
+                l.as_str()
+                    .filter(|s| s.contains('.'))
+                    .map(str::to_owned)
+                    .ok_or("Etichetta tema non valida")
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        if m["language"] != meta["language"]
+            || m["complete"] != true
+            || m["source"]
+                != if demo {
+                    "local_model_on_synthetic_outlinks"
+                } else {
+                    "local_model_on_verified_SQL_dump_outlinks"
+                }
+            || m["demo"].as_bool().unwrap_or(false) != demo
+            || m["input_sha256"] != raw_checksum
+            || labels.len() != 64
+            || taxonomy.len() != 64
+            || m["model"]["threshold"] != 0.5
+        {
+            return Err("Temi non corrispondenti al grafo completo".into());
+        }
+        let records = supplement_records(supplement)?;
+        if records.len() != ids.len() || records.keys().any(|id| !ids.contains(id)) {
+            return Err("Censimento dei temi incompleto".into());
+        }
+        crate::join_topic_rows(&mut rows, &records, &taxonomy)?;
+        m["status"] = json!("predicted");
+        m["input_checksum_verified"] = json!(true);
+        meta["topics"] = m;
+    }
+    for (key, value) in [
+        ("creators", creators),
+        ("history", history_meta),
+        ("unresolved_target_occurrences", json!(unresolved)),
+        ("category_rule", json!("structural_specificity_v1")),
+        ("category_rules", rules.clone()),
+        ("engine", json!("rust")),
+        ("measures_rule", json!("creation_quality_creators_v3")),
+        (
+            "age_rule",
+            json!(if reconstructed {
+                HISTORY_RULE
+            } else if creation_events {
+                "page_creation_event"
+            } else if meta["source"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Wikimedia SQL dumps / "))
+            {
+                "unavailable_no_approved_creation_event"
+            } else {
+                "first_public_revision_legacy"
+            }),
+        ),
+        (
+            "historical_age_rule",
+            json!(if history.is_some() {
+                "mediawiki_history_first_observed_revision_v1"
+            } else {
+                "not_collected"
+            }),
+        ),
+        ("length_unit", json!("UTF-8 wikitext bytes")),
+        ("input_sha256", json!(raw_checksum)),
+    ] {
+        meta[key] = value;
+    }
+    for (enabled, key, value) in [
+        (quality.is_some(), "quality", "johnson_v2_2022_01"),
+        (topics.is_some(), "topics", "local_model_predictions"),
+        (
+            reconstructed,
+            "age",
+            "MediaWiki History / page_creation_timestamp",
+        ),
+    ] {
+        if enabled {
+            if meta["article_features"].is_null() {
+                meta["article_features"] = json!({});
+            }
+            meta["article_features"]
+                .as_object_mut()
+                .ok_or("Misure non valide")?
+                .insert(key.into(), json!(value));
+        }
+    }
+    let mut result = json!({"metadata":meta,"pages":rows});
+    if let Some(sources) = sources {
+        result["_incoming_sources"] = json!(sources);
+    }
+    Ok(result)
+}
+
 /// Inputs for the bounded canonical SQL analysis. This API prepares one member;
 /// CSV, browser transports and manifest publication belong to the export stage.
 #[cfg(feature = "cli")]
@@ -4182,16 +4615,7 @@ pub fn analyze_imported_graph(
         ..
     } = imported;
     let rules = options.rules;
-    let native_rules: crate::CategoryRules = serde_json::from_value(json!([
-        rules.get("exclude_patterns").cloned().unwrap_or(json!([])),
-        rules
-            .get("exclude_categories")
-            .cloned()
-            .unwrap_or(json!([])),
-        rules.get("category_priority").cloned().unwrap_or(json!({})),
-        rules.get("page_overrides").cloned().unwrap_or(json!({})),
-        rules.get("min_support").cloned().unwrap_or(json!(5))
-    ]))?;
+    let native_rules = analysis_rules(rules)?;
     let mut ids = Vec::with_capacity(expected);
     let mut titles = Vec::with_capacity(expected);
     {
@@ -6366,14 +6790,14 @@ mod tests {
         std::fs::write(live.join("manifest.json"), b"approved").unwrap();
         std::fs::write(live.join("old.json"), b"canonical").unwrap();
         assert!(
-            super::publish_prepared(&prepared, &live, Some(b"stale"), |a, b| std::fs::rename(
-                a, b
-            ))
+            super::publish_prepared(&prepared, &live, Some(b"stale"), &[], |a, b| {
+                std::fs::rename(a, b)
+            })
             .is_err()
         );
         let mut moves = 0;
         assert!(
-            super::publish_prepared(&prepared, &live, Some(b"approved"), |a, b| {
+            super::publish_prepared(&prepared, &live, Some(b"approved"), &[], |a, b| {
                 moves += 1;
                 if moves == 2 {
                     Err(std::io::Error::other("synthetic rename failure"))

@@ -203,6 +203,59 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "analyze" {
+            let raw = self.path("input")?;
+            let metadata = _native::dumps::first_metadata(&raw).map_err(|e| e.to_string())?;
+            let language = metadata["language"].as_str().ok_or("Lingua mancante")?;
+            _native::wiki_database(language, metadata["database"].as_str())?;
+            let sibling = |argument: &str| -> Result<Option<PathBuf>, String> {
+                if self.args.get_one::<String>(argument).is_some() {
+                    return Ok(Some(self.path(argument)?));
+                }
+                let stem = raw
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or("Nome input non valido")?;
+                let path = raw.with_file_name(format!(
+                    "{}-{argument}.json",
+                    stem.strip_suffix("-raw").unwrap_or(stem)
+                ));
+                Ok(path.is_file().then_some(path))
+            };
+            let topics = sibling("topics")?;
+            let quality = sibling("quality")?;
+            let history = self
+                .args
+                .get_one::<String>("history")
+                .map(|p| self.root.join(p));
+            let work = self
+                .args
+                .get_one::<String>("work-dir")
+                .map(|p| self.root.join(p));
+            let rules: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(self.path("rules")?).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let output = self
+                .args
+                .get_one::<String>("output")
+                .map(|p| self.root.join(p))
+                .unwrap_or_else(|| self.root.join(format!("web/data/{language}.json")));
+            _native::dumps::analyze_file(
+                &raw,
+                &output,
+                &_native::dumps::AnalysisOptions {
+                    rules: &rules,
+                    work_dir: work.as_deref(),
+                    history: history.as_deref(),
+                    quality: quality.as_deref(),
+                    topics: topics.as_deref(),
+                    batch_size: 512,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if self.name == "dashboard" {
             _native::dumps::rebuild_dashboard(&self.path("data-dir")?)
                 .map_err(|e| e.to_string())?;

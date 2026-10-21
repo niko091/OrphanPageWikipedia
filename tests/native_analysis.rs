@@ -1,5 +1,8 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{analyze_imported_graph, AnalysisOptions, SQL_TABLES};
+use _native::dumps::{
+    analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, AnalysisOptions,
+    SQL_TABLES,
+};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -319,4 +322,80 @@ fn publication_failure_cleans_private_records_and_preserves_existing_paths() {
         .file_name()
         .to_string_lossy()
         .starts_with(".orphanwiki-")));
+}
+
+#[test]
+fn memory_and_bounded_analysis_preserve_the_same_complete_scientific_rows() {
+    let w = Workspace::new(523);
+    let raw = w.read("raw.json");
+    let history = w.read("history.json");
+    let quality = w.read("quality.json");
+    let mut topics = w.read("topics.json");
+    topics["metadata"]["input_sha256"] = json!(canonical_json_sha256(&raw).unwrap());
+    let rules = json!({"min_support":1,"exclude_categories":["Maintenance"]});
+    for supplements in [false, true] {
+        w.run(7, supplements).unwrap();
+        let bounded = w.read("result.json");
+        let memory = analyze_memory_graph(
+            &raw,
+            &rules,
+            supplements.then_some(&history),
+            supplements.then_some(&quality),
+            supplements.then_some(&topics),
+            true,
+        )
+        .unwrap();
+        assert_eq!(memory["pages"], bounded["pages"]);
+        assert_eq!(memory["metadata"]["creators"]["unmatched_pages"], 523);
+        assert_eq!(bounded["metadata"]["creators"]["unmatched_pages"], 0);
+        assert!(memory["metadata"].get("input_checksum_format").is_none());
+        assert_eq!(
+            memory["metadata"]["input_sha256"],
+            canonical_json_sha256(&raw).unwrap()
+        );
+        assert_eq!(
+            memory["_incoming_sources"][1].as_array().unwrap().len(),
+            131
+        );
+        if supplements {
+            assert_eq!(memory["metadata"]["history"]["matched_pages"], 175);
+            assert_eq!(
+                memory["metadata"]["quality"]["input_sha256"],
+                canonical_json_sha256(&quality).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn memory_analysis_rejects_partial_censuses_stale_supplements_and_external_enrichment() {
+    let w = Workspace::new(6);
+    let raw = w.read("raw.json");
+    let rules = json!({});
+    for mut changed in [raw.clone(), raw.clone(), raw.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        match changed.0 {
+            0 => changed.1["metadata"]["complete"] = json!(false),
+            1 => changed.1["pages"][1]["page_id"] = changed.1["pages"][0]["page_id"].clone(),
+            _ => changed.1["pages"][0]["biography"] = Value::Null,
+        }
+        assert!(analyze_memory_graph(&changed.1, &rules, None, None, None, false).is_err());
+    }
+    let mut quality = w.read("quality.json");
+    quality["pages"][0]["quality_revision_relation"] = json!("different");
+    assert!(analyze_memory_graph(&raw, &rules, None, Some(&quality), None, false).is_err());
+    let mut history = w.read("history.json");
+    history["metadata"]["sql_release"] = json!("20260901");
+    assert!(analyze_memory_graph(&raw, &rules, Some(&history), None, None, false).is_err());
+    assert!(analyze_memory_graph(
+        &raw,
+        &rules,
+        None,
+        None,
+        Some(&w.read("topics.json")),
+        false
+    )
+    .is_err());
 }
