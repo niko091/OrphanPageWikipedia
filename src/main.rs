@@ -574,11 +574,40 @@ fn main() -> ExitCode {
         eprintln!("{error}");
         return ExitCode::from(2);
     }
-    match invocation.execute() {
+    let _signals = if invocation.name == "serve" {
+        None
+    } else {
+        match _native::runtime::Signals::install() {
+            Ok(signals) => Some(signals),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let plan = invocation
+        .args
+        .try_get_one::<bool>("plan")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false);
+    let settings = if plan {
+        None
+    } else {
+        _native::runtime::TraceSettings::from_environment()
+    };
+    let result = _native::runtime::with_tracing(settings, || {
+        _native::runtime::phase(&format!("cli.{}", invocation.name), || invocation.execute())
+    });
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            ExitCode::FAILURE
+            ExitCode::from(
+                _native::runtime::received_signal()
+                    .map_or(1, |number| 128u8.saturating_add(number)),
+            )
         }
     }
 }

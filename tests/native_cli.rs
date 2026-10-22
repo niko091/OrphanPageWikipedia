@@ -95,6 +95,170 @@ fn standalone_editorial_http_preserves_reviews_and_stops_on_sigterm() {
 
 struct Workspace(PathBuf);
 
+#[test]
+fn tracing_keeps_scientific_bytes_identical_and_records_nested_native_phases() {
+    let w = Workspace::new();
+    fs::write(w.0.join("raw.json"),r#"{"metadata":{"language":"vec","complete":true,"demo":true,"finished_at":"2026-10-02T00:00:00Z"},"pages":[{"page_id":1,"title":"A","links":["B"]},{"page_id":2,"title":"B"}]}"#).unwrap();
+    fs::write(w.0.join("rules.json"), "{}").unwrap();
+    let plain = w.run(&[
+        "analyze",
+        "raw.json",
+        "--rules",
+        "rules.json",
+        "--output",
+        "plain/vec.json",
+    ]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let trace = w.0.join("trace.jsonl");
+    let traced = Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+        .args([
+            "analyze",
+            "raw.json",
+            "--rules",
+            "rules.json",
+            "--output",
+            "traced/vec.json",
+        ])
+        .current_dir(&w.0)
+        .env_clear()
+        .env("ORPHANWIKI_SPANS_FILE", &trace)
+        .env("ORPHANWIKI_RUN_ID", "test-run")
+        .env("ORPHANWIKI_PARENT_SPAN", "controller-parent")
+        .output()
+        .unwrap();
+    assert!(
+        traced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&traced.stderr)
+    );
+    for name in ["vec.json", "vec.csv"] {
+        assert_eq!(
+            fs::read(w.0.join("plain").join(name)).unwrap(),
+            fs::read(w.0.join("traced").join(name)).unwrap()
+        );
+    }
+    let records = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+        .collect::<Vec<_>>();
+    let mut active = std::collections::BTreeMap::new();
+    let mut names = std::collections::BTreeSet::new();
+    for record in &records {
+        assert_eq!(record["run_id"], "test-run");
+        let id = record["span_id"].as_str().unwrap();
+        names.insert(record["name"].as_str().unwrap());
+        if record["event"] == "span_start" {
+            let parent = record["parent_id"].as_str().unwrap();
+            assert!(parent == "controller-parent" || active.contains_key(parent));
+            assert!(active.insert(id, record).is_none());
+        } else {
+            let start = active.remove(id).unwrap();
+            assert_eq!(record["status"], "completed");
+            assert!(
+                record["finished_ns"].as_u64().unwrap() >= start["started_ns"].as_u64().unwrap()
+            );
+        }
+    }
+    assert!(active.is_empty());
+    for name in [
+        "cli.analyze",
+        "analysis.single",
+        "analysis.memory",
+        "export.csv",
+        "dashboard.member",
+        "export.publish",
+    ] {
+        assert!(names.contains(name), "{name}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn sigterm_cancels_native_work_with_or_without_tracing_and_preserves_approved_files() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    fs::write(w.0.join("rules.json"), "{}").unwrap();
+    let mut raw = std::io::BufWriter::new(fs::File::create(w.0.join("raw.json")).unwrap());
+    raw.write_all(br#"{"metadata":{"language":"vec","complete":true,"demo":true,"finished_at":"2026-10-02T00:00:00Z"},"pages":["#).unwrap();
+    for id in 1..=150000 {
+        if id > 1 {
+            raw.write_all(b",").unwrap();
+        }
+        write!(raw, "{{\"page_id\":{id},\"title\":\"Article {id}\"}}").unwrap();
+    }
+    raw.write_all(b"]}").unwrap();
+    raw.flush().unwrap();
+    drop(raw);
+    for tracing in [false, true] {
+        let folder = w.0.join(if tracing { "traced" } else { "plain" });
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("manifest.json"), "[]").unwrap();
+        fs::write(folder.join("previous-generation.json"), "approved bytes").unwrap();
+        let trace = w.0.join("trace.jsonl");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orphanwiki"));
+        command
+            .args(["analyze", "raw.json", "--rules", "rules.json", "--output"])
+            .arg(folder.join("vec.json"))
+            .current_dir(&w.0)
+            .env_clear();
+        if tracing {
+            command.env("ORPHANWIKI_SPANS_FILE", &trace);
+        }
+        let mut child = command.spawn().unwrap();
+        if tracing {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read_to_string(&trace)
+                .unwrap_or_default()
+                .contains("analysis.memory")
+            {
+                assert!(child.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline, "Native analysis never started");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(143));
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("SIGTERM did not stop native analysis");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(folder.join("manifest.json")).unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join("previous-generation.json")).unwrap(),
+            "approved bytes"
+        );
+        assert_eq!(fs::read_dir(folder).unwrap().count(), 2);
+        if tracing {
+            assert!(fs::read_to_string(trace)
+                .unwrap()
+                .contains("\"status\":\"interrupted\""));
+        }
+    }
+}
+
 impl Workspace {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);

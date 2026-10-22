@@ -7,6 +7,8 @@ pub mod dashboard;
 pub mod dumps;
 #[cfg(feature = "cli")]
 pub mod editorial;
+#[cfg(feature = "cli")]
+pub mod runtime;
 
 use std::collections::{HashMap, HashSet};
 
@@ -290,6 +292,8 @@ impl IncrementalGraph {
         }
         let mut edges = Vec::new();
         for targets in batch {
+            #[cfg(feature = "cli")]
+            crate::runtime::check_cancelled()?;
             let source = self.next_source;
             self.next_source += 1;
             let mut distinct = HashSet::with_capacity(targets.len());
@@ -436,6 +440,8 @@ impl TopicInputAccumulator {
         }
         let mut output = Vec::with_capacity(batch.len());
         for targets in batch {
+            #[cfg(feature = "cli")]
+            crate::runtime::check_cancelled()?;
             let source = graph.next_source;
             graph.next_source += 1;
             let mut distinct = HashSet::with_capacity(targets.len());
@@ -497,6 +503,8 @@ pub fn classify_categories(
 
     let mut frequencies = HashMap::<&str, u64>::new();
     for (_, categories) in pages {
+        #[cfg(feature = "cli")]
+        crate::runtime::check_cancelled()?;
         for category in categories.iter().collect::<HashSet<_>>() {
             *frequencies.entry(category).or_default() += 1;
         }
@@ -657,6 +665,8 @@ impl CategoryBatchClassifier {
         }
         let mut choices = Vec::with_capacity(pages.len());
         for (id, categories) in pages {
+            #[cfg(feature = "cli")]
+            crate::runtime::check_cancelled()?;
             let candidates = categories
                 .iter()
                 .map(String::as_str)
@@ -978,6 +988,8 @@ pub fn initialize_creator_rows(
 ) -> Result<serde_json::Value, String> {
     use serde_json::{json, Value};
     for row in rows.iter_mut() {
+        #[cfg(feature = "cli")]
+        crate::runtime::check_cancelled()?;
         let row = row.as_object_mut().ok_or("Osservazione non valida")?;
         for field in [
             "creator_key",
@@ -1034,6 +1046,8 @@ pub fn join_history_rows(
     }
     let mut matched = 0;
     for row in rows {
+        #[cfg(feature = "cli")]
+        crate::runtime::check_cancelled()?;
         let id = row["page_id"]
             .as_i64()
             .ok_or("ID dell'osservazione non valido")?;
@@ -1143,6 +1157,8 @@ pub fn join_quality_rows(
     records: &HashMap<i64, serde_json::Value>,
 ) -> Result<(), String> {
     for row in rows {
+        #[cfg(feature = "cli")]
+        crate::runtime::check_cancelled()?;
         let id = row["page_id"]
             .as_i64()
             .ok_or("ID dell'osservazione non valido")?;
@@ -1200,6 +1216,8 @@ pub fn join_topic_rows(
     }
     let mut predicted = 0;
     for row in rows {
+        #[cfg(feature = "cli")]
+        crate::runtime::check_cancelled()?;
         let id = row["page_id"]
             .as_i64()
             .ok_or("ID dell'osservazione non valido")?;
