@@ -223,6 +223,12 @@ fn reconstruction_attribution_current_flags_and_strict_activity_boundaries() {
         );
     }
     assert!(pages[2]["article_created_at"].is_null());
+    assert_eq!(
+        pages[2].get("creator_prior_edits_main_history"),
+        Some(&Value::Null)
+    );
+    assert!(pages[2].get("creation_tags_history").is_none());
+
     assert_eq!(pages[2]["creation_date_status"], "reconstructed_history");
     assert_eq!(
         pages[3]["creation_date_status"],

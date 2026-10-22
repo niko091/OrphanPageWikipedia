@@ -9227,14 +9227,54 @@ fn scan_history(
 }
 
 #[cfg(feature = "cli")]
+#[derive(serde::Serialize)]
+struct HistoryRecord {
+    page_id: i64,
+    first_revision_id: Option<i64>,
+    article_created_at: Option<String>,
+    creator_key: Option<String>,
+    creator_user_id: Option<i64>,
+    creator_attribution: &'static str,
+    creator_groups_at_creation: Option<Vec<String>>,
+    creator_groups_status: &'static str,
+    creator_continuity_months_before_creation: Option<usize>,
+    creator_continuity_bucket_before_creation: Option<String>,
+    creator_prior_edits_main_history: Option<usize>,
+    creator_prior_edits_other_history: Option<usize>,
+    creator_history_status: &'static str,
+    page_created_at: Option<String>,
+    creation_date_status: &'static str,
+    creator_registered_at: Option<String>,
+    creator_tenure_days: Option<f64>,
+    creator_prior_articles: Option<usize>,
+    creator_account_type: Option<&'static str>,
+    creator_is_bot_now: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creation_tags_history: Option<Vec<String>>,
+}
+
+#[cfg(feature = "cli")]
+struct InitialRevision {
+    revision: i64,
+    at: String,
+    user: Option<i64>,
+    hidden: bool,
+    groups: Option<String>,
+    tags: Option<String>,
+    registration: Option<String>,
+    created: Option<String>,
+    first: Option<String>,
+    before: bool,
+}
+
+#[cfg(feature = "cli")]
 fn history_records(
     connection: &rusqlite::Connection,
     pages: &std::collections::BTreeSet<i64>,
     database: &str,
-) -> DumpResult<Vec<serde_json::Value>> {
+) -> DumpResult<Vec<HistoryRecord>> {
     crate::runtime::phase("history.records", || {
         crate::runtime::check_cancelled()?;
-        use serde_json::{json, Value};
         use std::collections::{HashMap, HashSet};
         #[derive(Default)]
         struct Events {
@@ -9253,18 +9293,29 @@ fn history_records(
                 .or_default()
                 .insert(history_timestamp(Some(&raw)));
         }
-        let mut initial = HashMap::<i64, (usize, Value)>::new();
+        let mut initial = HashMap::<i64, (usize, InitialRevision)>::new();
         let mut query = connection.prepare("SELECT page_id,revision_id,at,user_id,hidden,groups,tags,registration,page_created,page_first,before_creation FROM history_initial ORDER BY page_id,at,revision_id")?;
         let mut rows = query.query([])?;
         while let Some(row) = rows.next()? {
-            let entry = initial.entry(row.get(0)?).or_insert((0, Value::Null));
-            entry.0 += 1;
-            if entry.0 == 1 {
-                entry.1 = json!({"revision":row.get::<_,i64>(1)?,"at":row.get::<_,String>(2)?,
-                "user":row.get::<_,Option<i64>>(3)?,"hidden":row.get::<_,i64>(4)? != 0,
-                "groups":row.get::<_,Option<String>>(5)?,"tags":row.get::<_,Option<String>>(6)?,
-                "registration":row.get::<_,Option<String>>(7)?,"created":row.get::<_,Option<String>>(8)?,
-                "first":row.get::<_,Option<String>>(9)?,"before":row.get::<_,i64>(10)? != 0});
+            match initial.entry(row.get(0)?) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((
+                        1,
+                        InitialRevision {
+                            revision: row.get(1)?,
+                            at: row.get(2)?,
+                            user: row.get(3)?,
+                            hidden: row.get::<_, i64>(4)? != 0,
+                            groups: row.get(5)?,
+                            tags: row.get(6)?,
+                            registration: row.get(7)?,
+                            created: row.get(8)?,
+                            first: row.get(9)?,
+                            before: row.get::<_, i64>(10)? != 0,
+                        },
+                    ));
+                }
             }
         }
         let mut events = HashMap::<i64, Events>::new();
@@ -9296,62 +9347,69 @@ fn history_records(
             } else {
                 "ambiguous_history_creation"
             };
-            let mut record = json!({"page_id":page,"first_revision_id":null,"article_created_at":null,
-            "creator_key":null,"creator_user_id":null,"creator_attribution":"history_missing_initial_revision",
-            "creator_groups_at_creation":null,"creator_groups_status":"unknown",
-            "creator_continuity_months_before_creation":null,"creator_continuity_bucket_before_creation":null,
-            "creator_prior_edits_main_history":null,"creator_prior_edits_other_history":null,
-            "creator_history_status":"unavailable","page_created_at":created,"creation_date_status":date_status,
-            "creator_registered_at":null,"creator_tenure_days":null,"creator_prior_articles":null,
-            "creator_account_type":null,"creator_is_bot_now":null});
+            let mut record = HistoryRecord {
+                page_id: *page,
+                first_revision_id: None,
+                article_created_at: None,
+                creator_key: None,
+                creator_user_id: None,
+                creator_attribution: "history_missing_initial_revision",
+                creator_groups_at_creation: None,
+                creator_groups_status: "unknown",
+                creator_continuity_months_before_creation: None,
+                creator_continuity_bucket_before_creation: None,
+                creator_prior_edits_main_history: None,
+                creator_prior_edits_other_history: None,
+                creator_history_status: "unavailable",
+                page_created_at: created,
+                creation_date_status: date_status,
+                creator_registered_at: None,
+                creator_tenure_days: None,
+                creator_prior_articles: None,
+                creator_account_type: None,
+                creator_is_bot_now: None,
+                creation_tags_history: None,
+            };
             if let Some((count, revision)) = initial.remove(page) {
                 if count > 1 {
-                    record["creator_attribution"] = json!("history_ambiguous_initial_revisions");
+                    record.creator_attribution = "history_ambiguous_initial_revisions";
                 } else {
-                    let at = revision["at"]
-                        .as_str()
-                        .ok_or("Timestamp History mancante")?;
-                    record["first_revision_id"] = revision["revision"].clone();
-                    record["article_created_at"] = json!(history_timestamp(Some(at)));
+                    let at = revision.at.as_str();
+                    record.first_revision_id = Some(revision.revision);
+                    record.article_created_at = history_timestamp(Some(at));
                     let event = events.remove(page).unwrap_or_default();
-                    let mismatch = |key: &str| {
-                        revision[key]
-                            .as_str()
-                            .is_some_and(|s| !s.is_empty() && s != at)
-                    };
-                    let attribution = if record["article_created_at"].is_null()
-                        || mismatch("created")
-                        || mismatch("first")
+                    let mismatch =
+                        |date: Option<&str>| date.is_some_and(|s| !s.is_empty() && s != at);
+                    let attribution = if record.article_created_at.is_none()
+                        || mismatch(revision.created.as_deref())
+                        || mismatch(revision.first.as_deref())
                     {
                         "history_inconsistent_creation_dates"
-                    } else if event.imported || revision["before"] == true || event.creates > 1 {
+                    } else if event.imported || revision.before || event.creates > 1 {
                         "history_imported_or_ambiguous"
                     } else if event.creates > 0 && event.first != at {
                         "history_create_event_mismatch"
-                    } else if revision["hidden"] == true || revision["user"].is_null() {
+                    } else if revision.hidden || revision.user.is_none() {
                         "history_hidden_or_unregistered_creator"
                     } else {
                         "history_initial_revision_observed"
                     };
-                    record["creator_attribution"] = json!(attribution);
+                    record.creator_attribution = attribution;
                     if attribution == "history_initial_revision_observed" {
-                        let user = revision["user"]
-                            .as_i64()
-                            .ok_or("Identità History mancante")?;
-                        record["creator_user_id"] = json!(user);
-                        record["creator_key"] = json!(format!("{database}:history-user:{user}"));
-                        if let Some(groups) = revision["groups"].as_str().filter(|s| !s.is_empty())
-                        {
-                            record["creator_groups_at_creation"] =
-                                json!(groups.split(',').collect::<Vec<_>>());
-                            record["creator_groups_status"] = json!("observed");
+                        let user = revision.user.ok_or("Identità History mancante")?;
+                        record.creator_user_id = Some(user);
+                        record.creator_key = Some(format!("{database}:history-user:{user}"));
+                        if let Some(groups) = revision.groups.as_deref().filter(|s| !s.is_empty()) {
+                            record.creator_groups_at_creation =
+                                Some(groups.split(',').map(str::to_owned).collect());
+                            record.creator_groups_status = "observed";
                         }
-                        record["creator_history_status"] = json!("pending_activity");
-                        record["creator_registered_at"] =
-                            json!(history_timestamp(revision["registration"].as_str()));
-                        if let Some(tags) = revision["tags"].as_str().filter(|s| !s.is_empty()) {
-                            record["creation_tags_history"] =
-                                json!(tags.split(',').collect::<Vec<_>>());
+                        record.creator_history_status = "pending_activity";
+                        record.creator_registered_at =
+                            history_timestamp(revision.registration.as_deref());
+                        if let Some(tags) = revision.tags.as_deref().filter(|s| !s.is_empty()) {
+                            record.creation_tags_history =
+                                Some(tags.split(',').map(str::to_owned).collect());
                         }
                     }
                 }
@@ -9365,22 +9423,21 @@ fn history_records(
 #[cfg(feature = "cli")]
 fn history_creator_metrics(
     connection: &rusqlite::Connection,
-    records: &mut [serde_json::Value],
+    records: &mut [HistoryRecord],
     users: &std::collections::BTreeSet<i64>,
 ) -> DumpResult<()> {
     crate::runtime::phase("history.creator_metrics", || {
         crate::runtime::check_cancelled()?;
-        use serde_json::{json, Value};
         use std::collections::{BTreeMap, HashSet};
         let mut by_user = BTreeMap::<i64, Vec<usize>>::new();
         for (index, record) in records.iter().enumerate() {
-            if let Some(user) = record["creator_user_id"].as_i64() {
+            if let Some(user) = record.creator_user_id {
                 by_user.entry(user).or_default().push(index);
             }
         }
         let finish = |user: i64,
                       edits: Vec<(String, i32)>,
-                      records: &mut [Value]|
+                      records: &mut [HistoryRecord]|
          -> DumpResult<()> {
             let indices = by_user
                 .get(&user)
@@ -9389,28 +9446,27 @@ fn history_creator_metrics(
             let mut dates = Vec::new();
             for &index in indices {
                 let record = &mut records[index];
-                if let Some(date) = record["page_created_at"].as_str() {
+                if let Some(date) = record.page_created_at.as_deref() {
                     group.push(index);
                     dates.push(date.replace('T', " ").trim_end_matches("+00:00").to_owned());
                 } else {
-                    record["creator_history_status"] = json!("observed_surviving_history");
+                    record.creator_history_status = "observed_surviving_history";
                 }
             }
             match history_activity(edits, dates) {
                 Ok(summaries) => {
                     for (index, (main, other, months, bucket)) in group.into_iter().zip(summaries) {
                         let record = &mut records[index];
-                        record["creator_prior_edits_main_history"] = json!(main);
-                        record["creator_prior_edits_other_history"] = json!(other);
-                        record["creator_continuity_months_before_creation"] = json!(months);
-                        record["creator_continuity_bucket_before_creation"] = json!(bucket);
-                        record["creator_history_status"] = json!("observed_surviving_history");
+                        record.creator_prior_edits_main_history = Some(main);
+                        record.creator_prior_edits_other_history = Some(other);
+                        record.creator_continuity_months_before_creation = Some(months);
+                        record.creator_continuity_bucket_before_creation = Some(bucket);
+                        record.creator_history_status = "observed_surviving_history";
                     }
                 }
                 Err(_) => {
                     for index in group {
-                        records[index]["creator_history_status"] =
-                            json!("invalid_history_timestamp");
+                        records[index].creator_history_status = "invalid_history_timestamp";
                     }
                 }
             }
@@ -9445,18 +9501,18 @@ fn history_creator_metrics(
                 .iter()
                 .filter_map(|&index| {
                     let record = &records[index];
-                    (record["creator_history_status"] == "observed_surviving_history")
-                        .then(|| record["page_created_at"].as_str().map(str::to_owned))
+                    (record.creator_history_status == "observed_surviving_history")
+                        .then(|| record.page_created_at.as_deref().map(str::to_owned))
                         .flatten()
                 })
                 .collect::<Vec<_>>();
             dates.sort();
             for &index in indices {
                 let record = &mut records[index];
-                if record["creator_history_status"] == "observed_surviving_history" {
-                    if let Some(date) = record["page_created_at"].as_str() {
-                        record["creator_prior_articles"] =
-                            json!(dates.partition_point(|prior| prior.as_str() < date));
+                if record.creator_history_status == "observed_surviving_history" {
+                    if let Some(date) = record.page_created_at.as_deref() {
+                        record.creator_prior_articles =
+                            Some(dates.partition_point(|prior| prior.as_str() < date));
                     }
                 }
             }
@@ -9617,7 +9673,7 @@ pub fn import_history(
             }
         }
         for record in &mut records {
-            if let Some(user) = record["creator_user_id"].as_i64().filter(|_| has_bots) {
+            if let Some(user) = record.creator_user_id.filter(|_| has_bots) {
                 let (mut bot, mut unknown) = (false, false);
                 for expiry in bots.get(&user).into_iter().flatten() {
                     if let Some(expiry) = expiry {
@@ -9645,26 +9701,26 @@ pub fn import_history(
                     }
                 }
                 if bot || !unknown {
-                    record["creator_is_bot_now"] = json!(bot);
-                    record["creator_account_type"] = json!(if bot { "bot" } else { "no_bot_flag" });
+                    record.creator_is_bot_now = Some(bot);
+                    record.creator_account_type = Some(if bot { "bot" } else { "no_bot_flag" });
                 }
             }
             if let (Some(created), Some(registered)) = (
-                record["page_created_at"].as_str(),
-                record["creator_registered_at"].as_str(),
+                record.page_created_at.as_deref(),
+                record.creator_registered_at.as_deref(),
             ) {
                 let parse = |date: &str| chrono::DateTime::parse_from_rfc3339(date);
                 let micros = (parse(created)? - parse(registered)?)
                     .num_microseconds()
                     .ok_or("Intervallo History fuori limite")?;
                 if micros >= 0 {
-                    record["creator_tenure_days"] = json!(micros as f64 / 1_000_000.0 / 86400.0);
+                    record.creator_tenure_days = Some(micros as f64 / 1_000_000.0 / 86400.0);
                 }
             }
         }
         let users = records
             .iter()
-            .filter_map(|r| r["creator_user_id"].as_i64())
+            .filter_map(|r| r.creator_user_id)
             .collect::<BTreeSet<_>>();
         for (name, data) in &files {
             scan_history(
