@@ -235,6 +235,14 @@ pub fn phase_counts(rows: Option<u64>, bytes: Option<u64>) {
     });
 }
 
+pub(crate) fn phase_tag(key: &str, value: Value) {
+    SPANS.with(|spans| {
+        if let Some(span) = spans.borrow().last() {
+            span.borrow_mut().record[key] = value;
+        }
+    });
+}
+
 /// Copy these keys onto child commands; the process environment stays untouched.
 pub fn child_environment() -> BTreeMap<&'static str, String> {
     let active = SPANS.with(|s| s.borrow().last().cloned());
@@ -444,6 +452,23 @@ pub fn resources(pid: u32, include_root_memory: bool) -> Value {
         "host_available_memory_bytes":memory.as_ref().and_then(|v|kib(v,"MemAvailable")),
         "controller_reaped_read_bytes":counter("read_bytes"),"controller_reaped_write_bytes":counter("write_bytes"),
         "host_pressure":pressure.into_iter().collect::<BTreeMap<_,_>>(),"host_load_average":load})
+}
+
+/// Completed child CPU and filesystem counters, including their waited workers.
+pub fn child_usage() -> Value {
+    #[cfg(unix)]
+    {
+        use nix::sys::{
+            resource::{getrusage, UsageWho},
+            time::TimeValLike,
+        };
+        if let Ok(usage) = getrusage(UsageWho::RUSAGE_CHILDREN) {
+            return json!({"user_cpu_seconds":usage.user_time().num_microseconds() as f64/1e6,
+                "system_cpu_seconds":usage.system_time().num_microseconds() as f64/1e6,
+                "filesystem_input_operations":usage.block_reads(),"filesystem_output_operations":usage.block_writes()});
+        }
+    }
+    json!({"user_cpu_seconds":null,"system_cpu_seconds":null,"filesystem_input_operations":null,"filesystem_output_operations":null})
 }
 
 #[cfg(test)]

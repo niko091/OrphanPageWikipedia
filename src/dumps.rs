@@ -1285,7 +1285,7 @@ fn load_sql_table(
 }
 
 #[cfg(feature = "cli")]
-fn resolved_path(path: &std::path::Path) -> DumpResult<std::path::PathBuf> {
+pub(crate) fn resolved_path(path: &std::path::Path) -> DumpResult<std::path::PathBuf> {
     use std::path::Component;
     let path = std::env::current_dir()?.join(path);
     let mut normalized = std::path::PathBuf::new();
@@ -2621,7 +2621,7 @@ fn publish_prepared(
 }
 
 #[cfg(feature = "cli")]
-fn dataset_filename(value: &serde_json::Value) -> DumpResult<&str> {
+pub(crate) fn dataset_filename(value: &serde_json::Value) -> DumpResult<&str> {
     let name = value.as_str().ok_or("Nome dataset non valido")?;
     if !name.ends_with(".json")
         || name.len() <= 5
@@ -4307,7 +4307,7 @@ impl RecordSpool {
 }
 
 #[cfg(feature = "cli")]
-fn file_sha256(path: &std::path::Path) -> DumpResult<String> {
+pub(crate) fn file_sha256(path: &std::path::Path) -> DumpResult<String> {
     DumpClient::<WikimediaHttp>::verified_sha256(path, None, None)?
         .ok_or_else(|| "Input mancante".into())
 }
@@ -5154,7 +5154,12 @@ fn comparison_blocks(
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let Some(last) = ids.last() else { break };
-        let rows = consume(&ids)?;
+        let rows = crate::runtime::phase("comparison.block", || -> DumpResult<usize> {
+            crate::runtime::phase_tag("language", serde_json::json!(language));
+            let rows = consume(&ids)?;
+            crate::runtime::phase_counts(Some(rows as u64), None);
+            Ok(rows)
+        })?;
         size = (ids.len().saturating_mul(8192) / rows.max(1)).clamp(1, 512);
         after = *last;
     }
@@ -6644,7 +6649,7 @@ pub fn publish_comparison(
 }
 
 #[cfg(feature = "cli")]
-struct PreparedSummaries {
+pub(crate) struct PreparedSummaries {
     documents: [serde_json::Value; 2],
     signatures: [(u64, i64); 2],
 }
@@ -6669,7 +6674,7 @@ fn guard_reused_export(
 }
 
 #[cfg(feature = "cli")]
-fn prepared_summaries(
+pub(crate) fn prepared_summaries(
     summary_path: &std::path::Path,
     creators_path: &std::path::Path,
     metadata: &serde_json::Value,
@@ -8214,7 +8219,7 @@ fn python_json(value: &serde_json::Value) -> DumpResult<String> {
 }
 
 #[cfg(feature = "cli")]
-fn file_signature(path: &std::path::Path) -> DumpResult<(u64, i64)> {
+pub(crate) fn file_signature(path: &std::path::Path) -> DumpResult<(u64, i64)> {
     let info = path.metadata()?;
     let time = info
         .modified()?
@@ -8490,28 +8495,32 @@ pub fn infer_quality(
             [],
             |r| r.get::<_, u64>(0),
         )?;
-        let mut maxima = [0.0; 6];
-        for (index, maximum) in maxima.iter_mut().enumerate() {
-            let minimum = spec["minimums"][index]
-                .as_f64()
-                .ok_or("Normalizzatore qualità mancante")?;
-            let mut percentile = 0.0;
-            if n > 0 {
-                let rank = (n - 1) as f64
-                    * spec["percentile"]
-                        .as_f64()
-                        .ok_or("Percentile qualità mancante")?;
-                let offset = rank.floor() as u64;
-                let pair=db.prepare(&format!("SELECT x{index} FROM quality_pages WHERE features IS NOT NULL ORDER BY x{index} LIMIT 2 OFFSET ?"))?.query_map([offset],|r|r.get::<_,f64>(0))?.collect::<Result<Vec<_>,_>>()?;
-                let first = pair
-                    .first()
-                    .copied()
-                    .ok_or("Percentile qualità incompleto")?;
-                percentile = first
-                    + (rank - offset as f64) * (pair.last().copied().unwrap_or(first) - first);
+        let maxima = crate::runtime::phase("quality.percentiles", || -> DumpResult<[f64; 6]> {
+            crate::runtime::check_cancelled()?;
+            let mut maxima = [0.0; 6];
+            for (index, maximum) in maxima.iter_mut().enumerate() {
+                let minimum = spec["minimums"][index]
+                    .as_f64()
+                    .ok_or("Normalizzatore qualità mancante")?;
+                let mut percentile = 0.0;
+                if n > 0 {
+                    let rank = (n - 1) as f64
+                        * spec["percentile"]
+                            .as_f64()
+                            .ok_or("Percentile qualità mancante")?;
+                    let offset = rank.floor() as u64;
+                    let pair=db.prepare(&format!("SELECT x{index} FROM quality_pages WHERE features IS NOT NULL ORDER BY x{index} LIMIT 2 OFFSET ?"))?.query_map([offset],|r|r.get::<_,f64>(0))?.collect::<Result<Vec<_>,_>>()?;
+                    let first = pair
+                        .first()
+                        .copied()
+                        .ok_or("Percentile qualità incompleto")?;
+                    percentile = first
+                        + (rank - offset as f64) * (pair.last().copied().unwrap_or(first) - first);
+                }
+                *maximum = minimum.max(percentile);
             }
-            *maximum = minimum.max(percentile);
-        }
+            Ok(maxima)
+        })?;
         let valid=db.query_row("SELECT COUNT(*) FROM quality_census c JOIN quality_pages p ON c.id=p.id WHERE p.features IS NOT NULL",[],|r|r.get::<_,u64>(0))?;
         let (same,different,unavailable)=db.query_row("SELECT SUM(CASE WHEN p.revision=c.revision THEN 1 ELSE 0 END),SUM(CASE WHEN p.revision IS NOT NULL AND p.revision!=c.revision THEN 1 ELSE 0 END),SUM(CASE WHEN p.revision IS NULL THEN 1 ELSE 0 END) FROM quality_census c LEFT JOIN quality_pages p ON p.id=c.id",[],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?)))?;
         let mut metadata = identity;
@@ -8621,7 +8630,7 @@ impl Default for HistoryOptions {
 }
 
 #[cfg(feature = "cli")]
-const HISTORY_RULE: &str = "mediawiki_history_page_creation_v2";
+pub(crate) const HISTORY_RULE: &str = "mediawiki_history_page_creation_v2";
 
 // Preserve partition order without requiring an ordered JSON-map dependency.
 #[cfg(feature = "cli")]
@@ -8820,6 +8829,8 @@ fn scan_history(
         use std::io::{BufRead, BufReader};
         let initial = scan.users.is_none();
         let phase = if initial { "initial" } else { "activity" };
+        crate::runtime::phase_tag("phase", serde_json::json!(phase));
+        crate::runtime::phase_tag("partition", serde_json::json!(name));
         let digest = data["sha256_local"]
             .as_str()
             .ok_or("Checksum History mancante")?;

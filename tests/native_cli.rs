@@ -305,6 +305,7 @@ fn standalone_help_needs_neither_python_nor_repository_files() {
         "refresh-measures",
         "dashboard",
         "serve",
+        "pipeline",
     ] {
         assert!(help.contains(command));
         assert!(workspace.run(&[command, "--help"]).status.success());

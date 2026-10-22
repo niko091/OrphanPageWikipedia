@@ -139,6 +139,45 @@ fn cli() -> Command {
                 .default_value("8000")
                 .value_parser(clap::value_parser!(u16)),
         );
+    let pipeline = editions(history_controls(
+        Command::new("pipeline")
+            .about("Raccolta e analisi sequenziali con checkpoint e metriche operative"),
+    ))
+    .arg(option("sql-release").required(true))
+    .arg(option("history-release").required(true))
+    .arg(option("content-release"))
+    .arg(path_option("dump-root", "data/dumps"))
+    .arg(path_option("import-dir", "data/imported"))
+    .arg(path_option("output-dir", "web/data"))
+    .arg(option("work-dir"))
+    .arg(path_option("log-dir", "data/logs"))
+    .arg(path_option(
+        "model",
+        "data/models/johnson-outlink-20220727.bin",
+    ))
+    .arg(path_option("model-config", "config/topics.json"))
+    .arg(
+        option("topic-budget-seconds")
+            .default_value("86400")
+            .value_parser(positive_budget),
+    )
+    .arg(
+        option("topic-batch-size")
+            .default_value("256")
+            .value_parser(clap::value_parser!(u32).range(1..=10000)),
+    )
+    .arg(
+        option("metrics-interval")
+            .default_value("10")
+            .value_parser(positive_budget),
+    )
+    .arg(
+        Arg::new("no-phase-spans")
+            .long("no-phase-spans")
+            .action(ArgAction::SetTrue),
+    )
+    .arg(Arg::new("force").long("force").action(ArgAction::SetTrue))
+    .arg(Arg::new("plan").long("plan").action(ArgAction::SetTrue));
     Command::new("orphanwiki")
         .about("Censimento e analisi delle pagine orfane")
         .version(env!("CARGO_PKG_VERSION"))
@@ -146,7 +185,7 @@ fn cli() -> Command {
         .arg(option("repo-root").global(true).help("Radice di configurazioni e percorsi relativi; altrimenti cerca dalla directory corrente"))
         .subcommands([
             Command::new("dashboard").about("Prepara i trasporti dagli export approvati").arg(path_option("data-dir", "web/data")),
-            content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve,
+            content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve, pipeline,
         ])
 }
 
@@ -186,7 +225,13 @@ impl Invocation {
     fn load_editions(&mut self) -> Result<(), String> {
         let uses_pool = matches!(
             self.name.as_str(),
-            "fetch-dumps" | "fetch-content" | "quality" | "refresh-measures" | "topics" | "compare"
+            "fetch-dumps"
+                | "fetch-content"
+                | "quality"
+                | "refresh-measures"
+                | "topics"
+                | "compare"
+                | "pipeline"
         ) || (self.name == "import-history"
             && self.args.get_one::<String>("manifest").is_none());
         if !uses_pool {
@@ -214,6 +259,66 @@ impl Invocation {
     }
 
     fn execute(&self) -> Result<(), String> {
+        if self.name == "pipeline" {
+            let value = |name| {
+                self.args
+                    .get_one::<String>(name)
+                    .cloned()
+                    .ok_or_else(|| format!("Argomento mancante: {name}"))
+            };
+            let integer = |name| {
+                self.args
+                    .get_one::<u32>(name)
+                    .copied()
+                    .ok_or_else(|| format!("Argomento mancante: {name}"))
+            };
+            let decimal = |name| {
+                self.args
+                    .get_one::<f64>(name)
+                    .copied()
+                    .ok_or_else(|| format!("Argomento mancante: {name}"))
+            };
+            let sql_release = value("sql-release")?;
+            let date = chrono::NaiveDate::parse_from_str(&sql_release, "%Y%m%d")
+                .map_err(|_| "Release SQL: usare YYYYMMDD")?;
+            if date.format("%Y%m%d").to_string() != sql_release {
+                return Err("Release SQL: usare YYYYMMDD".into());
+            }
+            let dump_root = self.path("dump-root")?;
+            let work_dir = self
+                .args
+                .get_one::<String>("work-dir")
+                .map(|p| self.root.join(p))
+                .unwrap_or_else(|| dump_root.join("staging"));
+            return _native::pipeline::run(_native::pipeline::PipelineOptions {
+                root: self.root.clone(),
+                languages_file: self.path("languages-file")?,
+                selected: self.editions.clone(),
+                sql_release,
+                history_release: value("history-release")?,
+                content_release: self
+                    .args
+                    .get_one::<String>("content-release")
+                    .cloned()
+                    .unwrap_or_else(|| date.format("%Y-%m-%d").to_string()),
+                dump_root,
+                import_dir: self.path("import-dir")?,
+                output_dir: self.path("output-dir")?,
+                work_dir,
+                log_dir: self.path("log-dir")?,
+                model: self.path("model")?,
+                model_config: self.path("model-config")?,
+                topic_budget_seconds: decimal("topic-budget-seconds")?,
+                topic_batch_size: integer("topic-batch-size")?,
+                history_cache_mib: integer("history-cache-mib")?,
+                history_commit_rows: integer("history-commit-rows")?,
+                metrics_interval: decimal("metrics-interval")?,
+                no_phase_spans: self.args.get_flag("no-phase-spans"),
+                force: self.args.get_flag("force"),
+                plan: self.args.get_flag("plan"),
+            })
+            .map_err(|e| e.to_string());
+        }
         if self.name == "serve" {
             let database = _native::editorial::ReviewDatabase::from_environment(
                 &self.root,
@@ -585,14 +690,16 @@ fn main() -> ExitCode {
             }
         }
     };
-    let plan = invocation
-        .args
-        .try_get_one::<bool>("plan")
-        .ok()
-        .flatten()
-        .copied()
-        .unwrap_or(false);
-    let settings = if plan {
+    let tracing_disabled = ["plan", "no-phase-spans"].iter().any(|name| {
+        invocation
+            .args
+            .try_get_one::<bool>(name)
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false)
+    });
+    let settings = if tracing_disabled {
         None
     } else {
         _native::runtime::TraceSettings::from_environment()
