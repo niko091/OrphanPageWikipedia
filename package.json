@@ -5,7 +5,7 @@
   "scripts": {
     "build": "node scripts/build-web.mjs",
     "check": "tsc --noEmit",
-    "test": "npm run build && node tests/web/dashboard.cjs"
+    "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --no-default-features --features cli --bin orphanwiki && npm run build && node tests/web/dashboard.cjs"
   },
   "devDependencies": {
     "typescript": "6.0.3"
