@@ -1,5 +1,5 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{
+use orphanwiki::dumps::{
     aggregate_index, comparison_filename, export_csv, prepare_dashboard_exports,
     publish_available_aggregate, rebuild_dashboard, write_aggregate_summary, ARTICLE_INDEX_COLUMNS,
     CSV_COLUMNS, OBSERVATION_COLUMNS,

@@ -25,9 +25,6 @@ jobs:
       ORPHANWIKI_TEST_MYSQL_URL: mysql://root:orphanwiki-local-test@127.0.0.1:3306/orphanwiki_test
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -38,7 +35,11 @@ jobs:
             echo 'Research data or generated assets are tracked.' >&2
             exit 1
           fi
-          if git grep -n -E '(/home/|/Users/)' -- orphanwiki scripts src web/src config; then
+          if [ -n "$(git ls-files -- '*.py' pyproject.toml)" ]; then
+            echo 'The production repository must not require Python.' >&2
+            exit 1
+          fi
+          if git grep -n -E '(/home/|/Users/)' -- scripts src web/src config; then
             echo 'A contributor-specific absolute path was found.' >&2
             exit 1
           fi
@@ -50,25 +51,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev pkg-config g++ curl tar
-          python -m venv .venv
-          .venv/bin/python -m pip install 'maturin>=1.12,<2'
           cargo install wasm-bindgen-cli --version 0.2.105 --locked
           npm ci
-      - name: Build Python extension
-        run: .venv/bin/maturin develop --release --locked
       - name: Check Rust
         run: |
           sh scripts/prepare-fasttext.sh
           cargo fmt --check
           cargo test --locked
           cargo test --locked --no-default-features
-          cargo test --locked --no-default-features --features cli
           cargo clippy --locked --all-targets -- -D warnings
           cargo clippy --locked --no-default-features --all-targets -- -D warnings
-          cargo clippy --locked --no-default-features --features cli --all-targets -- -D warnings
           cargo clippy --locked --no-default-features --features dashboard --target wasm32-unknown-unknown -- -D warnings
-      - name: Check Python
-        run: .venv/bin/python -m unittest discover -s tests/python -v
       - name: Check TypeScript and browser dashboard
         run: |
           npm run check

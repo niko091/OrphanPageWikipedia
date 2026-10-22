@@ -1,5 +1,5 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{
+use orphanwiki::dumps::{
     canonical_json_sha256, stage_supplement, write_canonical_json, SupplementKind,
 };
 use rusqlite::Connection;
@@ -232,10 +232,10 @@ fn complete_supplements_keep_every_record_order_hash_zero_and_missing() {
                 std::collections::HashMap::from([(record["page_id"].as_i64().unwrap(), record)]);
             match kind {
                 SupplementKind::History => {
-                    _native::join_history_rows(&mut observations, &records, "missing").unwrap();
+                    orphanwiki::join_history_rows(&mut observations, &records, "missing").unwrap();
                 }
                 SupplementKind::Quality => {
-                    _native::join_quality_rows(&mut observations, &records).unwrap()
+                    orphanwiki::join_quality_rows(&mut observations, &records).unwrap()
                 }
                 SupplementKind::Topics => {
                     let labels = meta["model"]["labels"]
@@ -244,7 +244,7 @@ fn complete_supplements_keep_every_record_order_hash_zero_and_missing() {
                         .iter()
                         .map(|v| v.as_str().unwrap().to_owned())
                         .collect();
-                    _native::join_topic_rows(&mut observations, &records, &labels).unwrap();
+                    orphanwiki::join_topic_rows(&mut observations, &records, &labels).unwrap();
                 }
             }
         }

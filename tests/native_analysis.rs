@@ -1,5 +1,5 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{
+use orphanwiki::dumps::{
     analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, comparison_schema,
     refresh_measures, stage_comparison_graph, AnalysisOptions, SQL_TABLES,
 };

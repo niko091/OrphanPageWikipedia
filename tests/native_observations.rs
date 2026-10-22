@@ -1,5 +1,5 @@
 //! Scientific row joins are available without Python, Wasm or the dump CLI.
-use _native::{
+use orphanwiki::{
     classify_categories, initialize_creator_rows, join_history_rows, join_quality_rows,
     join_topic_rows, observation_ages, observation_row,
 };

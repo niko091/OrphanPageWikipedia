@@ -270,7 +270,7 @@ impl Invocation {
         let config = std::fs::read_to_string(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let config = serde_json::from_str(&config).map_err(|error| error.to_string())?;
-        let pool = _native::configured_languages(&config)?;
+        let pool = orphanwiki::configured_languages(&config)?;
         let selected = if self.name == "compare" {
             None
         } else {
@@ -278,7 +278,7 @@ impl Invocation {
                 .get_many::<String>("languages")
                 .map(|values| values.cloned().collect::<Vec<_>>())
         };
-        self.editions = _native::select_languages(&pool, selected.as_deref())?;
+        self.editions = orphanwiki::select_languages(&pool, selected.as_deref())?;
         // The CLI's explicit acquisition order is independent of the pool's order.
         if let Some(selected) = selected {
             self.editions
@@ -300,7 +300,7 @@ impl Invocation {
                 .copied()
                 .ok_or_else(|| format!("Argomento mancante: {name}"))
         };
-        _native::pipeline::benchmark(_native::pipeline::BenchmarkOptions {
+        orphanwiki::pipeline::benchmark(orphanwiki::pipeline::BenchmarkOptions {
             root: self.root.clone(),
             spec: self.path("spec")?,
             output_dir: self.path("output-dir")?,
@@ -345,7 +345,7 @@ impl Invocation {
                 .get_one::<String>("work-dir")
                 .map(|p| self.root.join(p))
                 .unwrap_or_else(|| dump_root.join("staging"));
-            return _native::pipeline::run(_native::pipeline::PipelineOptions {
+            return orphanwiki::pipeline::run(orphanwiki::pipeline::PipelineOptions {
                 root: self.root.clone(),
                 languages_file: self.path("languages-file")?,
                 selected: self.editions.clone(),
@@ -375,7 +375,7 @@ impl Invocation {
             .map_err(|e| e.to_string());
         }
         if self.name == "serve" {
-            let database = _native::editorial::ReviewDatabase::from_environment(
+            let database = orphanwiki::editorial::ReviewDatabase::from_environment(
                 &self.root,
                 self.args.get_one::<String>("database").map(PathBuf::from),
             )?;
@@ -386,8 +386,8 @@ impl Invocation {
                 .or_else(|| std::env::var("ORPHANWIKI_WEB_ROOT").ok())
                 .unwrap_or_else(|| "web".into());
             let app =
-                _native::editorial::ReviewApplication::new(self.root.join(web_root), database);
-            return _native::editorial::serve(
+                orphanwiki::editorial::ReviewApplication::new(self.root.join(web_root), database);
+            return orphanwiki::editorial::serve(
                 app,
                 self.args
                     .get_one::<String>("bind")
@@ -401,7 +401,7 @@ impl Invocation {
             let output = self.path("data-dir")?;
             for (language, _) in &self.editions {
                 let quality = input.join(format!("{language}-quality.json"));
-                _native::dumps::refresh_measures(
+                orphanwiki::dumps::refresh_measures(
                     &input.join(format!("{language}-raw.json")),
                     &input.join(format!("{language}-history.json")),
                     &output,
@@ -409,7 +409,7 @@ impl Invocation {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            _native::dumps::publish_available_aggregate(&output).map_err(|e| e.to_string())?;
+            orphanwiki::dumps::publish_available_aggregate(&output).map_err(|e| e.to_string())?;
             return Ok(());
         }
         if self.name == "compare" {
@@ -441,7 +441,7 @@ impl Invocation {
                 .collect::<Vec<_>>();
             let output = self.path("output-dir")?;
             let (paths, published) =
-                _native::dumps::comparison_collections(&paths, &output, &allowed)
+                orphanwiki::dumps::comparison_collections(&paths, &output, &allowed)
                     .map_err(|e| e.to_string())?;
             let work = self
                 .args
@@ -461,9 +461,9 @@ impl Invocation {
                 &std::fs::read(self.path("rules")?).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            let connection = _native::dumps::compare_files(
+            let connection = orphanwiki::dumps::compare_files(
                 &paths,
-                &_native::dumps::ComparisonOptions {
+                &orphanwiki::dumps::ComparisonOptions {
                     rules: &rules,
                     work_dir: &work,
                     topics: &topics,
@@ -474,7 +474,7 @@ impl Invocation {
                 },
             )
             .map_err(|e| e.to_string())?;
-            let index = _native::dumps::publish_comparison(&connection, &output)
+            let index = orphanwiki::dumps::publish_comparison(&connection, &output)
                 .map_err(|e| e.to_string())?;
             println!(
                 "Confronto pubblicato: {} edizioni; {}",
@@ -485,9 +485,9 @@ impl Invocation {
         }
         if self.name == "analyze" {
             let raw = self.path("input")?;
-            let metadata = _native::dumps::first_metadata(&raw).map_err(|e| e.to_string())?;
+            let metadata = orphanwiki::dumps::first_metadata(&raw).map_err(|e| e.to_string())?;
             let language = metadata["language"].as_str().ok_or("Lingua mancante")?;
-            _native::wiki_database(language, metadata["database"].as_str())?;
+            orphanwiki::wiki_database(language, metadata["database"].as_str())?;
             let sibling = |argument: &str| -> Result<Option<PathBuf>, String> {
                 if self.args.get_one::<String>(argument).is_some() {
                     return Ok(Some(self.path(argument)?));
@@ -521,10 +521,10 @@ impl Invocation {
                 .get_one::<String>("output")
                 .map(|p| self.root.join(p))
                 .unwrap_or_else(|| self.root.join(format!("web/data/{language}.json")));
-            _native::dumps::analyze_file(
+            orphanwiki::dumps::analyze_file(
                 &raw,
                 &output,
-                &_native::dumps::AnalysisOptions {
+                &orphanwiki::dumps::AnalysisOptions {
                     rules: &rules,
                     work_dir: work.as_deref(),
                     history: history.as_deref(),
@@ -537,7 +537,7 @@ impl Invocation {
             return Ok(());
         }
         if self.name == "dashboard" {
-            _native::dumps::rebuild_dashboard(&self.path("data-dir")?)
+            orphanwiki::dumps::rebuild_dashboard(&self.path("data-dir")?)
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
@@ -546,13 +546,13 @@ impl Invocation {
                 .args
                 .get_one::<String>("work-dir")
                 .map(|path| self.root.join(path));
-            _native::dumps::run_topics(
+            orphanwiki::dumps::run_topics(
                 &self
                     .editions
                     .iter()
                     .map(|(code, _)| code.clone())
                     .collect::<Vec<_>>(),
-                _native::dumps::TopicRunOptions {
+                orphanwiki::dumps::TopicRunOptions {
                     input_dir: &self.path("input-dir")?,
                     output_dir: &self.path("output-dir")?,
                     model_path: &self.path("model")?,
@@ -572,7 +572,7 @@ impl Invocation {
             return Ok(());
         }
         if matches!(self.name.as_str(), "fetch-dumps" | "fetch-content") {
-            use _native::dumps::{DumpClient, WikimediaHttp};
+            use orphanwiki::dumps::{DumpClient, WikimediaHttp};
             let mut client = DumpClient::new(WikimediaHttp::new()?);
             let release = |name: &str| {
                 self.args
@@ -596,7 +596,7 @@ impl Invocation {
             return Ok(());
         }
         if matches!(self.name.as_str(), "import-dumps" | "import-history") {
-            use _native::dumps::{import_dumps, import_history, HistoryOptions};
+            use orphanwiki::dumps::{import_dumps, import_history, HistoryOptions};
             let options = HistoryOptions {
                 cache_mib: *self
                     .args
@@ -618,7 +618,7 @@ impl Invocation {
                 let language = manifest["language"]
                     .as_str()
                     .ok_or("Lingua del manifest mancante")?;
-                _native::wiki_database(language, manifest["database"].as_str())?;
+                orphanwiki::wiki_database(language, manifest["database"].as_str())?;
                 let history_argument = if self.name == "import-dumps" {
                     "history-output"
                 } else {
@@ -674,7 +674,7 @@ impl Invocation {
                 .get_one::<String>("content-release")
                 .ok_or("Release XML mancante")?;
             for (language, database) in &self.editions {
-                _native::dumps::infer_quality(
+                orphanwiki::dumps::infer_quality(
                     &self.path("input-dir")?.join(format!("{language}-raw.json")),
                     &self
                         .path("root")?
@@ -716,7 +716,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Paths stored in Python manifests can be relative to the repository too.
+    // Existing dump manifests may store paths relative to the repository.
     if let Err(error) = std::env::set_current_dir(&root) {
         eprintln!("{error}");
         return ExitCode::FAILURE;
@@ -737,7 +737,7 @@ fn main() -> ExitCode {
     let _signals = if invocation.name == "serve" {
         None
     } else {
-        match _native::runtime::Signals::install() {
+        match orphanwiki::runtime::Signals::install() {
             Ok(signals) => Some(signals),
             Err(error) => {
                 eprintln!("{error}");
@@ -758,10 +758,10 @@ fn main() -> ExitCode {
     let settings = if tracing_disabled {
         None
     } else {
-        _native::runtime::TraceSettings::from_environment()
+        orphanwiki::runtime::TraceSettings::from_environment()
     };
-    let result = _native::runtime::with_tracing(settings, || {
-        _native::runtime::phase(&format!("cli.{}", invocation.name), || {
+    let result = orphanwiki::runtime::with_tracing(settings, || {
+        orphanwiki::runtime::phase(&format!("cli.{}", invocation.name), || {
             if invocation.name == "benchmark" {
                 invocation.benchmark()
             } else {
@@ -774,7 +774,7 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(
-                _native::runtime::received_signal()
+                orphanwiki::runtime::received_signal()
                     .map_or(1, |number| 128u8.saturating_add(number)),
             )
         }
@@ -918,14 +918,14 @@ mod tests {
 
     #[test]
     fn complete_language_pool_is_validated_before_selecting_a_subset() {
-        let pool = _native::configured_languages(&json!({"version":1,"languages":["vec","lmo","be-tarask"],"databases":{"lmo":"customwiki","be-tarask":"be_x_oldwiki"}})).unwrap();
+        let pool = orphanwiki::configured_languages(&json!({"version":1,"languages":["vec","lmo","be-tarask"],"databases":{"lmo":"customwiki","be-tarask":"be_x_oldwiki"}})).unwrap();
         assert_eq!(pool[2].1, "be_x_oldwiki");
         assert_eq!(
-            _native::select_languages(&pool, Some(&["lmo".into(), "vec".into()])).unwrap(),
+            orphanwiki::select_languages(&pool, Some(&["lmo".into(), "vec".into()])).unwrap(),
             pool[..2]
         );
         for selection in [vec![], vec!["en".into()], vec!["vec".into(), "vec".into()]] {
-            assert!(_native::select_languages(&pool, Some(&selection)).is_err());
+            assert!(orphanwiki::select_languages(&pool, Some(&selection)).is_err());
         }
         for config in [
             json!({"version":1,"languages":["vec","lmo"],"databases":{"lmo":"bad"}}),
@@ -935,15 +935,15 @@ mod tests {
             json!({"version":1,"languages":["vec"],"sampling":10}),
             json!({"version":1,"languages":[]}),
         ] {
-            assert!(_native::configured_languages(&config).is_err());
+            assert!(orphanwiki::configured_languages(&config).is_err());
         }
         for language in ["", "ALL", "a/b", "é", "all"] {
-            assert!(_native::wiki_database(language, None).is_err());
+            assert!(orphanwiki::wiki_database(language, None).is_err());
         }
         assert_eq!(
-            _native::wiki_database("roa-tara", None).unwrap(),
+            orphanwiki::wiki_database("roa-tara", None).unwrap(),
             "roa_tarawiki"
         );
-        assert!(_native::wiki_database("vec", Some("vecwiki_p")).is_err());
+        assert!(orphanwiki::wiki_database("vec", Some("vecwiki_p")).is_err());
     }
 }

@@ -1,6 +1,6 @@
 #![cfg(feature = "cli")]
 
-use _native::dumps::{DumpClient, DumpHttp, DumpResponse, DUMP_BASE, SQL_TABLES};
+use orphanwiki::dumps::{DumpClient, DumpHttp, DumpResponse, DUMP_BASE, SQL_TABLES};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::cell::RefCell;

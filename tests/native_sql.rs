@@ -1,6 +1,6 @@
 #![cfg(feature = "cli")]
 
-use _native::dumps::{import_graph, SQL_TABLES};
+use orphanwiki::dumps::{import_graph, SQL_TABLES};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::fs;

@@ -1,5 +1,5 @@
 //! Public Rust consumers must work with Python disabled, including bounded paths.
-use _native::{
+use orphanwiki::{
     classify_categories, graph_counts, graph_details, matchable_edges, threshold_topics,
     topic_inputs, unique_items, CategoryBatchClassifier, GraphAccumulator, TopicInputAccumulator,
 };

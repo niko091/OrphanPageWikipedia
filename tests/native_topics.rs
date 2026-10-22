@@ -1,6 +1,6 @@
 #![cfg(feature = "cli")]
 
-use _native::dumps::{
+use orphanwiki::dumps::{
     predict_imported_topics, predict_topics, NativeTopicModel, TopicModel, TopicPrediction,
     SQL_TABLES,
 };

@@ -27,7 +27,7 @@ if (!generator) {
     generator = 'wasm-bindgen';
   }
 }
-run(generator, ['--target', 'web', '--no-typescript', '--out-dir', 'web/assets/native', '--out-name', 'dashboard', 'target/wasm32-unknown-unknown/release/_native.wasm']);
+run(generator, ['--target', 'web', '--no-typescript', '--out-dir', 'web/assets/native', '--out-name', 'dashboard', 'target/wasm32-unknown-unknown/release/orphanwiki.wasm']);
 
 const wasm = await readFile(new URL('dashboard_bg.wasm', native));
 const wasmName = `dashboard_${digest(wasm)}.wasm`;

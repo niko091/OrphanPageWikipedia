@@ -1,6 +1,6 @@
 #![cfg(feature = "cli")]
 
-use _native::dumps::{import_history, HistoryOptions};
+use orphanwiki::dumps::{import_history, HistoryOptions};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::Digest;

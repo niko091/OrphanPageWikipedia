@@ -1,4 +1,4 @@
-use _native::dumps::QualityExtractor;
+use orphanwiki::dumps::QualityExtractor;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -66,7 +66,7 @@ fn same_xml_namespaces_extend_frozen_aliases_without_case_or_prefix_inference() 
 #[cfg(feature = "cli")]
 mod content {
     use super::*;
-    use _native::dumps::{infer_quality, SQL_TABLES};
+    use orphanwiki::dumps::{infer_quality, SQL_TABLES};
     use rusqlite::Connection;
     use serde_json::json;
     use sha2::Digest;

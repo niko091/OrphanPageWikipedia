@@ -1,11 +1,11 @@
 [package]
-name = "orphanwiki-native"
+name = "orphanwiki"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 
 [lib]
-name = "_native"
+name = "orphanwiki"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
@@ -14,14 +14,11 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["python"]
-python = ["dep:pyo3"]
+default = ["cli"]
 dashboard = ["dep:wasm-bindgen"]
 cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc", "dep:focaccia", "dep:axum", "dep:tokio", "dep:mysql", "dep:futures-util", "dep:rustix", "dep:signal-hook", "dep:nix", "dep:indexmap", "serde_json/float_roundtrip"]
 
 [dependencies]
-pyo3 = { version = "0.28", optional = true, features = ["extension-module", "abi3-py311"] }
-
 regex = "=1.12.4"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 

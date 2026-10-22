@@ -1,5 +1,5 @@
 #![cfg(feature = "cli")]
-use _native::dumps::{
+use orphanwiki::dumps::{
     compare_files, comparison_schema, export_comparison_member, match_comparison,
     seed_comparison_pairs, stage_comparison_graph, AnalysisOptions, ComparisonOptions,
 };

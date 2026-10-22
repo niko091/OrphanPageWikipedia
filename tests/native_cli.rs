@@ -314,7 +314,7 @@ fn standalone_help_needs_neither_python_nor_repository_files() {
 }
 
 #[test]
-fn bad_arguments_and_pending_stages_never_publish_output() {
+fn bad_arguments_never_publish_output() {
     let workspace = Workspace::new();
     assert_eq!(workspace.run(&[]).status.code(), Some(2));
     assert_eq!(
