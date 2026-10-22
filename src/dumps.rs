@@ -1342,6 +1342,143 @@ fn next_relation(rows: &mut rusqlite::Rows<'_>) -> DumpResult<Option<(i64, Strin
         .transpose()
 }
 
+// Graph byte checksums are inputs to later stages. Keep the reference field
+// order and separators as well as its complete scientific records.
+#[cfg(feature = "cli")]
+struct GraphFormatter;
+
+#[cfg(feature = "cli")]
+impl serde_json::ser::Formatter for GraphFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+}
+
+#[cfg(feature = "cli")]
+#[derive(Clone, Copy)]
+enum GraphObject {
+    Metadata,
+    Features,
+    ItemMapping,
+    Page,
+}
+
+#[cfg(feature = "cli")]
+struct GraphRecord<'a> {
+    value: &'a serde_json::Value,
+    kind: GraphObject,
+}
+
+#[cfg(feature = "cli")]
+impl serde::Serialize for GraphRecord<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeMap};
+        let fields: &[&str] = match self.kind {
+            GraphObject::Metadata => &[
+                "language",
+                "database",
+                "source",
+                "sql_release",
+                "dump_manifest_sha256",
+                "complete",
+                "demo",
+                "started_at",
+                "finished_at",
+                "temporal_consistency",
+                "creation_date_rule",
+                "creator_collection_status",
+                "article_features",
+                "item_mapping",
+                "dump_manifest",
+            ],
+            GraphObject::Features => &[
+                "age",
+                "length",
+                "topic_inputs",
+                "topics",
+                "quality",
+                "pageviews",
+                "biographical_gender",
+                "bot_at_creation",
+            ],
+            GraphObject::ItemMapping => &["source", "complete"],
+            GraphObject::Page => &[
+                "page_id",
+                "title",
+                "length_bytes",
+                "revision_id",
+                "wikibase_item",
+                "created_at",
+                "page_created_at",
+                "first_public_revision_at",
+                "creation_date_source",
+                "creation_date_status",
+                "links",
+                "categories",
+            ],
+        };
+        let object = self
+            .value
+            .as_object()
+            .filter(|o| o.len() == fields.len())
+            .ok_or_else(|| S::Error::custom("Struttura del record del grafo non valida"))?;
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for key in fields {
+            let value = object
+                .get(*key)
+                .ok_or_else(|| S::Error::custom("Campo del grafo mancante"))?;
+            let nested = match (self.kind, *key) {
+                (GraphObject::Metadata, "article_features") => Some(GraphObject::Features),
+                (GraphObject::Metadata, "item_mapping") => Some(GraphObject::ItemMapping),
+                _ => None,
+            };
+            if let Some(kind) = nested {
+                map.serialize_entry(key, &GraphRecord { value, kind })?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+#[cfg(feature = "cli")]
+fn write_graph_json(
+    value: &impl serde::Serialize,
+    writer: &mut impl std::io::Write,
+) -> DumpResult<()> {
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        writer,
+        GraphFormatter,
+    ))?;
+    Ok(())
+}
+
 /// Import verified SQL archives using the existing table and checkpoint contracts.
 /// The caller owns separate output/staging paths; collected inputs are read only.
 #[cfg(feature = "cli")]
@@ -1474,8 +1611,8 @@ pub fn import_graph(
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-        let mut parents = std::collections::BTreeMap::<String, Vec<String>>::new();
+            .collect::<Result<indexmap::IndexMap<_, _>, _>>()?;
+        let mut parents = indexmap::IndexMap::<String, Vec<String>>::new();
         {
             let mut query = connection.prepare("SELECT p.title,COALESCE(t.title,c.title) FROM dump_category c JOIN dump_page p ON p.id=c.source_id
             LEFT JOIN dump_target t ON t.id=c.target_id WHERE p.ns=14 AND (t.ns=14 OR c.title IS NOT NULL)
@@ -1506,7 +1643,13 @@ pub fn import_graph(
         write_atomic(output, |file| {
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
             writer.write_all(b"{\"metadata\":")?;
-            serde_json::to_writer(&mut writer, &metadata)?;
+            write_graph_json(
+                &GraphRecord {
+                    value: &metadata,
+                    kind: GraphObject::Metadata,
+                },
+                &mut writer,
+            )?;
             writer.write_all(b",\"pages\":[")?;
             let mut page_query = connection.prepare("SELECT id,data FROM pages ORDER BY id")?;
             let mut link_query =
@@ -1546,16 +1689,22 @@ pub fn import_graph(
                 if count != 0 {
                     writer.write_all(b",")?;
                 }
-                serde_json::to_writer(&mut writer, &page)?;
+                write_graph_json(
+                    &GraphRecord {
+                        value: &page,
+                        kind: GraphObject::Page,
+                    },
+                    &mut writer,
+                )?;
                 count += 1;
             }
             if count != expected {
                 return Err("Popolazione del dump cambiata durante l’esportazione".into());
             }
             writer.write_all(b"],\"redirects\":")?;
-            serde_json::to_writer(&mut writer, &redirects)?;
+            write_graph_json(&redirects, &mut writer)?;
             writer.write_all(b",\"category_parents\":")?;
-            serde_json::to_writer(&mut writer, &parents)?;
+            write_graph_json(&parents, &mut writer)?;
             writer.write_all(b"}")?;
             writer.flush()?;
             Ok(())

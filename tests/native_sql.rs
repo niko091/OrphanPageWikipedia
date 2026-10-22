@@ -171,6 +171,81 @@ impl Drop for Workspace {
 }
 
 #[test]
+fn graph_bytes_retain_the_frozen_export_identity_for_unicode_links_and_metadata() {
+    let w = Workspace::new();
+    let tables = [
+        (
+            "page",
+            &[
+                "page_id",
+                "page_namespace",
+                "page_title",
+                "page_is_redirect",
+                "page_len",
+                "page_latest",
+            ][..],
+            &[
+                "(1,0,'Àrticle_雪',0,123,77)",
+                "(2,0,'Alias',1,0,78)",
+                "(3,14,'Specific',0,10,79)",
+                "(4,14,'Broad',0,5,80)",
+            ][..],
+        ),
+        (
+            "linktarget",
+            &["lt_id", "lt_namespace", "lt_title"][..],
+            &["(1,0,'Alias')", "(2,14,'Specific')", "(3,14,'Broad')"][..],
+        ),
+        (
+            "pagelinks",
+            &["pl_from", "pl_from_namespace", "pl_target_id"][..],
+            &["(1,0,1)", "(1,0,1)"][..],
+        ),
+        (
+            "redirect",
+            &["rd_from", "rd_namespace", "rd_title", "rd_interwiki"][..],
+            &["(2,0,'Àrticle_雪','')"][..],
+        ),
+        (
+            "page_props",
+            &["pp_page", "pp_propname", "pp_value"][..],
+            &["(1,'wikibase_item','Q17')"][..],
+        ),
+        (
+            "categorylinks",
+            &["cl_from", "cl_to"][..],
+            &["(1,'Specific')", "(3,'Broad')"][..],
+        ),
+        (
+            "user_groups",
+            &["ug_user", "ug_group", "ug_expiry"][..],
+            &["(1,'bot',NULL)"][..],
+        ),
+    ];
+    let mut files = serde_json::Map::new();
+    for (name, columns, rows) in tables {
+        let rows = rows.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        files.insert(name.into(), w.archive(name, columns, &rows, ""));
+    }
+    let manifest = w.0.join("manifest.json");
+    fs::write(&manifest,json!({"language":"vec","database":"vecwiki","sql_release":"20261001","history_release":"2026-09","files":files}).to_string()).unwrap();
+    let output = w.0.join("raw.json");
+    import_graph(&manifest, &output, &w.0.join("staging")).unwrap();
+    let path = serde_json::to_string(&manifest.canonicalize().unwrap()).unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest(fs::read(&manifest).unwrap()));
+    let actual = fs::read_to_string(output)
+        .unwrap()
+        .replacen(&path, "\"MANIFEST\"", 1)
+        .replacen(&digest, "SHA", 1);
+    // Frozen ea8b55a output, replacing only the temporary manifest path/hash.
+    assert_eq!(actual.len(), 1401);
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(actual.as_bytes())),
+        "6ba287d8c21bc46415903c84ae6a8296b5d94542b7d6fa4e57a4da14b35f8a06"
+    );
+}
+
+#[test]
 fn standalone_combined_import_and_selected_history_reuse_existing_sql_stage() {
     let workspace = Workspace::new();
     let manifest_path = workspace.manifest(false);
