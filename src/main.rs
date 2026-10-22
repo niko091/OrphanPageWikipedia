@@ -178,6 +178,35 @@ fn cli() -> Command {
     )
     .arg(Arg::new("force").long("force").action(ArgAction::SetTrue))
     .arg(Arg::new("plan").long("plan").action(ArgAction::SetTrue));
+    let benchmark = Command::new("benchmark")
+        .about("Confronta comandi su copie private con parità completa degli output")
+        .arg(option("spec").required(true))
+        .arg(option("output-dir").required(true))
+        .arg(
+            option("repetitions")
+                .default_value("5")
+                .value_parser(clap::value_parser!(u32).range(3..)),
+        )
+        .arg(
+            option("warmups")
+                .default_value("1")
+                .value_parser(clap::value_parser!(u32)),
+        )
+        .arg(
+            option("metrics-interval")
+                .default_value("0.1")
+                .value_parser(positive_budget),
+        )
+        .arg(
+            option("min-speedup")
+                .default_value("1.10")
+                .value_parser(positive_budget),
+        )
+        .arg(
+            option("max-rss-ratio")
+                .default_value("1.10")
+                .value_parser(positive_budget),
+        );
     Command::new("orphanwiki")
         .about("Censimento e analisi delle pagine orfane")
         .version(env!("CARGO_PKG_VERSION"))
@@ -185,7 +214,7 @@ fn cli() -> Command {
         .arg(option("repo-root").global(true).help("Radice di configurazioni e percorsi relativi; altrimenti cerca dalla directory corrente"))
         .subcommands([
             Command::new("dashboard").about("Prepara i trasporti dagli export approvati").arg(path_option("data-dir", "web/data")),
-            content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve, pipeline,
+            content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve, pipeline, benchmark,
         ])
 }
 
@@ -256,6 +285,32 @@ impl Invocation {
                 .sort_by_key(|(language, _)| selected.iter().position(|code| code == language));
         }
         Ok(())
+    }
+
+    fn benchmark(&self) -> Result<u8, String> {
+        let integer = |name| {
+            self.args
+                .get_one::<u32>(name)
+                .copied()
+                .ok_or_else(|| format!("Argomento mancante: {name}"))
+        };
+        let decimal = |name| {
+            self.args
+                .get_one::<f64>(name)
+                .copied()
+                .ok_or_else(|| format!("Argomento mancante: {name}"))
+        };
+        _native::pipeline::benchmark(_native::pipeline::BenchmarkOptions {
+            root: self.root.clone(),
+            spec: self.path("spec")?,
+            output_dir: self.path("output-dir")?,
+            repetitions: integer("repetitions")?,
+            warmups: integer("warmups")?,
+            metrics_interval: decimal("metrics-interval")?,
+            min_speedup: decimal("min-speedup")?,
+            max_rss_ratio: decimal("max-rss-ratio")?,
+        })
+        .map_err(|e| e.to_string())
     }
 
     fn execute(&self) -> Result<(), String> {
@@ -690,25 +745,32 @@ fn main() -> ExitCode {
             }
         }
     };
-    let tracing_disabled = ["plan", "no-phase-spans"].iter().any(|name| {
-        invocation
-            .args
-            .try_get_one::<bool>(name)
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false)
-    });
+    let tracing_disabled = invocation.name == "benchmark"
+        || ["plan", "no-phase-spans"].iter().any(|name| {
+            invocation
+                .args
+                .try_get_one::<bool>(name)
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+        });
     let settings = if tracing_disabled {
         None
     } else {
         _native::runtime::TraceSettings::from_environment()
     };
     let result = _native::runtime::with_tracing(settings, || {
-        _native::runtime::phase(&format!("cli.{}", invocation.name), || invocation.execute())
+        _native::runtime::phase(&format!("cli.{}", invocation.name), || {
+            if invocation.name == "benchmark" {
+                invocation.benchmark()
+            } else {
+                invocation.execute().map(|()| 0)
+            }
+        })
     });
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(

@@ -2062,7 +2062,7 @@ pub fn first_metadata(path: &std::path::Path) -> DumpResult<serde_json::Value> {
 /// Read the ordered metadata/pages contract, optionally followed by candidate
 /// records. Keep one record resident, including records larger than the buffer.
 #[cfg(feature = "cli")]
-fn visit_ordered_json(
+pub(crate) fn visit_ordered_json(
     reader: impl std::io::Read,
     allow_candidates: bool,
     pages_only: bool,

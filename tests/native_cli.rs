@@ -619,3 +619,64 @@ fn standalone_compare_publishes_all_members_and_retains_every_previous_generatio
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn standalone_benchmark_checks_parity_and_reports_verdict_without_python() {
+    use serde_json::json;
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.0.join("seed.json"),
+        r#"{"metadata":{"complete":true,"language":"vec"},"pages":[{"id":1,"age":null}]}"#,
+    )
+    .unwrap();
+    let command = json!([
+        "/bin/sh",
+        "-c",
+        "/bin/cp \"$1/seed.json\" \"$1/result.json\"; /bin/sleep 0.15",
+        "benchmark",
+        "{run}"
+    ]);
+    let spec = json!({"version":1,"inputs":["seed.json"],"copies":[{"source":"seed.json","destination":"seed.json"}],
+        "baseline":{"commands":[command]},"candidate":{"commands":[command]},"outputs":[{"path":"result.json","kind":"canonical"}]});
+    fs::write(
+        workspace.0.join("spec.json"),
+        serde_json::to_vec(&spec).unwrap(),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+        .args([
+            "benchmark",
+            "--spec",
+            "spec.json",
+            "--output-dir",
+            "measurements",
+            "--repetitions",
+            "3",
+            "--warmups",
+            "0",
+            "--min-speedup",
+            "10000",
+        ])
+        .env_clear()
+        .current_dir(&workspace.0)
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.0.join("measurements/comparison.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["correctness"], "matched");
+    assert_eq!(report["samples"].as_array().unwrap().len(), 6);
+    assert_eq!(report["status"], "no_improvement");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("seed.json")).unwrap(),
+        r#"{"metadata":{"complete":true,"language":"vec"},"pages":[{"id":1,"age":null}]}"#
+    );
+}

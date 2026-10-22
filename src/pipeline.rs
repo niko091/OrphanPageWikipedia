@@ -640,6 +640,7 @@ struct Reporter {
     run_id: String,
     started: Instant,
     disks: BTreeMap<&'static str, PathBuf>,
+    include_controller_memory: bool,
 }
 
 impl Reporter {
@@ -678,7 +679,7 @@ impl Reporter {
             .map_err(|_| "Metriche non disponibili")?
             .active
             .clone();
-        let mut resources = runtime::resources(std::process::id(), true);
+        let mut resources = runtime::resources(std::process::id(), self.include_controller_memory);
         let now = Instant::now();
         let step = {
             let mut state = self.shared.lock().map_err(|_| "Metriche non disponibili")?;
@@ -839,6 +840,15 @@ impl Drop for RunningChild {
     }
 }
 
+struct RecordingOptions {
+    root: PathBuf,
+    prefix: PathBuf,
+    interval: f64,
+    phase_spans: bool,
+    include_controller_memory: bool,
+    disks: BTreeMap<&'static str, PathBuf>,
+}
+
 struct Runner {
     executable: PathBuf,
     root: PathBuf,
@@ -872,44 +882,13 @@ impl Runner {
             timestamp().replace(['-', ':', '.'], ""),
             &run_id[..12]
         );
-        let log_path = options.log_dir.join(format!("{prefix}.log"));
-        let event_path = options
-            .log_dir
-            .join(format!("{prefix}.benchmark.metrics.jsonl"));
-        let report_path = options.log_dir.join(format!("{prefix}.benchmark.json"));
-        let create = |path: &Path| OpenOptions::new().write(true).create_new(true).open(path);
+        let prefix = options.log_dir.join(prefix);
         let disks = BTreeMap::from([
             ("dump_root", options.dump_root.clone()),
             ("import_dir", options.import_dir.clone()),
             ("output_dir", options.output_dir.clone()),
             ("work_dir", options.work_dir.clone()),
         ]);
-        let reporter = Reporter {
-            shared: std::sync::Arc::new(std::sync::Mutex::new(Reporting {
-                log: create(&log_path)?,
-                events: create(&event_path)?,
-                active: None,
-                peak_rss: None,
-                step_peak_rss: None,
-                last_cpu: None,
-            })),
-            run_id: run_id.clone(),
-            started: Instant::now(),
-            disks,
-        };
-        let trace = if options.no_phase_spans {
-            None
-        } else {
-            let file = options
-                .log_dir
-                .join(format!("{prefix}.benchmark.spans.jsonl"));
-            create(&file)?;
-            Some(runtime::TraceSettings {
-                file,
-                run_id: run_id.clone(),
-                parent_id: None,
-            })
-        };
         let configs = [
             &options.languages_file,
             &options.model_config,
@@ -939,20 +918,66 @@ impl Runner {
                 "dump_root":options.dump_root,"import_dir":options.import_dir,"output_dir":options.output_dir,"work_dir":options.work_dir,
                 "topic_batch_size":options.topic_batch_size,"topic_budget_seconds":options.topic_budget_seconds,"history_cache_mib":options.history_cache_mib,
                 "history_commit_rows":options.history_commit_rows,"metrics_interval":options.metrics_interval,"no_phase_spans":options.no_phase_spans,"force":options.force},
-            "host":host_inventory(&reporter.disks),
+            "host":host_inventory(&disks),
             "code":{"git_revision":git(&["rev-parse","HEAD"]),"binary_sha256":dumps::file_sha256(&executable)?},"config_sha256":configs,
-            "measurement":{"interval_seconds":options.metrics_interval,"spans_file":trace.as_ref().and_then(|t|t.file.file_name()).map(|s|s.to_string_lossy()),
+            "measurement":{"interval_seconds":options.metrics_interval,"spans_file":(!options.no_phase_spans).then(||prefix.with_extension("benchmark.spans.jsonl").file_name().map(|s|s.to_string_lossy().into_owned())).flatten(),
                 "spans":"inclusive monotonic intervals; subtract child interval unions; abrupt ends are detection bounds",
                 "rss":"sampled sum of controller and live descendants; shared pages may repeat; not PSS",
                 "cpu":"getrusage children deltas per completed step; live /proc samples are estimates; 100 percent = one core",
                 "io":"controller plus reaped descendants; physical storage bytes, excludes network and cache hits"}});
+        Self::record(
+            RecordingOptions {
+                root: options.root.clone(),
+                prefix,
+                interval: options.metrics_interval,
+                phase_spans: !options.no_phase_spans,
+                include_controller_memory: true,
+                disks,
+            },
+            metadata,
+        )
+    }
+
+    fn record(options: RecordingOptions, mut metadata: Value) -> PipelineResult<Self> {
+        let executable = std::env::current_exe()?;
+        let run_id = runtime::unique_id();
+        metadata["run_id"] = json!(run_id);
+        let log_path = options.prefix.with_extension("log");
+        let event_path = options.prefix.with_extension("benchmark.metrics.jsonl");
+        let report_path = options.prefix.with_extension("benchmark.json");
+        let create = |path: &Path| OpenOptions::new().write(true).create_new(true).open(path);
+        let reporter = Reporter {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(Reporting {
+                log: create(&log_path)?,
+                events: create(&event_path)?,
+                active: None,
+                peak_rss: None,
+                step_peak_rss: None,
+                last_cpu: None,
+            })),
+            run_id: run_id.clone(),
+            started: Instant::now(),
+            disks: options.disks,
+            include_controller_memory: options.include_controller_memory,
+        };
+        let trace = if options.phase_spans {
+            let file = options.prefix.with_extension("benchmark.spans.jsonl");
+            create(&file)?;
+            Some(runtime::TraceSettings {
+                file,
+                run_id,
+                parent_id: None,
+            })
+        } else {
+            None
+        };
         reporter.log(&format!("LOG {}", log_path.display()))?;
         reporter.event("run_start", metadata.clone())?;
         reporter.sample()?;
-        let monitor = Monitor::start(reporter.clone(), options.metrics_interval);
+        let monitor = Monitor::start(reporter.clone(), options.interval);
         Ok(Self {
             executable,
-            root: options.root.clone(),
+            root: options.root,
             reporter: Some(reporter),
             monitor: Some(monitor),
             report_path: Some(report_path),
@@ -968,7 +993,7 @@ impl Runner {
             return Ok(());
         };
         reporter.sample()?;
-        let resources = runtime::resources(std::process::id(), true);
+        let resources = runtime::resources(std::process::id(), reporter.include_controller_memory);
         let status = if result.is_ok() {
             "completed"
         } else if runtime::received_signal().is_some() {
@@ -1001,24 +1026,28 @@ impl Runner {
             .report_path
             .as_ref()
             .ok_or("Percorso del report mancante")?;
-        // This operational report must also survive handled cancellation.
-        let temporary = path.with_extension(format!("{}.tmp", runtime::unique_id()));
-        let written = (|| -> PipelineResult<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            serde_json::to_writer_pretty(&mut file, &report)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)?;
-            Ok(())
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(temporary);
-        }
-        written
+        write_operational_report(path, &report)
     }
+}
+
+fn write_operational_report(path: &Path, report: &Value) -> PipelineResult<()> {
+    // Diagnostics must also survive handled cancellation.
+    let temporary = path.with_extension(format!("{}.tmp", runtime::unique_id()));
+    let written = (|| -> PipelineResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, report)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    written
 }
 
 fn numeric_difference(after: &Value, before: &Value, key: &str) -> Value {
@@ -1043,6 +1072,23 @@ impl Steps for Runner {
     }
 
     fn run(&mut self, name: &str, arguments: &[String]) -> PipelineResult<()> {
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("--repo-root")
+            .arg(&self.root)
+            .args(arguments)
+            .current_dir(&self.root);
+        self.execute_command(name, arguments, command)
+    }
+}
+
+impl Runner {
+    fn execute_command(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        mut command: Command,
+    ) -> PipelineResult<()> {
         runtime::check_cancelled()?;
         runtime::phase("pipeline.step", || {
             runtime::phase_tag("step", json!(name));
@@ -1071,12 +1117,6 @@ impl Steps for Runner {
                 .and_then(|s| std::fs::metadata(&s.file).ok())
                 .map_or(0, |s| s.len());
             let result = (|| -> PipelineResult<i32> {
-                let mut command = Command::new(&self.executable);
-                command
-                    .arg("--repo-root")
-                    .arg(&self.root)
-                    .args(arguments)
-                    .current_dir(&self.root);
                 runtime::configure_child_tracing(&mut command);
                 let mut child = RunningChild::start(command)?;
                 let mut exited = None;
@@ -1175,6 +1215,585 @@ impl Steps for Runner {
             Ok(())
         })
     }
+}
+
+/// Paired commands use independent copies of frozen inputs; no controller RSS.
+pub struct BenchmarkOptions {
+    pub root: PathBuf,
+    pub spec: PathBuf,
+    pub output_dir: PathBuf,
+    pub repetitions: u32,
+    pub warmups: u32,
+    pub metrics_interval: f64,
+    pub min_speedup: f64,
+    pub max_rss_ratio: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct BenchmarkSpec {
+    version: u32,
+    inputs: Vec<String>,
+    #[serde(default)]
+    copies: Vec<BenchmarkCopy>,
+    outputs: Vec<BenchmarkOutput>,
+    baseline: BenchmarkVariant,
+    candidate: BenchmarkVariant,
+}
+
+#[derive(serde::Deserialize)]
+struct BenchmarkCopy {
+    source: String,
+    destination: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BenchmarkVariant {
+    #[serde(default = "default_directory")]
+    cwd: String,
+    commands: Vec<Vec<String>>,
+}
+
+fn default_directory() -> String {
+    ".".into()
+}
+
+#[derive(serde::Deserialize)]
+struct BenchmarkOutput {
+    path: String,
+    kind: OutputKind,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OutputKind {
+    Canonical,
+    Manifest,
+    Bytes,
+}
+
+fn relative_path(value: &str) -> PipelineResult<&Path> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+        || path.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("Percorso benchmark relativo non valido".into());
+    }
+    Ok(path)
+}
+
+fn local_output(folder: &Path, name: &str) -> PipelineResult<PathBuf> {
+    let path = folder.join(relative_path(name)?).canonicalize()?;
+    if !path.starts_with(folder.canonicalize()?) {
+        return Err("Output benchmark esterno alla prova".into());
+    }
+    Ok(path)
+}
+
+#[derive(Default)]
+struct BenchmarkDigest(sha2::Sha256);
+
+impl Write for BenchmarkDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_fingerprint(path: &Path, language: Option<&str>) -> PipelineResult<Value> {
+    use sha2::Digest;
+    let mut digest = BenchmarkDigest::default();
+    let mut pages = 0u64;
+    let mut targets = 0u64;
+    let mut candidates = 0u64;
+    let mut reference_edges = 0u64;
+    dumps::visit_ordered_json(
+        std::io::BufReader::new(File::open(path)?),
+        true,
+        false,
+        &mut |section, identifier, mut value| {
+            match section {
+                "metadata" => {
+                    if value["complete"] != true || !value["language"].is_string() {
+                        return Err("Il benchmark richiede un censimento completo".into());
+                    }
+                    if language.is_some_and(|l| value["language"] != l) {
+                        return Err("Lingua del manifest benchmark non corrispondente".into());
+                    }
+                    let meta = value.as_object_mut().ok_or("Metadati non validi")?;
+                    meta.remove("engine");
+                    meta.remove("dump_manifest");
+                    if matches!(
+                        meta.get("source").and_then(Value::as_str),
+                        Some(
+                            "local_model_on_synthetic_outlinks"
+                                | "local_model_on_verified_SQL_dump_outlinks"
+                        )
+                    ) {
+                        for key in ["started_at", "finished_at", "timing"] {
+                            meta.remove(key);
+                        }
+                    }
+                    if let Some(topics) = meta.get_mut("topics").and_then(Value::as_object_mut) {
+                        for key in ["started_at", "finished_at", "timing"] {
+                            topics.remove(key);
+                        }
+                    }
+                }
+                "pages" => pages += 1,
+                "link_candidates" => {
+                    targets += 1;
+                    if let Some(rows) = value.get("candidates") {
+                        let rows = rows.as_array().ok_or("Candidate non valide")?;
+                        candidates += rows.len() as u64;
+                        for row in rows {
+                            if let Some(edges) = row.get("evidence") {
+                                reference_edges +=
+                                    edges.as_array().ok_or("Evidenze non valide")?.len() as u64;
+                            }
+                        }
+                    }
+                }
+                _ => return Err("Sezione benchmark non valida".into()),
+            }
+            dumps::write_canonical_json(&json!([section, identifier, value]), &mut digest)?;
+            digest.write_all(b"\n")?;
+            Ok(())
+        },
+    )?;
+    if pages == 0 {
+        return Err("Output benchmark senza voci".into());
+    }
+    Ok(
+        json!({"sha256":format!("{:x}",digest.0.finalize()), "pages":pages,"targets":targets,"candidates":candidates,"reference_edges":reference_edges}),
+    )
+}
+
+fn benchmark_outputs(folder: &Path, outputs: &[BenchmarkOutput]) -> PipelineResult<Value> {
+    let mut result = Map::new();
+    for output in outputs {
+        let path = local_output(folder, &output.path)?;
+        match output.kind {
+            OutputKind::Canonical => {
+                result.insert(output.path.clone(), canonical_fingerprint(&path, None)?);
+            }
+            OutputKind::Bytes => {
+                result.insert(
+                    output.path.clone(),
+                    json!({"sha256":dumps::file_sha256(&path)?,"bytes":path.metadata()?.len()}),
+                );
+            }
+            OutputKind::Manifest => {
+                let entries = read_json(&path)?;
+                let entries = entries.as_array().ok_or("Manifest benchmark non valido")?;
+                let mut languages = BTreeSet::new();
+                for entry in entries {
+                    if !entry.is_object() {
+                        return Err("Manifest benchmark non valido".into());
+                    }
+                    if entry.get("kind").and_then(Value::as_str).unwrap_or("wiki") != "wiki" {
+                        continue;
+                    }
+                    let language = entry["language"]
+                        .as_str()
+                        .filter(|l| !l.is_empty())
+                        .ok_or("Lingua benchmark mancante")?;
+                    if !languages.insert(language) {
+                        return Err("Serve esattamente un export per lingua nel benchmark".into());
+                    }
+                    let filename = entry["file"]
+                        .as_str()
+                        .ok_or("Nome export benchmark non valido")?;
+                    if relative_path(filename)?.components().count() != 1 {
+                        return Err("Nome export benchmark non valido".into());
+                    }
+                    let parent = Path::new(&output.path)
+                        .parent()
+                        .ok_or("Percorso manifest non valido")?;
+                    let member = local_output(folder, &parent.join(filename).to_string_lossy())?;
+                    result.insert(
+                        format!("{}:{language}", output.path),
+                        canonical_fingerprint(&member, Some(language))?,
+                    );
+                }
+                if languages.is_empty() {
+                    return Err("Manifest benchmark senza membri".into());
+                }
+            }
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+fn distribution(values: &[Option<f64>]) -> Value {
+    let Some(mut values) = values.iter().copied().collect::<Option<Vec<_>>>() else {
+        return Value::Null;
+    };
+    if values.is_empty() || values.iter().any(|n| !n.is_finite()) {
+        return Value::Null;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    let median = if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    };
+    json!({"median":median,"min":values[0],"max":values[values.len()-1]})
+}
+
+fn benchmark_summary(
+    samples: &[Value],
+    min_speedup: f64,
+    max_rss_ratio: f64,
+) -> PipelineResult<Value> {
+    let mut pairs = BTreeMap::<u64, BTreeMap<&str, &Value>>::new();
+    for sample in samples {
+        if sample["warmup"] == true {
+            continue;
+        }
+        let pair = sample["pair"]
+            .as_u64()
+            .ok_or("Coppia benchmark non valida")?;
+        let variant = sample["variant"]
+            .as_str()
+            .ok_or("Variante benchmark mancante")?;
+        if !matches!(variant, "baseline" | "candidate")
+            || pairs
+                .entry(pair)
+                .or_default()
+                .insert(variant, sample)
+                .is_some()
+        {
+            return Err("Prova benchmark duplicata o non valida".into());
+        }
+    }
+    if pairs.len() < 3 || pairs.values().any(|p| p.len() != 2) {
+        return Err("Servono almeno tre coppie complete di misure".into());
+    }
+    let mut metrics = Map::new();
+    for metric in ["wall_seconds", "cpu_seconds", "sampled_peak_tree_rss_bytes"] {
+        let before = pairs
+            .values()
+            .map(|p| p["baseline"][metric].as_f64())
+            .collect::<Vec<_>>();
+        let after = pairs
+            .values()
+            .map(|p| p["candidate"][metric].as_f64())
+            .collect::<Vec<_>>();
+        if metric == "wall_seconds"
+            && before
+                .iter()
+                .chain(&after)
+                .any(|v| v.is_none_or(|n| !n.is_finite() || n <= 0.0))
+        {
+            return Err("Durata benchmark non valida".into());
+        }
+        let ratios = before
+            .iter()
+            .zip(&after)
+            .map(|(b, a)| b.zip(*a).filter(|(b, _)| *b > 0.0).map(|(b, a)| a / b))
+            .collect::<Vec<_>>();
+        metrics.insert(metric.into(),json!({"baseline":distribution(&before),"candidate":distribution(&after),"candidate_over_baseline":distribution(&ratios)}));
+    }
+    let speedup = distribution(
+        &pairs
+            .values()
+            .map(|p| {
+                p["baseline"]["wall_seconds"]
+                    .as_f64()
+                    .zip(p["candidate"]["wall_seconds"].as_f64())
+                    .map(|(b, a)| b / a)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let memory = &metrics["sampled_peak_tree_rss_bytes"]["candidate_over_baseline"];
+    let status = if speedup["median"].as_f64().is_some_and(|n| n < min_speedup)
+        || memory["max"].as_f64().is_some_and(|n| n > max_rss_ratio)
+    {
+        "no_improvement"
+    } else if memory.is_null() || speedup["min"].as_f64().is_none_or(|n| n <= 1.0) {
+        "inconclusive"
+    } else {
+        "passed"
+    };
+    Ok(
+        json!({"status":status,"metrics":metrics,"paired_speedup":speedup,
+        "thresholds":{"minimum_median_speedup":min_speedup,"maximum_paired_rss_ratio":max_rss_ratio,"every_pair_must_be_faster":true},
+        "interpretation":"observed paired repetitions, not a statistical confidence interval"}),
+    )
+}
+
+fn git_output(cwd: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|r| r.status.success())
+        .map(|r| r.stdout)
+}
+
+fn benchmark_executable(value: &str, cwd: &Path) -> PipelineResult<PathBuf> {
+    // Keep a virtual environment's interpreter path instead of resolving its symlink.
+    if value.contains(std::path::MAIN_SEPARATOR) {
+        let path = cwd.join(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+    } else if let Some(paths) = std::env::var_os("PATH") {
+        if let Some(path) = std::env::split_paths(&paths)
+            .map(|p| p.join(value))
+            .find(|p| p.is_file())
+        {
+            return Ok(path);
+        }
+    }
+    Err("Eseguibile benchmark mancante".into())
+}
+
+fn verify_frozen(frozen: &BTreeMap<PathBuf, String>) -> PipelineResult<()> {
+    for (path, checksum) in frozen {
+        runtime::check_cancelled()?;
+        if dumps::file_sha256(path)? != *checksum {
+            return Err(format!("Input benchmark modificato: {}", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+fn optional_sum(steps: &[Value], keys: &[&str]) -> Option<f64> {
+    steps.iter().try_fold(0.0, |sum, step| {
+        keys.iter()
+            .try_fold(sum, |sum, key| step[*key].as_f64().map(|v| sum + v))
+    })
+}
+
+/// Return 0 for accepted measurements and 2 for an unproven improvement.
+/// Execution, input mutation and parity failures return an error and retain diagnostics.
+pub fn benchmark(options: BenchmarkOptions) -> PipelineResult<u8> {
+    use sha2::Digest;
+    if options.repetitions < 3
+        || options.warmups.checked_add(options.repetitions).is_none()
+        || [
+            options.metrics_interval,
+            options.min_speedup,
+            options.max_rss_ratio,
+        ]
+        .iter()
+        .any(|v| !v.is_finite())
+        || options.metrics_interval < 0.1
+        || options.metrics_interval > 86400.0
+        || options.min_speedup < 1.0
+        || options.max_rss_ratio < 1.0
+    {
+        return Err("Controlli benchmark non validi".into());
+    }
+    let expand = |s: &str| s.replace("{repo}", &options.root.to_string_lossy());
+    let spec_path = options.root.join(&options.spec);
+    let spec_value = read_json(&spec_path)?;
+    let spec: BenchmarkSpec = serde_json::from_value(spec_value.clone())?;
+    if spec.version != 1 || spec.inputs.is_empty() || spec.outputs.is_empty() {
+        return Err("Specifica benchmark incompleta".into());
+    }
+    let mut output_names = BTreeSet::new();
+    for output in &spec.outputs {
+        relative_path(&output.path)?;
+        if !output_names.insert(&output.path) {
+            return Err("Output benchmark duplicati".into());
+        }
+    }
+    let mut fingerprints = BTreeMap::new();
+    for input in &spec.inputs {
+        let path = options.root.join(expand(input)).canonicalize()?;
+        let sha = dumps::file_sha256(&path)?;
+        if fingerprints.insert(path, sha).is_some() {
+            return Err("Input benchmark duplicati".into());
+        }
+    }
+    let mut copies = Vec::new();
+    let mut destinations = BTreeSet::new();
+    for copy in &spec.copies {
+        let source = options.root.join(expand(&copy.source)).canonicalize()?;
+        let destination = relative_path(&copy.destination)?.to_path_buf();
+        if !fingerprints.contains_key(&source) || !destinations.insert(destination.clone()) {
+            return Err("Copie benchmark duplicate o non verificate".into());
+        }
+        copies.push((source, destination));
+    }
+    let mut frozen = fingerprints.clone();
+    let mut variants = Map::new();
+    let mut commands = BTreeMap::new();
+    for (name, variant) in [("baseline", &spec.baseline), ("candidate", &spec.candidate)] {
+        if variant.commands.is_empty()
+            || variant
+                .commands
+                .iter()
+                .any(|c| c.is_empty() || c.iter().any(|t| t.is_empty()))
+        {
+            return Err("I comandi devono essere liste di argomenti, senza shell".into());
+        }
+        let cwd = options.root.join(expand(&variant.cwd)).canonicalize()?;
+        if !cwd.is_dir() {
+            return Err("Directory della variante mancante".into());
+        }
+        let mut executables = BTreeMap::new();
+        let mut resolved = Vec::new();
+        for command in &variant.commands {
+            let path = benchmark_executable(&expand(&command[0]), &cwd)?;
+            let checksum = dumps::file_sha256(&path)?;
+            frozen.insert(path.clone(), checksum.clone());
+            executables.insert(path.to_string_lossy().into_owned(), checksum);
+            let mut command = command.clone();
+            command[0] = path.to_string_lossy().into_owned();
+            resolved.push(command);
+        }
+        variants.insert(name.into(),json!({"cwd":cwd,"commands":variant.commands,
+            "git_revision":git_output(&cwd,&["rev-parse","HEAD"]).and_then(|v|String::from_utf8(v).ok()).map(|s|s.trim().to_owned()),
+            "tracked_diff_sha256":git_output(&cwd,&["diff","HEAD"]).map(|v|format!("{:x}",sha2::Sha256::digest(v))),"executables_sha256":executables}));
+        commands.insert(name, (cwd, resolved));
+    }
+    let output = options.root.join(&options.output_dir);
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(&output)?;
+    let mut report = json!({"format":"migration_benchmark_v1","status":"failed","samples":[],
+        "arguments":{"spec":spec_path,"output_dir":output,"repetitions":options.repetitions,"warmups":options.warmups,
+            "metrics_interval":options.metrics_interval,"min_speedup":options.min_speedup,"max_rss_ratio":options.max_rss_ratio},
+        "cache_policy":"input verification and copies before timing; OS cache not flushed",
+        "timing_scope":"sum of sequential commands, including startup; excludes copies, hashes and output validation",
+        "spec":spec_value,"spec_sha256":dumps::file_sha256(&spec_path)?,"inputs_sha256":fingerprints,"variants":variants,
+        "host":host_inventory(&BTreeMap::from([("output_dir",output.clone())]))});
+    let mut samples = Vec::new();
+    let result = runtime::with_tracing(None, || -> PipelineResult<u8> {
+        let mut reference = None;
+        for pair in 0..options.warmups + options.repetitions {
+            let order = if pair % 2 == 0 {
+                ["baseline", "candidate"]
+            } else {
+                ["candidate", "baseline"]
+            };
+            for variant in order {
+                verify_frozen(&frozen)?;
+                let run = output.join(format!("{pair:02}-{variant}"));
+                let work = run.join("work");
+                std::fs::create_dir_all(&work)?;
+                for (source, destination) in &copies {
+                    let destination = work.join(destination);
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(source, &destination)?;
+                    let metadata = source.metadata()?;
+                    let mut times = std::fs::FileTimes::new().set_modified(metadata.modified()?);
+                    if let Ok(accessed) = metadata.accessed() {
+                        times = times.set_accessed(accessed);
+                    }
+                    File::options()
+                        .write(true)
+                        .open(destination)?
+                        .set_times(times)?;
+                }
+                let mut runner = Runner::record(
+                    RecordingOptions {
+                        root: options.root.clone(),
+                        prefix: run.join("run"),
+                        interval: options.metrics_interval,
+                        phase_spans: false,
+                        include_controller_memory: false,
+                        disks: BTreeMap::from([("work_dir", work.clone())]),
+                    },
+                    json!({"format":"pipeline_benchmark_v1","variant":variant,"pair":pair,
+                    "measurement":{"interval_seconds":options.metrics_interval,"rss":"sampled sum of live descendants only; benchmark controller excluded"}}),
+                )?;
+                let (cwd, variant_commands) = &commands[variant];
+                let executed = (|| -> PipelineResult<()> {
+                    for (number, command) in variant_commands.iter().enumerate() {
+                        let args = command
+                            .iter()
+                            .map(|s| expand(s).replace("{run}", &work.to_string_lossy()))
+                            .collect::<Vec<_>>();
+                        let mut command = Command::new(&args[0]);
+                        command.args(&args[1..]).current_dir(cwd);
+                        runner.execute_command(&format!("command-{number}"), &args, command)?;
+                    }
+                    Ok(())
+                })();
+                runner.finish(&executed)?;
+                executed?;
+                let measured = read_json(
+                    runner
+                        .report_path
+                        .as_ref()
+                        .ok_or("Report benchmark mancante")?,
+                )?;
+                if !measured["monitor_error"].is_null() {
+                    return Err("Monitoraggio benchmark fallito".into());
+                }
+                let peak = runner
+                    .steps
+                    .iter()
+                    .map(|s| s["sampled_peak_tree_rss_bytes"].as_u64())
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|v| v.into_iter().max());
+                let sample = json!({"pair":pair,"variant":variant,"warmup":pair<options.warmups,
+                    "wall_seconds":optional_sum(&runner.steps,&["wall_seconds"]),
+                    "cpu_seconds":optional_sum(&runner.steps,&["user_cpu_seconds","system_cpu_seconds"]),
+                    "sampled_peak_tree_rss_bytes":peak,"report":format!("{pair:02}-{variant}/run.benchmark.json")});
+                samples.push(sample);
+                verify_frozen(&frozen)?;
+                let outputs = benchmark_outputs(&work, &spec.outputs)?;
+                samples.last_mut().ok_or("Prova benchmark mancante")?["outputs"] = outputs.clone();
+                if let Some(before) = &reference {
+                    if before != &outputs {
+                        return Err(format!(
+                            "Output differenti nella prova {pair}, variante {variant}"
+                        )
+                        .into());
+                    }
+                } else {
+                    reference = Some(outputs);
+                }
+            }
+        }
+        let summary = benchmark_summary(&samples, options.min_speedup, options.max_rss_ratio)?;
+        let passed = summary["status"] == "passed";
+        report
+            .as_object_mut()
+            .ok_or("Report non valido")?
+            .extend(summary.as_object().ok_or("Riepilogo non valido")?.clone());
+        report["correctness"] = json!("matched");
+        Ok(if passed { 0 } else { 2 })
+    });
+    report["samples"] = json!(samples);
+    if let Err(error) = &result {
+        report["error"] = json!(error.to_string());
+        report["status"] = json!(if runtime::received_signal().is_some() {
+            "interrupted"
+        } else {
+            "failed"
+        });
+    }
+    write_operational_report(&output.join("comparison.json"), &report)?;
+    println!(
+        "Benchmark {}: {}",
+        report["status"].as_str().unwrap_or("failed"),
+        output.join("comparison.json").display()
+    );
+    result
 }
 
 fn path_text(path: &Path) -> String {
@@ -2446,5 +3065,217 @@ exit 7
             state.is_none_or(|zombie| zombie),
             "Worker remained alive after its command failed"
         );
+    }
+    #[test]
+    fn benchmark_fingerprints_keep_missing_intervals_models_and_every_edge() {
+        let f = Fixture::new();
+        let path = f.root.join("result.json");
+        let mut record = json!({"metadata":{"complete":true,"language":"vec","engine":"python","started_at":"2026-10-01","dump_manifest":"old","topics":{"model_sha512":"frozen","started_at":"one"}},
+            "pages":[{"id":1,"age":null,"quality":0.9859704508633369}],"link_candidates":{"1":{"candidates":[{"id":2,"evidence":[{"language":"lmo","source_id":3},{"language":"it","source_id":4}]}]}}});
+        let save = |record: &Value| {
+            // The canonical reader intentionally requires metadata first.
+            let text = format!(
+                "{{\"metadata\":{},\"pages\":{},\"link_candidates\":{}}}",
+                record["metadata"], record["pages"], record["link_candidates"]
+            );
+            std::fs::write(&path, text).unwrap();
+        };
+        save(&record);
+        let expected = canonical_fingerprint(&path, None).unwrap();
+        assert_eq!(expected["reference_edges"], 2);
+        // Independent frozen Python reference, including its exact float encoding.
+        assert_eq!(
+            expected["sha256"],
+            "b7ca872ba3a0645fa9afcd1f3248e9fe4bcc8dd84dd4daa26b478f646c4e1e72"
+        );
+        record["metadata"]["engine"] = json!("rust");
+        record["metadata"]["dump_manifest"] = json!("new");
+        record["metadata"]["topics"]["started_at"] = json!("two");
+        save(&record);
+        assert_eq!(canonical_fingerprint(&path, None).unwrap(), expected);
+        for key in ["missing", "edge", "interval", "model", "float"] {
+            let mut changed = record.clone();
+            match key {
+                "missing" => changed["pages"][0]["age"] = json!(0),
+                "edge" => {
+                    changed["link_candidates"]["1"]["candidates"][0]["evidence"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                "interval" => changed["metadata"]["started_at"] = json!("2026-10-02"),
+                "model" => changed["metadata"]["topics"]["model_sha512"] = json!("changed"),
+                _ => changed["pages"][0]["quality"] = json!(0.985970450863337),
+            }
+            save(&changed);
+            assert_ne!(
+                canonical_fingerprint(&path, None).unwrap(),
+                expected,
+                "{key}"
+            );
+        }
+        record["metadata"]["complete"] = json!(false);
+        save(&record);
+        assert!(canonical_fingerprint(&path, None).is_err());
+        assert!(local_output(&f.root, "../outside").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", f.root.join("escape")).unwrap();
+            assert!(local_output(&f.root, "escape").is_err());
+        }
+    }
+
+    #[test]
+    fn benchmark_manifest_requires_one_complete_member_per_language() {
+        let f = Fixture::new();
+        std::fs::write(
+            f.root.join("member.json"),
+            r#"{"metadata":{"complete":true,"language":"vec"},"pages":[{"id":1}]}"#,
+        )
+        .unwrap();
+        let outputs: Vec<BenchmarkOutput> =
+            serde_json::from_value(json!([{"path":"index.json","kind":"manifest"}])).unwrap();
+        write(
+            &f.root.join("index.json"),
+            &json!([{"file":"member.json","language":"vec"},{"kind":"aggregate","file":"unused.json"}]),
+        );
+        assert_eq!(
+            benchmark_outputs(&f.root, &outputs).unwrap()["index.json:vec"]["pages"],
+            1
+        );
+        for entries in [
+            json!([]),
+            json!([{"file":"member.json","language":"lmo"}]),
+            json!([{"file":"../member.json","language":"vec"}]),
+            json!([{"file":"member.json","language":"vec"},{"file":"member.json","language":"vec"}]),
+        ] {
+            write(&f.root.join("index.json"), &entries);
+            assert!(benchmark_outputs(&f.root, &outputs).is_err());
+        }
+    }
+
+    #[test]
+    fn benchmark_verdict_requires_paired_time_and_memory_excluding_warmups() {
+        let samples = (0..4).flat_map(|pair|["baseline","candidate"].map(move |variant|json!({"pair":pair,"variant":variant,"warmup":pair==0,"wall_seconds":if variant=="baseline" {10.0} else if pair==0 {1000.0} else {5.0},"cpu_seconds":8.0,"sampled_peak_tree_rss_bytes":100}))).collect::<Vec<_>>();
+        let result = benchmark_summary(&samples, 1.1, 1.1).unwrap();
+        assert_eq!(result["status"], "passed");
+        assert_eq!(result["paired_speedup"]["median"], 2.0);
+        for (key, value, status) in [
+            ("wall_seconds", json!(12.0), "inconclusive"),
+            ("sampled_peak_tree_rss_bytes", json!(120), "no_improvement"),
+            ("sampled_peak_tree_rss_bytes", Value::Null, "inconclusive"),
+        ] {
+            let mut changed = samples.clone();
+            changed.last_mut().unwrap()[key] = value;
+            assert_eq!(
+                benchmark_summary(&changed, 1.1, 1.1).unwrap()["status"],
+                status
+            );
+        }
+        assert_eq!(
+            benchmark_summary(&samples, 3.0, 1.1).unwrap()["status"],
+            "no_improvement"
+        );
+        assert!(benchmark_summary(&samples[..7], 1.1, 1.1).is_err());
+        let mut duplicate = samples.clone();
+        duplicate.push(samples[2].clone());
+        assert!(benchmark_summary(&duplicate, 1.1, 1.1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_runs_fresh_copies_and_rejects_mismatch_mutation_and_failure() {
+        let f = Fixture::new();
+        let seed = f.root.join("seed.json");
+        let original =
+            r#"{"metadata":{"complete":true,"language":"vec"},"pages":[{"id":1,"age":null}]}"#;
+        std::fs::write(&seed, original).unwrap();
+        let script = f.root.join("run.sh");
+        std::fs::write(&script,"test ! -e \"$1/result.json\" || exit 9\ncp \"$1/seed.json\" \"$1/result.json\"\nprintf private > \"$1/seed.json\"\nsleep 0.15\n").unwrap();
+        let spec_path = f.root.join("spec.json");
+        let mut spec = json!({"version":1,"inputs":[seed,script],"copies":[{"source":seed,"destination":"seed.json"}],
+            "baseline":{"cwd":"{repo}","commands":[["/bin/sh","{repo}/run.sh","{run}"]]},
+            "candidate":{"cwd":"{repo}","commands":[["/bin/sh","{repo}/run.sh","{run}"]]},
+            "outputs":[{"path":"result.json","kind":"canonical"}]});
+        write(&spec_path, &spec);
+        let options = |name: &str| BenchmarkOptions {
+            root: f.root.clone(),
+            spec: spec_path.clone(),
+            output_dir: f.root.join(name),
+            repetitions: 3,
+            warmups: 1,
+            metrics_interval: 0.1,
+            min_speedup: 10000.0,
+            max_rss_ratio: 1.1,
+        };
+        assert_eq!(benchmark(options("accepted-parity")).unwrap(), 2);
+        let report_path = f.root.join("accepted-parity/comparison.json");
+        let report = read_json(&report_path).unwrap();
+        assert_eq!(report["correctness"], "matched");
+        let variants = report["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["variant"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            variants,
+            [
+                "baseline",
+                "candidate",
+                "candidate",
+                "baseline",
+                "baseline",
+                "candidate",
+                "candidate",
+                "baseline"
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&seed).unwrap(), original);
+        for sample in report["samples"].as_array().unwrap() {
+            let measured = read_json(
+                &f.root
+                    .join("accepted-parity")
+                    .join(sample["report"].as_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(sample["wall_seconds"], measured["steps"][0]["wall_seconds"]);
+            assert!(measured["measurement"]["rss"]
+                .as_str()
+                .unwrap()
+                .contains("controller excluded"));
+            assert!(sample["sampled_peak_tree_rss_bytes"].as_u64().unwrap() > 0);
+        }
+        let saved = std::fs::read(&report_path).unwrap();
+        assert!(benchmark(options("accepted-parity")).is_err());
+        assert_eq!(std::fs::read(&report_path).unwrap(), saved);
+        for (name, code, message) in [
+            (
+                "different",
+                "sed 's/null/0/' \"$1/seed.json\" > \"$1/result.json\"",
+                "Output differenti",
+            ),
+            ("failed", "exit 7", "codice di uscita 7"),
+            (
+                "mutated",
+                "printf changed > \"$2\"",
+                "Input benchmark modificato",
+            ),
+        ] {
+            spec["candidate"]["commands"] =
+                json!([["/bin/sh", "-c", code, "benchmark", "{run}", seed]]);
+            write(&spec_path, &spec);
+            let mut opts = options(name);
+            opts.warmups = 0;
+            let error = benchmark(opts).unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+            let report = read_json(&f.root.join(name).join("comparison.json")).unwrap();
+            assert_eq!(report["status"], "failed");
+            assert!(report.get("correctness").is_none());
+        }
+        spec["copies"][0]["destination"] = json!("../escape");
+        write(&spec_path, &spec);
+        assert!(benchmark(options("invalid")).is_err());
+        assert!(!f.root.join("invalid").exists());
     }
 }
