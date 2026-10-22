@@ -205,6 +205,15 @@ mod content {
         assert_eq!(result["metadata"]["same_revision_pages"], 1095);
         assert_eq!(result["metadata"]["different_revision_pages"], 5);
         assert_eq!(result["metadata"]["scored_pages"], 1097);
+        // The frozen minimum wins ties and keeps its JSON number type;
+        // changing 100 to 100.0 would change every downstream quality digest.
+        for (index, minimum) in [(0, 100), (4, 2), (5, 5)] {
+            assert_eq!(
+                result["metadata"]["normalizers"][index].as_i64(),
+                Some(minimum)
+            );
+        }
+
         let db = workspace.db();
         let first: String = db
             .query_row("SELECT features FROM quality_pages WHERE id=1", [], |r| {
@@ -404,7 +413,7 @@ mod content {
         assert_eq!(result["metadata"]["missing_pages"], 1101);
         assert_eq!(
             result["metadata"]["normalizers"],
-            json!([100.0, 0.15, 0.1, 0.1, 2.0, 5.0])
+            json!([100, 0.15, 0.1, 0.1, 2, 5])
         );
         assert!(
             result["pages"]
