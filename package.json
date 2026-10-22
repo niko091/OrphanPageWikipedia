@@ -3,11 +3,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/build-web.mjs",
-    "check": "tsc --noEmit",
+    "build": "node scripts/build-web.ts",
+    "check": "tsc --noEmit && tsc -p tsconfig.node.json",
     "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --bin orphanwiki && npm run build && node tests/web/dashboard.cjs"
   },
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "devDependencies": {
+    "@types/node": "22.20.1",
     "typescript": "6.0.3"
   }
 }

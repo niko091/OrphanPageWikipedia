@@ -1,6 +1,6 @@
 'use strict';
 // Static interface and transport contracts; analytical work belongs to Rust.
-// PyO3 prepares observations; WebAssembly computes displayed statistics.
+// The Rust CLI prepares observations; WebAssembly computes displayed statistics.
 type MetricField = 'age_days' | 'length_bytes' | 'creator_prior_edits_main' | 'creator_prior_edits_other' |
   'creator_prior_articles' | 'creator_tenure_days' | 'creator_articles_created_total' | 'creator_orphans_current' |
   'creator_continuity_months_before_creation' | 'creator_prior_edits_main_history' |

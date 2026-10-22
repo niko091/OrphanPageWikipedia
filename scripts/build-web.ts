@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { BinaryLike } from 'node:crypto';
 import { access, copyFile, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -7,9 +8,9 @@ const root = new URL('../', import.meta.url);
 const assets = new URL('web/assets/', root);
 const native = new URL('native/', assets);
 const pages = ['index.html', 'creators.html', 'deorphanize.html', 'connections.html'];
-const digest = bytes => createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+const digest = (bytes: BinaryLike): string => createHash('sha256').update(bytes).digest('hex').slice(0, 12);
 
-function run(command, args) {
+function run(command: string, args: string[]): void {
   const result = spawnSync(command, args, { cwd: fileURLToPath(root), stdio: 'inherit' });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);

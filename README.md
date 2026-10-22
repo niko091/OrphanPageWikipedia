@@ -20,6 +20,8 @@ Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wik
 
 #### Download dipendenze:
 
+Usare Node.js 22.18 o successivo: anche lo script di build è TypeScript, eseguito direttamente da Node e verificato da `npm run check`.
+
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.105 --locked

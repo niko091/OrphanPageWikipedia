@@ -8,6 +8,7 @@
       "DOM.Iterable"
     ],
     "strict": true,
+    "types": [],
     "noEmitOnError": true,
     "removeComments": false,
     "rootDir": "web/src",
