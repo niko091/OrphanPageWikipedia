@@ -5,7 +5,7 @@
   "scripts": {
     "build": "node scripts/build-web.ts",
     "check": "tsc --noEmit && tsc -p tsconfig.node.json",
-    "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --bin orphanwiki && npm run build && node tests/web/dashboard.cjs"
+    "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --bin orphanwiki && npm run build && node tests/web/dashboard.ts"
   },
   "engines": {
     "node": ">=22.18.0"

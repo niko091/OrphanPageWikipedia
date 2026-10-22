@@ -3,12 +3,13 @@
   "compilerOptions": {
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "moduleDetection": "legacy",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["node"],
     "rootDir": ".",
     "noEmit": true,
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true
   },
-  "files": ["scripts/build-web.ts"]
+  "files": ["scripts/build-web.ts", "tests/web/dashboard.ts", "web/src/app.ts"]
 }

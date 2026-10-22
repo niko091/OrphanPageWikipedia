@@ -13,14 +13,14 @@ Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wik
 - `src/dashboard.rs`: statistiche scientifiche e riepiloghi preparati in Rust; l’interfaccia usa gli stessi calcoli tramite WebAssembly. Il codice Rust vieta `unsafe` in compilazione.
 - `src/editorial.rs`: servizio HTTP per le quattro pagine e `/api/reviews`; SQLite locale/Cloud VPS o MariaDB ToolsDB su Toolforge. Salva solo identità delle coppie, stato, versione e data; controlla le coppie nei dettagli approvati e rileva aggiornamenti concorrenti.
 - `web/src/`: interfaccia TypeScript e CSS; `web/assets/` è prodotto dal build. Su invio esplicito dello username Wikimedia, la personalizzazione associa le ultime 100 modifiche pubbliche complessive ai temi dell’ultima raccolta disponibile per ogni lingua, anche diversa da quella delle proposte selezionate; mostra la copertura e mantiene in memoria il profilo. Legge i blocchi dei temi di più lingue con un limite condiviso di quattro richieste, limita a 200 record il buffer di unione dei contributi e salta il calcolo dei punteggi quando non emergono temi utilizzabili. Nel dialogo di Fix this, l’opzione DEBUG aggiunge al prompt domande diagnostiche separate dalla risposta normale; è disattivata di default.
-- `tests/`: test Rust e browser DOM; le fixture del browser sono preparate dalla CLI Rust. Le fixture sintetiche non sono dati di ricerca.
+- `tests/`: test Rust e TypeScript/DOM; le fixture del browser sono preparate dalla CLI Rust. Le fixture sintetiche non sono dati di ricerca.
 - `.github/workflows/test.yml`: stessi controlli automatici su Ubuntu 24.04 per push e pull request.
 
 ## Comandi
 
 #### Download dipendenze:
 
-Usare Node.js 22.18 o successivo: anche lo script di build è TypeScript, eseguito direttamente da Node e verificato da `npm run check`.
+Usare Node.js 22.18 o successivo: build e test DOM sono TypeScript, eseguiti direttamente da Node e verificati con tipi strict da `npm run check`.
 
 ```sh
 rustup target add wasm32-unknown-unknown
