@@ -386,7 +386,8 @@ impl Invocation {
                 .or_else(|| std::env::var("ORPHANWIKI_WEB_ROOT").ok())
                 .unwrap_or_else(|| "web".into());
             let app =
-                orphanwiki::editorial::ReviewApplication::new(self.root.join(web_root), database);
+                orphanwiki::editorial::ReviewApplication::new(self.root.join(web_root), database)
+                    .with_oauth_from_environment()?;
             return orphanwiki::editorial::serve(
                 app,
                 self.args

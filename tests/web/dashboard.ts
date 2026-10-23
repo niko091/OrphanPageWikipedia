@@ -32,6 +32,8 @@ interface HarnessPreferences {
   blockStorage?: boolean;
   clipboardUnavailable?: boolean;
   clipboardFailure?: boolean;
+  authSession?: {enabled: boolean; username: string | null};
+  authAPI?: (url: string,options: FetchOptions) => MockResponse | Promise<MockResponse>;
   reviewStore?: Map<string,EditorialReview>;
   reviewAPI?: (url: string,options: FetchOptions) => MockResponse | Promise<MockResponse>;
   reviewsUnavailable?: boolean;
@@ -499,6 +501,8 @@ class Element {
   disabled = false;
   checked = false;
   open = false;
+  focused = false;
+  focus(): void {this.focused=true;}
   clientWidth = 0;
   viewBox = '';
   height = '';
@@ -515,6 +519,7 @@ class Element {
   replaceChildren(...nodes: Element[]): void {this.children=[];this.append(...nodes);}
   setAttribute(k: string,v: string): void {this.attributes[k]=v;Reflect.set(this,k,v);}
   getAttribute(k: string): string | undefined {return this.attributes[k];}
+  removeAttribute(k: string): void {delete this.attributes[k];if(k==='href')this.href='';}
   addEventListener(type: string,handler: (event?: unknown) => unknown): void {this.listeners[type]=handler;}
   showModal(): void {this.open=true;}
   close(): void {this.open=false;}
@@ -626,8 +631,18 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
   const localStorage={getItem:(key: string)=>{if(preferences.blockStorage)throw new Error('storage unavailable');return storage.get(key);},setItem:(key: string,value: string)=>{if(preferences.blockStorage)throw new Error('storage unavailable');storage.set(key,value);}};
   const copied: string[]=[];
   const navigator=preferences.clipboardUnavailable?{}:{clipboard:{writeText:async (text: string)=>{if(preferences.clipboardFailure)throw new Error('clipboard denied');copied.push(text);}}};
+  // Keep authentication requests separate from transport/merge benchmark counters.
+  let authSession=preferences.authSession??{enabled:false,username:null};
+  const authRequests: RecordedRequest[]=[],navigations: string[]=[];
   let fetchCount=0;const requests: RecordedRequest[]=[],reviewStore=preferences.reviewStore||new Map<string,EditorialReview>();
-  const context: Record<string,unknown>=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search}},URL,URLSearchParams,TextEncoder,AbortController,crypto:webcrypto,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text: string,value: string){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url: string,options: FetchOptions={})=>{requests.push({url,method:options?.method||'GET',body:options?.body,headers:options?.headers,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;if(preferences.beforeFetch)await preferences.beforeFetch(url,options);
+  const context: Record<string,unknown>=vm.createContext({window:{navigator,localStorage,matchMedia:()=>media,addEventListener(){},location:{search,assign:(url: string)=>{navigations.push(url);}}},URL,URLSearchParams,TextEncoder,AbortController,crypto:webcrypto,setTimeout,clearTimeout,document,Intl,Map,Set,Math,Number,Option:function(text: string,value: string){const n=new Element('option');n.textContent=text;n.value=value;return n;},fetch:async (url: string,options: FetchOptions={})=>{
+    if(String(url).startsWith('api/auth/')) {
+      authRequests.push({url,method:options.method??'GET',...options});
+      if(preferences.authAPI)return preferences.authAPI(url,options);
+      if(url.endsWith('/logout'))authSession={...authSession,username:null};
+      return {ok:true,status:200,json:async()=>authSession};
+    }
+    requests.push({url,method:options?.method||'GET',body:options?.body,headers:options?.headers,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;if(preferences.beforeFetch)await preferences.beforeFetch(url,options);
     if(String(url).startsWith('api/reviews')) {
       if(preferences.reviewAPI)return preferences.reviewAPI(url,options);
       if(preferences.reviewsUnavailable)return {ok:false,status:503,json:async()=>({error:'unavailable'})};
@@ -636,7 +651,7 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
         const current=reviewStore.get(key);
         if((current?.version??0)!==body.version)return {ok:false,status:409,json:async()=>({current})};
         const review={language:body.language,source_id:body.source_id,target_id:body.target_id,status:body.status,
-          version:body.version+1,updated_at:'2026-10-20T12:00:00Z'};reviewStore.set(key,review);
+          version:body.version+1,updated_at:'2026-10-20T12:00:00Z',reviewer:authSession.username??''};reviewStore.set(key,review);
         return {ok:true,status:200,json:async()=>({review})};
       }
       return {ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[...reviewStore.values()]})};
@@ -645,7 +660,7 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
   await nativeReady;
   evaluate(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
   await evaluate('dashboardReady',context);
-  return {nodes,context,html,staticNodes,storage,media,document,copied,requests,getFetchCount:()=>fetchCount};
+  return {nodes,context,html,staticNodes,storage,media,document,copied,requests,authRequests,navigations,getFetchCount:()=>fetchCount};
 }
 async function checkFreshResources() {
   const pages=['index.html','creators.html','deorphanize.html','connections.html'];
@@ -1211,7 +1226,7 @@ async function checkSingleConnectionPrompts() {
   raw.link_candidates={1:{candidate_count:7,candidates:[...others,chosen]}};
   const before=JSON.stringify(raw),result=await harness('connections',raw,'?dataset=fixture.json&page=1'),{nodes,context}=result;
   const card=()=>nodes['connection-candidates'].children.find(row=>titleLink(row).textContent===chosen.title),fix=()=>findClass(card(),'fix-link');
-  for(const [provider,url] of [['qwen','https://chat.qwen.ai/'],['kimi','https://www.kimi.ai/'],['mistral','https://chat.mistral.ai/chat'],['glm','https://chat.z.ai/']]) {
+  for(const [provider,url] of [['qwen','https://chat.qwen.ai/'],['kimi','https://www.kimi.ai/'],['mistral','https://chat.mistral.ai/chat'],['glm','https://chat.z.ai/'],['chatgpt','https://chatgpt.com/'],['claude','https://claude.ai/new'],['gemini','https://gemini.google.com/app']]) {
     const fetches=result.getFetchCount();nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
     assert.equal(result.getFetchCount(),fetches);
     const prompt=await preparePrompt(result,fix());
@@ -1234,7 +1249,7 @@ async function checkSingleConnectionPrompts() {
     chosen.evidence=evidence;evaluate('renderConnections()',context);assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');
     assert(nodes['connection-candidates'].children.some(row=>findClass(row,'fix-link').tag==='button'));
   }
-  console.log('Single connection: isolated candidate beyond top five, all seven reference pairs without truncation, four plain chat URLs and unchanged data passed.');
+  console.log('Single connection: isolated candidate beyond top five, all seven reference pairs without truncation, seven plain chat URLs and unchanged data passed.');
 }
 async function checkLlmSelection() {
   const raw=fixture();raw.metadata.demo=false;
@@ -1242,7 +1257,7 @@ async function checkLlmSelection() {
   const record={candidate_count:1,candidates:[{page_id:99,title:'Local source',dead_end:true,evidence:[{language:'lmo',source_title:'Reference source',target_title:'Reference target'}]}]};
   raw.link_candidates=Object.fromEntries(raw.pages.map(page=>[page.page_id,record]));
   const result=await harness('deorphanize',raw),{nodes,storage}=result;
-  assert.deepEqual(nodes['llm-provider'].children.map(option=>option.textContent),['Qwen','Kimi','Mistral','GLM']);
+  assert.deepEqual(nodes['llm-provider'].children.map(option=>option.textContent),['ChatGPT','Gemini','Claude','Qwen','Kimi','GLM','Mistral','Altro']);
   nodes['candidate-search'].value='Target';nodes['candidate-search'].listeners.input();nodes['candidate-more'].listeners.click();
   assert.equal(nodes['candidate-cards'].children.length,30);
   const fetches=result.getFetchCount();
@@ -1276,6 +1291,36 @@ async function checkLlmSelection() {
   await next.nodes['llm-prompt-copy'].listeners.click();assert.match(next.nodes['llm-prompt-status'].textContent,/Prompt and sources copied/);
   await next.nodes.dataset.listeners.change();
   assert.equal(next.nodes['llm-prompt'].open,false);assert.equal(next.nodes['llm-prompt-text'].value,'');
+  // Every added provider retains the same complete prompt and explicit copy workflow.
+  const selection=await harness('connections',raw,'?dataset=fixture.json&page=1');
+  const initialFetches=selection.getFetchCount();
+  let completePrompt: string | undefined;
+  for(const [provider,url] of [['chatgpt','https://chatgpt.com/'],['claude','https://claude.ai/new'],['gemini','https://gemini.google.com/app'],['other',null]] as const) {
+    const before=selection.getFetchCount(),copies=selection.copied.length;
+    selection.nodes['llm-provider'].value=provider;selection.nodes['llm-provider'].listeners.change();
+    assert.equal(selection.getFetchCount(),before);assert.equal(selection.copied.length,copies);
+    const prompt=await preparePrompt(selection,findClass(selection.nodes['connection-candidates'].children[0],'fix-link'));
+    // Each explicit preparation retrieves documents again; acquisition times can differ.
+    const comparable=prompt.replace(/"retrieved_at": "[^"]+"/g,'"retrieved_at": "TIMESTAMP"');
+    if(completePrompt===undefined)completePrompt=comparable;else assert.equal(comparable,completePrompt);
+    assert.equal(selection.nodes['llm-prompt-open'].hidden,url===null);
+    assert.equal(selection.nodes['llm-prompt-open'].href,url??'');
+    if(url)assert.equal(new URL(selection.nodes['llm-prompt-open'].href).search,'');
+    await selection.nodes['llm-prompt-copy'].listeners.click();assert.equal(selection.copied.at(-1),prompt);
+    assert.equal(selection.storage.get('orphanwiki-llm'),provider);
+  }
+  assert(selection.getFetchCount()>initialFetches);
+  const restored=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{storage:selection.storage});
+  assert.equal(restored.nodes['llm-provider'].value,'other');
+  assert.equal(required(restored.nodes['llm-provider'].children.at(-1)).textContent,'Altro');
+  restored.nodes['ui-language-toggle'].listeners.click();
+  assert.equal(restored.nodes['llm-provider'].value,'other');
+  assert.equal(required(restored.nodes['llm-provider'].children.at(-1)).textContent,'Other');
+  await preparePrompt(restored,findClass(restored.nodes['connection-candidates'].children[0],'fix-link'));
+  assert.equal(restored.nodes['llm-prompt-title'].textContent,'Prompt for Other');assert.equal(restored.nodes['llm-prompt-open'].hidden,true);
+  restored.nodes['llm-provider'].value='chatgpt';restored.nodes['llm-provider'].listeners.change();
+  await preparePrompt(restored,findClass(restored.nodes['connection-candidates'].children[0],'fix-link'));
+  assert.equal(restored.nodes['llm-prompt-open'].hidden,false);assert.equal(restored.nodes['llm-prompt-open'].href,'https://chatgpt.com/');
   console.log('Provider selection: preferences and pagination retained, no background sources/clipboard, explicit manual copy fallback, translations and clearing on dataset change passed.');
 }
 async function checkWikitextPreparation() {
@@ -1966,7 +2011,7 @@ async function checkSharedEditorialReviews() {
   raw.link_candidates={1:{candidate_count:3,status:'compared',candidates},
     10:{candidate_count:1,status:'compared',candidates:[{page_id:11,title:'Other source',evidence:candidates[0].evidence}]}};
   const before=JSON.stringify(raw),reviewStore=new Map<string,EditorialReview>();
-  const overview=await harness('deorphanize',raw,undefined,null,{reviewStore});
+  let overview=await harness('deorphanize',raw,undefined,null,{reviewStore});
   assert.equal(overview.requests.filter(request=>request.url.startsWith('api/reviews')).length,1);
   assert.equal(overview.requests.filter(request=>request.method==='POST').length,0);
   assert.equal(overview.nodes['llm-prompt-finished'].disabled,true);
@@ -1980,6 +2025,8 @@ async function checkSharedEditorialReviews() {
   assert.equal(overview.nodes['llm-prompt-text'].value,'');assert.equal(overview.nodes['llm-prompt-debug'].checked,false);
   assert.equal(overview.nodes['review-dialog'].open,true);
   assert.equal(overview.nodes['review-rows'].children.length,3);
+  assert.equal(overview.requests.filter(request=>request.url.startsWith('api/reviews')&&request.method==='GET').length,1);
+  assert(!overview.html.includes('review-refresh'));
   const choose=async(result: Awaited<ReturnType<typeof harness>>,index: number,statusIndex: number)=>{
     const row=result.nodes['review-rows'].children[index],button=findClass(row,'review-actions').children[statusIndex];
     assert.equal(button.disabled,false);button.listeners.click();
@@ -2014,10 +2061,16 @@ async function checkSharedEditorialReviews() {
   connection.nodes['llm-prompt-finished'].listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(connection.nodes['review-rows'].children.length,1);
   await choose(connection,0,0);
-  await overview.nodes['review-refresh'].listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(evaluate("editorialReviews.get('vec:4:1').status",overview.context),'not_fixed');
+  // Reloading the page reads the latest shared statuses before rendering its cards.
+  overview=await harness('deorphanize',raw,undefined,null,{reviewStore});
+  const reads=overview.requests.filter(request=>request.url.startsWith('api/reviews'));
+  assert.equal(reads.length,1);assert.equal(reads[0].method,'GET');assert.equal(reads[0].cache,'no-store');
   assert.equal(titleLink(overview.nodes['candidate-cards'].children.at(-1)).textContent,'Target one');
   assert.equal(findClass(card(),'fix-link').getAttribute('aria-disabled'),'true');
   assert.equal(connection.nodes['connection-candidates'].children.length,3);
+  assert.equal(connection.requests.filter(request=>request.url.startsWith('api/reviews')&&request.method==='GET').length,1);
+  assert(!connection.html.includes('review-refresh'));
 
   // Closed pairs can be reopened from Connect without preparing another prompt.
   connection.nodes['review-close'].listeners.click();
@@ -2047,6 +2100,11 @@ async function checkSharedEditorialReviews() {
   assert.match(offline.nodes['review-dialog-status'].textContent,/non disponibili/);
   assert(findClass(offline.nodes['review-rows'].children[0],'review-actions').children.every(button=>button.disabled));
   assert.equal(offline.requests.filter(request=>request.method==='POST').length,0);
+  assert.match(offline.nodes['review-service-status'].textContent,/Ricarica la pagina/);
+  assert.equal(offline.requests.filter(request=>request.url.startsWith('api/reviews')).length,1);
+  const reloaded=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{reviewStore});
+  assert.equal(reloaded.requests.filter(request=>request.url.startsWith('api/reviews')).length,1);
+  assert.match(findClass(reloaded.nodes['connection-candidates'].children[0],'review-badge').textContent,/Bad link/);
   const failed=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{
     reviewAPI:async(_url,options)=>options?.method==='POST'?{ok:false,status:503,json:async()=>({error:'unavailable'})}:
       {ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[]})}
@@ -2084,6 +2142,115 @@ async function checkSharedEditorialReviews() {
   assert.equal(capped.nodes['review-rows'].children.length,5);
   assert(!capped.nodes['review-rows'].children.some(row=>row.children[0].children[0].textContent==='Wide source 5'));
   console.log('Shared editorial reviews: Finished pair scope, no text persistence, independent readers, closed-pair ordering/filtering, full Connect evidence, reopening, conflicts, translations, failed/stale saves and unavailable service passed.');
+}
+async function checkWikipediaAuthentication() {
+  const raw=fixture();raw.metadata.demo=false;
+  raw.metadata.topics={status:'predicted'};
+  const target=required(raw.pages.find(page=>page.orphan));
+  const candidate=required(raw.pages.find(page=>!page.orphan));
+  raw.link_candidates={...raw.link_candidates,[target.page_id]:{candidate_count:1,status:'compared',candidates:[{
+    page_id:candidate.page_id,title:candidate.title,evidence:[{language:'lmo',source_title:'Reference source',target_title:'Reference target'}]}]}};
+  for(const page of raw.pages){page.topic_status='predicted';page.topic_labels=['Culture.Media.Music'];}
+  const entries=[{language:'vec',file:'fixture.json',date:raw.metadata.finished_at,observations_file:'observations.json'}];
+  const files={'fixture.json':raw,'observations.json':{format:'observations_v1',metadata:raw.metadata,
+    columns:['page_id','topic_labels','topic_status'],rows:[[target.page_id,['Culture.Media.Music'],'predicted']]}};
+  const username='Editor À & Test';
+  const apiResponse=(url: URL)=>url.hostname==='meta.wikimedia.org'
+    ?{query:{globaluserinfo:{id:1,name:username,merged:[{wiki:'vecwiki',url:'https://vec.wikipedia.org',id:11}]}}}
+    :{query:{usercontribs:[{userid:11,pageid:target.page_id,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}};
+  const preferences={authSession:{enabled:true,username},apiResponse};
+  const result=await harness('deorphanize',raw,'?dataset=fixture.json',entries,preferences,files);
+  assert.equal(result.nodes['auth-user'].textContent,username);
+  assert.equal(result.nodes['auth-user'].href,'https://vec.wikipedia.org/wiki/User:Editor_%C3%80_%26_Test');
+  assert.equal(result.nodes['auth-user'].hidden,false);assert.equal(result.nodes['auth-login'].hidden,true);
+  assert.equal(result.nodes['profile-username'].value,username);assert.equal(result.nodes['profile-username'].disabled,true);
+  assert.equal(result.nodes['candidate-sort'].value,'personalized');
+  const globalQueries=()=>result.requests.filter(request=>request.url.startsWith('https://meta.wikimedia.org'));
+  assert.equal(new URL(globalQueries()[0].url).searchParams.get('guiuser'),username);
+  // The authenticated identity wins even if a script changes the disabled input.
+  result.nodes['profile-username'].value='Impersonated';await evaluateAsync('applyProfile()',result.context);
+  assert.equal(new URL(required(globalQueries().at(-1)).url).searchParams.get('guiuser'),username);
+  assert.equal(result.authRequests[0].credentials,'same-origin');
+  assert(![...result.storage.values()].some(value=>value.includes(username)));
+  await evaluateAsync('logout()',result.context);
+  assert.equal(result.nodes['auth-user'].hidden,true);assert.equal(result.nodes['auth-login'].hidden,false);
+  assert.equal(result.nodes['profile-username'].disabled,false);assert.equal(result.nodes['profile-username'].value,'');
+  assert.equal(evaluate('profileContributions',result.context),null);assert.equal(evaluate('profileScores',result.context),null);
+  assert.equal(result.nodes['profile-sort-option'].disabled,true);
+  assert.equal(required(result.authRequests.at(-1)).method,'POST');
+
+  const store=new Map<string,EditorialReview>();
+  const connection=await harness('connections',raw,'?dataset=fixture.json&page='+target.page_id,null,{...preferences,reviewStore:store});
+  const source=required(connection.nodes['connection-candidates'].children[0]);
+  findClass(source,'review-edge').listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
+  const button=findClass(connection.nodes['review-rows'].children[0],'review-actions').children[0];
+  assert.equal(button.disabled,false);button.listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
+  const review=required([...store.values()][0]);assert.equal(review.reviewer,username);
+  const author=descendants(connection.nodes['review-rows']).find(node=>node.tag==='a'&&node.textContent===username);
+  assert.equal(required(author).href,'https://vec.wikipedia.org/wiki/User:Editor_%C3%80_%26_Test');
+  const post=required(connection.requests.find(request=>request.method==='POST'));
+  assert.equal(post.credentials,'same-origin');assert(!required(post.body).includes(username));
+  const signedOut=await harness('connections',raw,'?dataset=fixture.json&page='+target.page_id,null,
+    {authSession:{enabled:true,username:null},reviewStore:store});
+  assert.equal(signedOut.requests.filter(request=>request.url.startsWith('https://')).length,0);
+  findClass(signedOut.nodes['connection-candidates'].children[0],'review-edge').listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
+  assert(findClass(signedOut.nodes['review-rows'].children[0],'review-actions').children.every(button=>button.disabled));
+  assert.match(signedOut.nodes['review-dialog-status'].textContent,/Accedi con Wikipedia/);
+  assert(descendants(signedOut.nodes['connection-candidates']).some(node=>node.tag==='a'&&node.textContent===username));
+  for(const page of ['articles','creators'] as const) {
+    const dashboard=await harness(page,raw,undefined,null,preferences);
+    assert.equal(dashboard.nodes['auth-user'].textContent,username);
+    assert.equal(dashboard.requests.filter(request=>request.url.startsWith('https://')).length,0);
+  }
+  const unavailable=await harness('deorphanize',raw,undefined,null,{authAPI:()=>({ok:false,status:503,json:async()=>({})})});
+  assert.equal(unavailable.nodes['auth-login'].hidden,false);
+  assert.match(unavailable.nodes['auth-status'].textContent,/non disponibile/);
+  assert(unavailable.nodes['candidate-cards'].children.length>0);
+  for(const page of ['articles','creators','deorphanize','connections']) {
+    const file=page==='articles'?'index.html':page+'.html',html=fs.readFileSync('web/'+file,'utf8');
+    const header=required(html.match(/<header>([\s\S]*?)<\/header>/)?.[1]);
+    assert.match(header,/id="ui-language-toggle"[\s\S]*id="theme-toggle"[\s\S]*<details id="auth-menu"[\s\S]*<summary id="auth-toggle"[\s\S]*<svg[\s\S]*id="auth-login"/);
+    assert.equal((html.match(/id="auth-menu"/g)??[]).length,1);
+    assert.match(header,/id="auth-status" role="alert"/);
+    assert(!html.includes('account-toolbar'));
+  }
+  assert.equal(signedOut.nodes['auth-menu'].open,false);
+  signedOut.nodes['auth-menu'].open=true;
+  signedOut.nodes['auth-login'].listeners.click();await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.deepEqual(signedOut.navigations,['api/auth/login?return_to='+encodeURIComponent('connections.html?dataset=fixture.json&page='+target.page_id)]);
+  signedOut.nodes['auth-menu'].listeners.keydown({key:'Escape',preventDefault(){}});
+  assert.equal(signedOut.nodes['auth-menu'].open,false);assert.equal(signedOut.nodes['auth-toggle'].focused,true);
+  assert.equal(signedOut.nodes['auth-status'].hidden,true);
+
+  // Missing setup, server errors, offline requests and malformed responses stay in the menu.
+  for(const authAPI of [
+    ()=>({ok:true,json:async()=>({enabled:false,username:null})}),
+    ()=>({ok:false,status:503,json:async()=>({})}),
+    ()=>{throw new Error('offline');},
+    ()=>({ok:true,json:async()=>({enabled:'bad',username:null})})
+  ]) {
+    const failed=await harness('deorphanize',raw,undefined,null,{authAPI});
+    failed.nodes['auth-menu'].open=true;
+    await evaluateAsync('login()',failed.context);
+    assert.equal(failed.nodes['auth-menu'].open,true);
+    assert.equal(failed.nodes['auth-login'].disabled,false);assert.equal(failed.nodes['auth-login'].hidden,false);
+    assert.equal(failed.nodes['auth-status'].hidden,false);assert.match(failed.nodes['auth-status'].textContent,/non disponibile.*Riprova/);
+    assert.deepEqual(failed.navigations,[]);
+    failed.nodes['ui-language-toggle'].listeners.click();
+    assert.match(failed.nodes['auth-status'].textContent,/unavailable.*try again/);
+  }
+  let available=false;
+  const retry=await harness('deorphanize',raw,undefined,null,{authAPI:()=>({ok:available,status:available?200:503,json:async()=>({enabled:true,username:null})})});
+  await evaluateAsync('login()',retry.context);assert.equal(retry.navigations.length,0);
+  available=true;await evaluateAsync('login()',retry.context);
+  assert.equal(retry.navigations.length,1);assert.equal(retry.nodes['auth-status'].hidden,true);
+  const logoutFailure=await harness('articles',raw,undefined,null,{authAPI:url=>url.endsWith('/logout')
+    ?{ok:false,status:503,json:async()=>({})}:{ok:true,json:async()=>({enabled:true,username})}});
+  await evaluateAsync('logout()',logoutFailure.context);
+  assert.equal(logoutFailure.nodes['auth-user'].textContent,username);
+  assert.match(logoutFailure.nodes['auth-status'].textContent,/non disponibile/);
+  console.log('Wikipedia account menu: header placement, keyboard dismissal, login navigation, unavailable service, retry and logout errors passed.');
+  console.log('Wikipedia authentication: automatic recommendations, linked identities, server attribution, logout, anonymous readers and unavailable OAuth passed.');
 }
 async function checkPersonalization() {
   const raw=fixture();raw.metadata.demo=false;
@@ -2598,4 +2765,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

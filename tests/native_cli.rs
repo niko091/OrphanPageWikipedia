@@ -44,6 +44,16 @@ fn standalone_editorial_http_preserves_reviews_and_stops_on_sigterm() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().unwrap(), "<h1>Dashboard</h1>");
     assert!(client.head(url).send().unwrap().bytes().unwrap().is_empty());
+    let session = client
+        .get(format!("{url}/api/auth/session"))
+        .send()
+        .unwrap();
+    assert_eq!(session.status(), 200);
+    let session: serde_json::Value = serde_json::from_slice(&session.bytes().unwrap()).unwrap();
+    assert_eq!(
+        session,
+        serde_json::json!({"enabled": false, "username": null})
+    );
     let body = r#"{"dataset":"vec.json","language":"vec","source_id":2,"target_id":1,"status":"fixed","version":0}"#;
     let submit = || {
         client
@@ -91,6 +101,20 @@ fn standalone_editorial_http_preserves_reviews_and_stops_on_sigterm() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+}
+
+#[test]
+fn editorial_oauth_rejects_partial_configuration_before_serving() {
+    let workspace = Workspace::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+        .args(["serve", "--port", "0"])
+        .env_clear()
+        .env("ORPHANWIKI_OAUTH_CLIENT_ID", "synthetic-client")
+        .current_dir(&workspace.0)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("OAuth"));
 }
 
 struct Workspace(PathBuf);

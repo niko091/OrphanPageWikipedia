@@ -596,7 +596,7 @@ input,select {
   color: var(--text);
 }
 
-a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible {
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible {
   outline: 2px solid var(--teal);
   outline-offset: 3px;
 }
@@ -636,6 +636,48 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible {
 .preference-button:hover {
   color: var(--text);
   border-color: var(--teal);
+}
+
+.account-menu {
+  position: relative;
+}
+
+.account-menu summary {
+  list-style: none;
+  cursor: pointer;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+}
+
+.account-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.account-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(320px,calc(100vw - 56px));
+  padding: 16px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px var(--shadow);
+  overflow-wrap: anywhere;
+}
+
+#auth-status {
+  margin: 0;
+  padding: 10px;
+  background: var(--warning-surface);
+  color: var(--warning-text);
+  border-radius: 6px;
+  font-size: .9rem;
 }
 
 .theme-button span {

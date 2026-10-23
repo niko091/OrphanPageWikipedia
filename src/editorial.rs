@@ -12,24 +12,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 use tokio::io::AsyncReadExt;
 
 const MAX_ID: u64 = 9_007_199_254_740_991;
-const COLUMNS: &str = "language, source_id, target_id, status, version, updated_at";
+const COLUMNS: &str = "language, source_id, target_id, status, version, updated_at, reviewer";
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS editorial_reviews (
     language VARCHAR(20) NOT NULL, source_id BIGINT NOT NULL, target_id BIGINT NOT NULL,
     status VARCHAR(12) NOT NULL, version BIGINT NOT NULL, updated_at VARCHAR(32) NOT NULL,
+    reviewer VARCHAR(255) NOT NULL DEFAULT '',
     PRIMARY KEY (language, target_id, source_id))";
 
 #[derive(Debug)]
 struct ReviewError {
     status: StatusCode,
     message: &'static str,
-    current: Option<Review>,
+    current: Option<Box<Review>>,
 }
 
 impl ReviewError {
@@ -79,6 +81,9 @@ pub struct Review {
     pub status: String,
     pub version: u64,
     pub updated_at: String,
+    /// Verified Wikimedia identity; empty for historical anonymous reviews.
+    #[serde(default)]
+    pub reviewer: String,
 }
 
 #[derive(Deserialize)]
@@ -214,7 +219,29 @@ impl ReviewDatabase {
                 ))
             }
         };
-        storage.execute(SCHEMA, &[])?;
+        let schema = if matches!(storage, Storage::Mysql(_)) {
+            SCHEMA.replace(
+                "reviewer VARCHAR(255)",
+                "reviewer VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            )
+        } else {
+            SCHEMA.to_owned()
+        };
+        storage.execute(&schema, &[])?;
+        if !storage.has_reviewer()? {
+            let column = if matches!(storage, Storage::Mysql(_)) {
+                "reviewer VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"
+            } else {
+                "reviewer VARCHAR(255) NOT NULL DEFAULT ''"
+            };
+            let result = storage.execute(
+                &format!("ALTER TABLE editorial_reviews ADD COLUMN {column}"),
+                &[],
+            );
+            if result.is_err() && !storage.has_reviewer()? {
+                result?;
+            }
+        }
         Ok(storage)
     }
 }
@@ -269,6 +296,31 @@ enum Storage {
 }
 
 impl Storage {
+    fn has_reviewer(&mut self) -> ReviewResult<bool> {
+        match self {
+            Self::Sqlite(db) => {
+                let mut query = db
+                    .prepare("PRAGMA table_info(editorial_reviews)")
+                    .map_err(|_| ReviewError::unavailable())?;
+                let names = query
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(|_| ReviewError::unavailable())?;
+                for name in names {
+                    if name.map_err(|_| ReviewError::unavailable())? == "reviewer" {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Mysql(db) => {
+                let rows: Vec<mysql::Row> = db
+                    .query("SHOW COLUMNS FROM editorial_reviews LIKE 'reviewer'")
+                    .map_err(|_| ReviewError::unavailable())?;
+                Ok(!rows.is_empty())
+            }
+        }
+    }
+
     fn sqlite_parameters(values: &[SqlValue]) -> Vec<rusqlite::types::Value> {
         values
             .iter()
@@ -323,6 +375,7 @@ impl Storage {
                                 status: row.get(3)?,
                                 version: row.get(4)?,
                                 updated_at: row.get(5)?,
+                                reviewer: row.get(6)?,
                             })
                         },
                     )
@@ -336,7 +389,7 @@ impl Storage {
                     .map_err(|_| ReviewError::unavailable())?;
                 rows.into_iter()
                     .map(|row| {
-                        let (language, source_id, target_id, status, version, updated_at) =
+                        let (language, source_id, target_id, status, version, updated_at, reviewer) =
                             mysql::from_row_opt(row).map_err(|_| ReviewError::unavailable())?;
                         Ok(Review {
                             language,
@@ -345,6 +398,7 @@ impl Storage {
                             status,
                             version,
                             updated_at,
+                            reviewer,
                         })
                     })
                     .collect()
@@ -352,14 +406,14 @@ impl Storage {
         }
     }
 
-    fn save(&mut self, body: &Submission) -> ReviewResult<Review> {
+    fn save(&mut self, body: &Submission, reviewer: &str) -> ReviewResult<Review> {
         let begin = if matches!(self, Self::Sqlite(_)) {
             "BEGIN IMMEDIATE"
         } else {
             "START TRANSACTION"
         };
         self.execute(begin, &[])?;
-        let result = self.update(body);
+        let result = self.update(body, reviewer);
         match result {
             Ok(review) => {
                 if let Err(error) = self.execute("COMMIT", &[]) {
@@ -375,7 +429,7 @@ impl Storage {
         }
     }
 
-    fn update(&mut self, body: &Submission) -> ReviewResult<Review> {
+    fn update(&mut self, body: &Submission, reviewer: &str) -> ReviewResult<Review> {
         let now: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
         let now = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         let identity = || {
@@ -386,39 +440,258 @@ impl Storage {
             ]
         };
         let mut values = identity();
-        values.extend(["not_fixed".into(), 0.into(), now.as_str().into()]);
+        values.extend(["not_fixed".into(), 0.into(), now.as_str().into(), "".into()]);
         let insert = if matches!(self, Self::Sqlite(_)) {
             "INSERT OR IGNORE"
         } else {
             "INSERT IGNORE"
         };
         self.execute(
-            &format!("{insert} INTO editorial_reviews ({COLUMNS}) VALUES (?,?,?,?,?,?)"),
+            &format!("{insert} INTO editorial_reviews ({COLUMNS}) VALUES (?,?,?,?,?,?,?)"),
             &values,
         )?;
-        let mut values = vec![body.status.as_str().into(), now.as_str().into()];
+        let mut values = vec![
+            body.status.as_str().into(),
+            now.as_str().into(),
+            reviewer.into(),
+        ];
         values.extend(identity());
         values.push(body.version.into());
-        let changed = self.execute("UPDATE editorial_reviews SET status=?, version=version+1, updated_at=? WHERE language=? AND source_id=? AND target_id=? AND version=?", &values)?;
+        let changed = self.execute("UPDATE editorial_reviews SET status=?, version=version+1, updated_at=?, reviewer=? WHERE language=? AND source_id=? AND target_id=? AND version=?", &values)?;
         let current = self.read(&format!("SELECT {COLUMNS} FROM editorial_reviews WHERE language=? AND source_id=? AND target_id=?"), &identity())?
             .pop().ok_or_else(ReviewError::unavailable)?;
         if changed == 0 {
             return Err(ReviewError { status: StatusCode::CONFLICT,
-                message: "La coppia è stata valutata da un altro utente. Controlla lo stato aggiornato e riprova.", current: Some(current) });
+                message: "La coppia è stata valutata da un altro utente. Controlla lo stato aggiornato e riprova.", current: Some(Box::new(current)) });
         }
         Ok(current)
     }
+}
+
+// OAuth tokens are exchanged only on the server and discarded after identification.
+#[derive(Clone)]
+struct OAuthConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: reqwest::Url,
+}
+
+impl OAuthConfig {
+    fn parse(client_id: String, client_secret: String, redirect: &str) -> Result<Self, String> {
+        let redirect_uri =
+            reqwest::Url::parse(redirect).map_err(|_| "Callback OAuth non valido")?;
+        let local = matches!(
+            redirect_uri.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]")
+        );
+        if client_id.is_empty()
+            || client_secret.is_empty()
+            || !(redirect_uri.scheme() == "https" || local && redirect_uri.scheme() == "http")
+            || redirect_uri.host_str().is_none()
+            || !redirect_uri.username().is_empty()
+            || redirect_uri.password().is_some()
+            || redirect_uri.query().is_some()
+            || redirect_uri.fragment().is_some()
+            || !redirect_uri.path().ends_with("/api/auth/callback")
+        {
+            return Err("Configurazione OAuth non valida: usare un callback HTTPS /api/auth/callback (HTTP solo su localhost)".into());
+        }
+        Ok(Self {
+            client_id,
+            client_secret,
+            redirect_uri,
+        })
+    }
+
+    fn cookie(&self, value: &str, seconds: u64) -> String {
+        let path = self
+            .redirect_uri
+            .path()
+            .strip_suffix("api/auth/callback")
+            .unwrap_or("/");
+        format!(
+            "orphanwiki_session={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={seconds}{}",
+            if self.redirect_uri.scheme() == "https" {
+                "; Secure"
+            } else {
+                ""
+            }
+        )
+    }
+
+    fn identify(&self, code: &str) -> ReviewResult<String> {
+        self.identify_at(
+            code,
+            "https://meta.wikimedia.org/w/rest.php/oauth2/access_token",
+            "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile",
+        )
+    }
+
+    fn identify_at(&self, code: &str, token_url: &str, profile_url: &str) -> ReviewResult<String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("OrphanWiki/0.1 (Wikimedia OAuth identity)")
+            .build()
+            .map_err(|_| ReviewError::unavailable())?;
+        let token = client
+            .post(token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", &self.client_id),
+                ("client_secret", &self.client_secret),
+                ("redirect_uri", self.redirect_uri.as_str()),
+            ])
+            .send()
+            .map_err(|_| ReviewError::unavailable())?;
+        let token = oauth_json(token)?;
+        let token = token["access_token"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(ReviewError::unavailable)?;
+        let profile = client
+            .get(profile_url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| ReviewError::unavailable())?;
+        verified_username(&oauth_json(profile)?)
+    }
+}
+
+fn oauth_json(response: reqwest::blocking::Response) -> ReviewResult<Value> {
+    if !response.status().is_success() {
+        return Err(ReviewError::unavailable());
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReviewError::unavailable())?;
+    if bytes.len() > 65536 {
+        return Err(ReviewError::unavailable());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ReviewError::unavailable())
+}
+
+fn verified_username(profile: &Value) -> ReviewResult<String> {
+    profile["username"]
+        .as_str()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 255
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || "#<>|[]{}".contains(c))
+        })
+        .map(str::to_owned)
+        .ok_or_else(ReviewError::unavailable)
+}
+
+struct LoginSession {
+    expires: std::time::Instant,
+    username: Option<String>,
+    state: String,
+    return_to: String,
+}
+
+fn random_key() -> ReviewResult<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|_| ReviewError::unavailable())?;
+    use std::fmt::Write;
+    let mut value = String::with_capacity(64);
+    for byte in bytes {
+        write!(value, "{byte:02x}").map_err(|_| ReviewError::unavailable())?;
+    }
+    Ok(value)
+}
+
+fn session_cookie(request: &Request) -> Option<&str> {
+    let cookies = request.headers().get(header::COOKIE)?.to_str().ok()?;
+    let mut matches = cookies
+        .split(';')
+        .filter_map(|part| part.trim().strip_prefix("orphanwiki_session="));
+    let key = matches.next()?;
+    if matches.next().is_some() || key.len() != 64 || !key.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(key)
+}
+
+fn return_page(value: &str) -> bool {
+    value.len() <= 2048
+        && !value
+            .chars()
+            .any(|c| c.is_control() || c == '\\' || c == '#')
+        && matches!(
+            value.split('?').next(),
+            Some("index.html" | "creators.html" | "deorphanize.html" | "connections.html")
+        )
 }
 
 #[derive(Clone)]
 pub struct ReviewApplication {
     web_root: PathBuf,
     database: ReviewDatabase,
+    oauth: Option<OAuthConfig>,
+    sessions: Arc<Mutex<BTreeMap<String, LoginSession>>>,
 }
 
 impl ReviewApplication {
     pub fn new(web_root: PathBuf, database: ReviewDatabase) -> Self {
-        Self { web_root, database }
+        Self {
+            web_root,
+            database,
+            oauth: None,
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// OAuth is optional for local anonymous review installations; partial configuration is an error.
+    pub fn with_oauth_from_environment(mut self) -> Result<Self, String> {
+        let values = [
+            "ORPHANWIKI_OAUTH_CLIENT_ID",
+            "ORPHANWIKI_OAUTH_CLIENT_SECRET",
+            "ORPHANWIKI_OAUTH_REDIRECT_URI",
+        ]
+        .map(|key| std::env::var(key).unwrap_or_default());
+        if values.iter().all(String::is_empty) {
+            return Ok(self);
+        }
+        self.oauth = Some(OAuthConfig::parse(
+            values[0].clone(),
+            values[1].clone(),
+            &values[2],
+        )?);
+        Ok(self)
+    }
+
+    fn session(&self, request: &Request) -> ReviewResult<Option<String>> {
+        let Some(key) = session_cookie(request) else {
+            return Ok(None);
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ReviewError::unavailable())?;
+        sessions.retain(|_, session| session.expires > std::time::Instant::now());
+        Ok(sessions
+            .get(key)
+            .and_then(|session| session.username.clone()))
+    }
+
+    fn reviewer(&self, request: &Request) -> ReviewResult<String> {
+        if self.oauth.is_none() {
+            return Ok(String::new());
+        }
+        self.session(request)?.ok_or_else(|| {
+            ReviewError::new(
+                StatusCode::UNAUTHORIZED,
+                "Accedi con Wikipedia per salvare la valutazione",
+            )
+        })
     }
 
     fn data_file(&self, relative: &Path, missing: ReviewError) -> ReviewResult<PathBuf> {
@@ -566,14 +839,15 @@ impl ReviewApplication {
         self.database.connect()?.read(&format!("SELECT {COLUMNS} FROM editorial_reviews WHERE language IN ({markers}) ORDER BY language, target_id, source_id"), &values)
     }
 
-    fn save(&self, body: Submission) -> ReviewResult<Review> {
+    fn save(&self, body: Submission, reviewer: &str) -> ReviewResult<Review> {
         self.validate_edge(&body)?;
-        self.database.connect()?.save(&body)
+        self.database.connect()?.save(&body, reviewer)
     }
 
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/reviews", any(api))
+            .route("/api/auth/{action}", any(auth))
             .fallback(static_file)
             .with_state(Arc::new(self))
     }
@@ -623,9 +897,16 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
             };
             let origin = text("origin");
             let host = text("host");
+            let allowed = app
+                .oauth
+                .as_ref()
+                .map(|config| config.redirect_uri.origin().ascii_serialization());
             if (!origin.is_empty()
-                && origin != format!("https://{host}")
-                && origin != format!("http://{host}"))
+                && if let Some(allowed) = allowed {
+                    origin != allowed
+                } else {
+                    origin != format!("https://{host}") && origin != format!("http://{host}")
+                })
                 || matches!(text("sec-fetch-site"), "cross-site" | "same-site")
             {
                 return Err(ReviewError::new(
@@ -646,6 +927,7 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
                     "Dimensione della richiesta non valida",
                 ));
             }
+            let reviewer = app.reviewer(&request)?;
             let bytes = to_bytes(request.into_body(), 2048)
                 .await
                 .map_err(|_| ReviewError::invalid())?;
@@ -654,7 +936,7 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
             }
             let body: Submission =
                 serde_json::from_slice(&bytes).map_err(|_| ReviewError::invalid())?;
-            let review = tokio::task::spawn_blocking(move || app.save(body))
+            let review = tokio::task::spawn_blocking(move || app.save(body, &reviewer))
                 .await
                 .map_err(|_| ReviewError::unavailable())??;
             Ok(json!({"review": review}))
@@ -664,6 +946,218 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
             "Metodo non consentito",
         )),
     }
+}
+
+async fn auth(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
+    match auth_request(app, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+fn auth_redirect(
+    config: &OAuthConfig,
+    location: &str,
+    cookie: Option<(&str, u64)>,
+) -> ReviewResult<Response> {
+    let mut builder = axum::http::Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    if let Some((value, seconds)) = cookie {
+        builder = builder.header(header::SET_COOKIE, config.cookie(value, seconds));
+    }
+    builder
+        .body(Body::empty())
+        .map_err(|_| ReviewError::unavailable())
+}
+
+async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewResult<Response> {
+    let action = request.uri().path().rsplit('/').next().unwrap_or("");
+    if action == "session" && request.method() == Method::GET {
+        return Ok(response(
+            StatusCode::OK,
+            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?}),
+        ));
+    }
+    let config = app.oauth.as_ref().ok_or_else(|| {
+        ReviewError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Accesso Wikipedia non configurato",
+        )
+    })?;
+    if action == "logout" && request.method() == Method::POST {
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        let site = request
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok());
+        if origin.is_some_and(|v| v != config.redirect_uri.origin().ascii_serialization())
+            || matches!(site, Some("cross-site" | "same-site"))
+            || request
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                != Some("application/json")
+        {
+            return Err(ReviewError::new(
+                StatusCode::FORBIDDEN,
+                "Origine non consentita",
+            ));
+        }
+        if let Some(key) = session_cookie(&request) {
+            app.sessions
+                .lock()
+                .map_err(|_| ReviewError::unavailable())?
+                .remove(key);
+        }
+        let mut result = response(StatusCode::OK, json!({"enabled": true, "username": null}));
+        result.headers_mut().insert(
+            header::SET_COOKIE,
+            config
+                .cookie("", 0)
+                .parse()
+                .map_err(|_| ReviewError::unavailable())?,
+        );
+        return Ok(result);
+    }
+    if request.method() != Method::GET {
+        return Err(ReviewError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Metodo non consentito",
+        ));
+    }
+    let fields: Vec<(String, String)> = axum::extract::Query::try_from_uri(request.uri())
+        .map_err(|_| ReviewError::invalid())?
+        .0;
+    if action == "login" {
+        if matches!(
+            request
+                .headers()
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok()),
+            Some("cross-site" | "same-site")
+        ) {
+            return Err(ReviewError::new(
+                StatusCode::FORBIDDEN,
+                "Origine non consentita",
+            ));
+        }
+        if fields.len() > 1
+            || fields
+                .first()
+                .is_some_and(|(key, value)| key != "return_to" || !return_page(value))
+        {
+            return Err(ReviewError::invalid());
+        }
+        let key = random_key()?;
+        let state = random_key()?;
+        let mut url = reqwest::Url::parse("https://meta.wikimedia.org/w/rest.php/oauth2/authorize")
+            .map_err(|_| ReviewError::unavailable())?;
+        url.query_pairs_mut().extend_pairs([
+            ("client_id", config.client_id.as_str()),
+            ("response_type", "code"),
+            ("redirect_uri", config.redirect_uri.as_str()),
+            ("state", &state),
+        ]);
+        let mut sessions = app
+            .sessions
+            .lock()
+            .map_err(|_| ReviewError::unavailable())?;
+        sessions.retain(|_, session| session.expires > std::time::Instant::now());
+        if sessions.len() >= 4096 {
+            return Err(ReviewError::unavailable());
+        }
+        if let Some(old) = session_cookie(&request) {
+            sessions.remove(old);
+        }
+        sessions.insert(
+            key.clone(),
+            LoginSession {
+                expires: std::time::Instant::now() + Duration::from_secs(600),
+                username: None,
+                state,
+                return_to: fields
+                    .first()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "deorphanize.html".into()),
+            },
+        );
+        return auth_redirect(config, url.as_str(), Some((&key, 600)));
+    }
+    if action == "callback" {
+        if fields.len() > 4
+            || fields
+                .iter()
+                .enumerate()
+                .any(|(i, (key, _))| fields[..i].iter().any(|(other, _)| key == other))
+        {
+            return Err(ReviewError::invalid());
+        }
+        let state = fields
+            .iter()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(ReviewError::invalid)?;
+        let cookie = session_cookie(&request).ok_or_else(ReviewError::invalid)?;
+        let pending = {
+            let mut sessions = app
+                .sessions
+                .lock()
+                .map_err(|_| ReviewError::unavailable())?;
+            let session = sessions
+                .get(cookie)
+                .filter(|session| {
+                    session.username.is_none()
+                        && session.state == state
+                        && session.expires > std::time::Instant::now()
+                })
+                .ok_or_else(ReviewError::invalid)?;
+            let return_to = session.return_to.clone();
+            sessions.remove(cookie);
+            return_to
+        };
+        let base = config
+            .redirect_uri
+            .as_str()
+            .strip_suffix("api/auth/callback")
+            .ok_or_else(ReviewError::invalid)?;
+        if fields.iter().any(|(key, _)| key == "error") {
+            return auth_redirect(config, &format!("{base}{pending}"), Some(("", 0)));
+        }
+        let code = fields
+            .iter()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.clone())
+            .filter(|code| !code.is_empty() && code.len() <= 4096)
+            .ok_or_else(ReviewError::invalid)?;
+        let configuration = config.clone();
+        let username = tokio::task::spawn_blocking(move || configuration.identify(&code))
+            .await
+            .map_err(|_| ReviewError::unavailable())??;
+        let key = random_key()?;
+        app.sessions
+            .lock()
+            .map_err(|_| ReviewError::unavailable())?
+            .insert(
+                key.clone(),
+                LoginSession {
+                    expires: std::time::Instant::now() + Duration::from_secs(28800),
+                    username: Some(username),
+                    state: String::new(),
+                    return_to: String::new(),
+                },
+            );
+        return auth_redirect(config, &format!("{base}{pending}"), Some((&key, 28800)));
+    }
+    Err(ReviewError::new(
+        StatusCode::NOT_FOUND,
+        "Risorsa non disponibile",
+    ))
 }
 
 async fn static_file(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
@@ -905,6 +1399,309 @@ mod tests {
         }
     }
 
+    fn enable_oauth(f: &mut Fixture) {
+        Arc::get_mut(&mut f.app).unwrap().oauth = Some(
+            OAuthConfig::parse(
+                "test-client".into(),
+                "test-secret".into(),
+                "https://example.toolforge.org/api/auth/callback",
+            )
+            .unwrap(),
+        );
+    }
+
+    fn auth_call(f: &Fixture, method: Method, uri: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                auth(State(f.app.clone()), request.body(Body::empty()).unwrap()).await
+            })
+    }
+
+    #[test]
+    fn oauth_authorization_binds_browser_state_and_blocks_replay_and_redirects() {
+        let mut f = Fixture::new();
+        enable_oauth(&mut f);
+        for uri in [
+            "/api/auth/login?return_to=https://evil.invalid",
+            "/api/auth/login?return_to=//evil.invalid",
+            "/api/auth/login?return_to=connections.html%0d%0aLocation:evil",
+            "/api/auth/login?return_to=index.html&return_to=creators.html",
+        ] {
+            assert_eq!(
+                auth_call(&f, Method::GET, uri, &[]).status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            auth_call(
+                &f,
+                Method::GET,
+                "/api/auth/login",
+                &[("sec-fetch-site", "cross-site")]
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = auth_call(
+            &f,
+            Method::GET,
+            "/api/auth/login?return_to=connections.html%3Fdataset%3Dvec.json%26page%3D1",
+            &[],
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.contains("HttpOnly; SameSite=Lax; Max-Age=600; Secure"));
+        let browser_cookie = cookie.split(';').next().unwrap();
+        let location =
+            reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        assert_eq!(location.host_str(), Some("meta.wikimedia.org"));
+        let params = location.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(params["client_id"], "test-client");
+        assert_eq!(params["response_type"], "code");
+        assert!(!location.as_str().contains("test-secret"));
+        let state = &params["state"];
+        let callback = format!("/api/auth/callback?state={state}&error=access_denied");
+        assert_eq!(
+            auth_call(&f, Method::GET, &callback, &[]).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            auth_call(
+                &f,
+                Method::GET,
+                "/api/auth/callback?state=wrong&code=unused",
+                &[("cookie", browser_cookie)]
+            )
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = auth_call(&f, Method::GET, &callback, &[("cookie", browser_cookie)]);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "https://example.toolforge.org/connections.html?dataset=vec.json&page=1"
+        );
+        assert!(response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        assert_eq!(
+            auth_call(&f, Method::GET, &callback, &[("cookie", browser_cookie)]).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(f.app.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_reviews_cannot_forge_authors_and_logout_revokes_writes() {
+        let mut f = Fixture::new();
+        enable_oauth(&mut f);
+        assert_eq!(f.submit(f.body.clone()).0, StatusCode::UNAUTHORIZED);
+        let key = random_key().unwrap();
+        f.app.sessions.lock().unwrap().insert(
+            key.clone(),
+            LoginSession {
+                expires: std::time::Instant::now() + Duration::from_secs(60),
+                username: Some("Editor À & Test".into()),
+                state: String::new(),
+                return_to: String::new(),
+            },
+        );
+        let cookie = format!("orphanwiki_session={key}");
+        let headers = [
+            ("cookie", cookie.as_str()),
+            ("origin", "https://example.toolforge.org"),
+        ];
+        let mut forged = f.body.clone();
+        forged["reviewer"] = json!("Impersonated");
+        assert_eq!(
+            f.request(Method::POST, "/api/reviews", Some(forged), &headers)
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let saved = f.request(Method::POST, "/api/reviews", Some(f.body.clone()), &headers);
+        assert_eq!(saved.0, StatusCode::OK);
+        assert_eq!(saved.1["review"]["reviewer"], "Editor À & Test");
+        assert_eq!(
+            f.request(Method::GET, "/api/reviews?dataset=vec.json", None, &[])
+                .1["reviews"][0]["reviewer"],
+            "Editor À & Test"
+        );
+        let conflict = f.request(Method::POST, "/api/reviews", Some(f.body.clone()), &headers);
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert_eq!(conflict.1["current"], saved.1["review"]);
+        assert_eq!(
+            auth_call(
+                &f,
+                Method::POST,
+                "/api/auth/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("origin", "https://evil.invalid"),
+                    ("content-type", "application/json")
+                ]
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            auth_call(&f, Method::GET, "/api/auth/logout", &[("cookie", &cookie)]).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(f.app.sessions.lock().unwrap().contains_key(&key));
+        assert_eq!(
+            auth_call(
+                &f,
+                Method::POST,
+                "/api/auth/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("origin", "https://example.toolforge.org"),
+                    ("content-type", "application/json")
+                ]
+            )
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.request(Method::POST, "/api/reviews", Some(f.body.clone()), &headers)
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        f.app.sessions.lock().unwrap().insert(
+            key,
+            LoginSession {
+                expires: std::time::Instant::now() - Duration::from_secs(1),
+                username: Some("Expired".into()),
+                state: String::new(),
+                return_to: String::new(),
+            },
+        );
+        assert_eq!(
+            f.request(Method::POST, "/api/reviews", Some(f.body.clone()), &headers)
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn oauth_server_exchange_uses_form_secret_and_bearer_profile_only() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for step in 0..2 {
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                let headers = lines.join("").to_lowercase();
+                if step == 0 {
+                    assert_eq!(lines[0], "POST /token HTTP/1.1\r\n");
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let body = String::from_utf8(body).unwrap();
+                    assert!(body.contains("client_secret=test-secret"));
+                    assert!(body.contains("code=code%26value"));
+                } else {
+                    assert_eq!(lines[0], "GET /profile HTTP/1.1\r\n");
+                    assert!(headers.contains("authorization: bearer synthetic-token"));
+                }
+                let body = if step == 0 {
+                    r#"{"access_token":"synthetic-token","refresh_token":"discard"}"#
+                } else {
+                    r#"{"username":"Editor À & Test","sub":"123","email":"discard"}"#
+                };
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let config = OAuthConfig::parse(
+            "test-client".into(),
+            "test-secret".into(),
+            "https://example.org/api/auth/callback",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .identify_at(
+                    "code&value",
+                    &format!("http://{address}/token"),
+                    &format!("http://{address}/profile")
+                )
+                .unwrap(),
+            "Editor À & Test"
+        );
+        worker.join().unwrap();
+        for value in [
+            json!({}),
+            json!({"username":"Bad#name"}),
+            json!({"username":""}),
+            json!({"username":"Bad\nname"}),
+        ] {
+            assert!(verified_username(&value).is_err());
+        }
+        for callback in [
+            "http://example.org/api/auth/callback",
+            "https://user:secret@example.org/api/auth/callback",
+            "https://example.org/api/auth/callback?secret=x",
+        ] {
+            assert!(OAuthConfig::parse("id".into(), "secret".into(), callback).is_err());
+        }
+        let local = OAuthConfig::parse(
+            "id".into(),
+            "secret".into(),
+            "http://localhost:8000/tool/api/auth/callback",
+        )
+        .unwrap();
+        assert_eq!(
+            local.cookie("abc", 10),
+            "orphanwiki_session=abc; Path=/tool/; HttpOnly; SameSite=Lax; Max-Age=10"
+        );
+    }
+
+    #[test]
+    fn existing_anonymous_database_migrates_without_changing_reviews() {
+        let f = Fixture::new();
+        let db = rusqlite::Connection::open(f.root.join("reviews.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE editorial_reviews (language TEXT,source_id INTEGER,target_id INTEGER,status TEXT,version INTEGER,updated_at TEXT,PRIMARY KEY(language,target_id,source_id));
+            INSERT INTO editorial_reviews VALUES ('vec',2,1,'fixed',4,'2026-10-01T00:00:00Z');").unwrap();
+        let result = f.request(Method::GET, "/api/reviews?dataset=vec.json", None, &[]);
+        assert_eq!(result.0, StatusCode::OK);
+        let review = &result.1["reviews"][0];
+        assert_eq!(review["version"], 4);
+        assert_eq!(review["reviewer"], "");
+        assert_eq!(review["status"], "fixed");
+        assert_eq!(review["updated_at"], "2026-10-01T00:00:00Z");
+    }
+
     #[test]
     fn persistence_reopening_language_scope_and_private_schema() {
         let f = Fixture::new();
@@ -955,7 +1752,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    app.save(serde_json::from_value(body).unwrap())
+                    app.save(serde_json::from_value(body).unwrap(), "")
                         .map_err(|e| e.status)
                 })
             })

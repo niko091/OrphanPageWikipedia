@@ -66,7 +66,7 @@ interface CompactObservations {
   card_identity?: string;
   link_candidates?: Record<string, CandidateRecord>;
 }
-interface Provider { name: string; url: string; }
+interface Provider { name: string; url: string | null; }
 interface PromptSource { id: string; language: string; title: string; page_id?: number | null; }
 interface PromptDocument {
   page_id: number; title: string; revision_id: number; timestamp: string;
@@ -74,7 +74,7 @@ interface PromptDocument {
 }
 type ReviewStatus = 'fixed' | 'not_fixed' | 'bad_link';
 interface EditorialReview {
-  language: string; source_id: number; target_id: number; status: ReviewStatus; version: number; updated_at: string;
+  language: string; source_id: number; target_id: number; status: ReviewStatus; version: number; updated_at: string; reviewer?: string;
 }
 interface ReviewContext {
   dataset: string; language: string; target_id: number; target_title: string;
@@ -163,6 +163,12 @@ interface UIElements {
   'candidate-search': HTMLInputElement;
   'candidate-section': HTMLElement;
   'candidate-sort': HTMLSelectElement;
+  'auth-menu': HTMLDetailsElement;
+  'auth-toggle': HTMLElement;
+  'auth-login': HTMLButtonElement;
+  'auth-user': HTMLAnchorElement;
+  'auth-logout': HTMLButtonElement;
+  'auth-status': HTMLElement;
   'profile-sort-option': HTMLOptionElement;
   'profile-username': HTMLInputElement;
   'profile-apply': HTMLButtonElement;
@@ -216,7 +222,6 @@ interface UIElements {
   'review-rows': HTMLElement;
   'review-dialog-status': HTMLElement;
   'review-close': HTMLButtonElement;
-  'review-refresh': HTMLButtonElement;
   'review-service-status': HTMLElement;
   'llm-prompt-copy': HTMLButtonElement;
   'llm-prompt-debug': HTMLInputElement;
@@ -288,6 +293,7 @@ const translations: Record<string, string> = {
   "Prompt per {provider}": "Prompt for {provider}",
   "Chiudi": "Close",
   "Apri {provider}": "Open {provider}",
+  "Altro": "Other",
   "Preparazione del wikitesto: {current}/{total} fonti…": "Preparing wikitext: {current}/{total} sources…",
   "Fonti disponibili: {current}/{total} · {size} caratteri. Copia il pacchetto e incollalo in una chat nuova.": "Sources available: {current}/{total} · {size} characters. Copy the package and paste it into a new chat.",
   "Nessuna fonte disponibile. Chiudi e riprova; il prompt non è pronto.": "No sources available. Close and retry; the prompt is not ready.",
@@ -415,7 +421,6 @@ const translations: Record<string, string> = {
   "Cerca una categoria…": "Search categories…",
   "Mostra altre 25 schede": "Show 25 more cards",
   "Valuta le coppie di pagine": "Review candidate page pairs",
-  "Aggiorna valutazioni": "Refresh reviews",
   "Fixato": "Fixed",
   "Non fixato": "Not fixed",
   "Bad link": "Bad link",
@@ -423,15 +428,23 @@ const translations: Record<string, string> = {
   "Non ancora valutata": "Not reviewed yet",
   "Valutazione condivisa: {status}": "Shared review: {status}",
   "Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.": "Shared user reviews; not automatically verified on Wikipedia.",
-  "Valutazioni condivise non disponibili. Riprova con Aggiorna valutazioni.": "Shared reviews are unavailable. Try Refresh reviews.",
+  "Valutazioni condivise non disponibili. Ricarica la pagina per riprovare.": "Shared reviews are unavailable. Reload the page to try again.",
   "Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; Non fixato la mantiene attiva.": "Review each pair. Fixed and Bad link exclude it from future prompts; Not fixed keeps it active.",
-  "Valutazioni condivise non disponibili. Chiudi e aggiorna le valutazioni prima di riprovare.": "Shared reviews are unavailable. Close and refresh reviews before trying again.",
-  "Caricamento delle valutazioni condivise…": "Loading shared reviews…",
+  "Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.": "Shared reviews are unavailable. Close and reload the page to try again.",
   "Salvataggio…": "Saving…",
   "Un altro utente ha aggiornato questa coppia. Controlla lo stato e riprova.": "Another user updated this pair. Check its status and try again.",
   "Valutazione salvata e visibile a tutti gli utenti.": "Review saved and visible to all users.",
-  "Salvataggio non confermato. Aggiorna le valutazioni prima di riprovare.": "Save not confirmed. Refresh reviews before trying again.",
+  "Salvataggio non confermato. Ricarica la pagina prima di riprovare.": "Save not confirmed. Reload the page before trying again.",
   "{n} coppie segnate come Fixato o Bad link, escluse dai prompt.": "{n} pairs marked Fixed or Bad link, excluded from prompts.",
+  "Accedi con Wikipedia": "Log in with Wikipedia",
+  "Accedi con Wikimedia": "Log in with Wikimedia",
+  "Account Wikimedia": "Wikimedia account",
+  "Accesso Wikimedia non disponibile al momento. Riprova.": "Wikimedia login is currently unavailable. Please try again.",
+  "Esci": "Log out",
+  "Accesso Wikipedia non configurato": "Wikipedia login is not configured",
+  "Accesso Wikipedia non disponibile": "Wikipedia login is unavailable",
+  "Accedi con Wikipedia per salvare la valutazione": "Log in with Wikipedia to save the review",
+  "Valutazione di ": "Reviewed by ",
   "Nome utente Wikimedia": "Wikimedia username",
   "Nome utente": "Username",
   "Personalizza le proposte": "Personalize suggestions",
@@ -539,11 +552,17 @@ function readPreference<T extends string>(key: string, fallback: T, choices: rea
   try {const value=window.localStorage.getItem(key);return value!==null&&choices.includes(value as T)?value as T:fallback;} catch {return fallback;}
 }
 let uiLanguage=readPreference('orphanwiki-language','it',['it','en']);
+// Presentation order: estimated web visits, September 2026 (not active-user counts).
+// https://www.alphamoat.ai/en/ai/t/llm
 const llmProviders: Record<string, Provider> = {
+  chatgpt:{name:'ChatGPT',url:'https://chatgpt.com/'},
+  gemini:{name:'Gemini',url:'https://gemini.google.com/app'},
+  claude:{name:'Claude',url:'https://claude.ai/new'},
   qwen:{name:'Qwen',url:'https://chat.qwen.ai/'},
   kimi:{name:'Kimi',url:'https://www.kimi.ai/'},
+  glm:{name:'GLM',url:'https://chat.z.ai/'},
   mistral:{name:'Mistral',url:'https://chat.mistral.ai/chat'},
-  glm:{name:'GLM',url:'https://chat.z.ai/'}
+  other:{name:'Altro',url:null}
 };
 let llmProvider=readPreference('orphanwiki-llm','qwen',Object.keys(llmProviders));
 let theme=readPreference('orphanwiki-theme','system',['system','light','dark']);
@@ -600,6 +619,73 @@ let profileScores: Map<string, {topic: number; language: number}> | null = null;
 let cardRequestVersion=0,cardController=new AbortController(),cardHydration: Promise<void>=Promise.resolve();
 let activeCardFetches=0;
 const waitingCardFetches: (()=>void)[]=[];
+
+let authEnabled: boolean | null=null,authUsername: string | null=null;
+let authError: string | null=null,authBusy=false;
+const validUsername=(value: unknown): value is string=>typeof value==='string'&&value.length>0&&value.length<=255&&!/[\u0000-\u001f\u007f#<>|\[\]{}]/.test(value);
+function userPage(username: string, language: string): string {
+  const edition=/^[a-z][a-z0-9-]{0,19}$/.test(language)&&language!=='all'?language:uiLanguage;
+  return `https://${edition}.wikipedia.org/wiki/User:${encodeURIComponent(username.replaceAll(' ','_'))}`;
+}
+function renderAuth() {
+  $('auth-login')!.hidden=authUsername!==null;
+  $('auth-login')!.disabled=authBusy;
+  $('auth-login')!.setAttribute('aria-busy',String(authBusy));
+  $('auth-toggle')!.setAttribute('aria-label',t('Account Wikimedia')+(authUsername?' · '+authUsername:''));
+  const user=$('auth-user')!;user.hidden=authUsername===null;user.textContent=authUsername??'';
+  if(authUsername)user.href=userPage(authUsername,data?.metadata.language??uiLanguage);
+  $('auth-logout')!.hidden=authUsername===null;
+  const message=authError??(authEnabled!==true?'Accesso Wikimedia non disponibile al momento. Riprova.':'');
+  $('auth-status')!.textContent=t(message);$('auth-status')!.hidden=!message;
+  if($('profile-username')) { $('profile-username')!.disabled=authUsername!==null;if(authUsername)$('profile-username')!.value=authUsername; }
+}
+function clearProfile() {
+  ++profileRequestVersion;profileController.abort();profileController=new AbortController();
+  profileContributions=null;profileScores=null;profileTopicCache.clear();
+  if($('profile-username'))$('profile-username')!.value='';
+  if($('profile-status'))$('profile-status')!.textContent='';
+  if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
+  if($('profile-apply'))$('profile-apply')!.disabled=false;
+  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+}
+async function authRequest(action: 'session' | 'logout'): Promise<void> {
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
+  try {
+    const response=await fetch('api/auth/'+action,{cache:'no-store',credentials:'same-origin',signal:controller.signal,
+      ...(action==='logout'?{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}:{})});
+    if(!response.ok)throw new Error('Accesso Wikipedia non disponibile');
+    const payload: unknown=await response.json();
+    if(!isRecord(payload)||typeof payload.enabled!=='boolean'||!(payload.username===null||validUsername(payload.username))||!payload.enabled&&payload.username!==null)throw new Error('Accesso Wikipedia non disponibile');
+    if(authUsername!==payload.username)clearProfile();
+    authEnabled=payload.enabled;authUsername=payload.username;authError=null;
+  } finally {clearTimeout(timer);}
+  renderAuth();
+}
+async function loadAuth() {
+  try {await authRequest('session');}
+  catch {if(authUsername)clearProfile();authEnabled=null;authUsername=null;renderAuth();}
+}
+async function login() {
+  if(authBusy)return;
+  authBusy=true;authError=null;renderAuth();
+  try {
+    await authRequest('session');
+    if(authEnabled!==true)throw new Error('Accesso non disponibile');
+    if(authUsername) {
+      if(deorphanizePage&&data&&!profileContributions)await applyProfile();
+      return;
+    }
+    const page=connectionsPage?'connections.html':deorphanizePage?'deorphanize.html':creatorsPage?'creators.html':'index.html';
+    window.location.assign('api/auth/login?return_to='+encodeURIComponent(page+window.location.search));
+  } catch {authError='Accesso Wikimedia non disponibile al momento. Riprova.';}
+  finally {authBusy=false;renderAuth();}
+}
+async function logout() {
+  $('auth-logout')!.disabled=true;
+  try {await authRequest('logout');closePrompt();if(data)renderDataset();}
+  catch {authError='Accesso Wikimedia non disponibile al momento. Riprova.';renderAuth();}
+  finally {$('auth-logout')!.disabled=false;}
+}
 
 async function wikimediaAPI(url: URL, signal?: AbortSignal): Promise<unknown> {
   if(url.protocol!=='https:' || !(url.hostname==='meta.wikimedia.org'||/^[a-z][a-z0-9-]{0,19}\.wikipedia\.org$/.test(url.hostname)))
@@ -813,7 +899,7 @@ async function applyProfile() {
   if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
   $('profile-status')!.textContent=t('Caricamento delle ultime 100 modifiche…');
   try {
-    const edits=await recentWikipediaEdits($('profile-username')!.value.trim(),profileController.signal);
+    const edits=await recentWikipediaEdits(authUsername??$('profile-username')!.value.trim(),profileController.signal);
     if(version!==profileRequestVersion)return;
     profileContributions=edits;
     if(!edits.length)throw new Error('L’utente non ha modifiche pubbliche nelle Wikipedie collegate');
@@ -1148,9 +1234,18 @@ function parseReview(value: unknown): EditorialReview {
     typeof value.source_id!=='number'||!Number.isSafeInteger(value.source_id)||value.source_id<=0||
     typeof value.target_id!=='number'||!Number.isSafeInteger(value.target_id)||value.target_id<=0||value.source_id===value.target_id||
     (value.status!=='fixed'&&value.status!=='not_fixed'&&value.status!=='bad_link')||typeof value.version!=='number'||!Number.isSafeInteger(value.version)||value.version<=0||
-    typeof value.updated_at!=='string'||!Number.isFinite(Date.parse(value.updated_at)))throw new Error('Valutazioni condivise non valide');
+    typeof value.updated_at!=='string'||!Number.isFinite(Date.parse(value.updated_at))||
+    value.reviewer!==undefined&&value.reviewer!==''&&!validUsername(value.reviewer))throw new Error('Valutazioni condivise non valide');
   return {language:value.language,source_id:value.source_id,target_id:value.target_id,
-    status:value.status,version:value.version,updated_at:value.updated_at};
+    status:value.status,version:value.version,updated_at:value.updated_at,reviewer:typeof value.reviewer==='string'?value.reviewer:undefined};
+}
+function reviewBadge(review: EditorialReview): HTMLElement {
+  const badge=element('span',t('Valutazione condivisa: {status}',{status:t(reviewLabels[review.status])}),'review-badge');
+  if(review.reviewer) {
+    const link=element('a',review.reviewer);link.href=userPage(review.reviewer,review.language);link.target='_blank';link.rel='noopener noreferrer';
+    badge.append(element('span',' · '+t('Valutazione di ')),link);
+  }
+  return badge;
 }
 async function readReviews(dataset: string): Promise<Map<string,EditorialReview>> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
@@ -1168,7 +1263,7 @@ async function readReviews(dataset: string): Promise<Map<string,EditorialReview>
     return reviews;
   } finally {clearTimeout(timer);}
 }
-async function refreshSharedReviews(render=true): Promise<void> {
+async function loadSharedReviews(): Promise<void> {
   const version=loadVersion,file=datasetFile,request=++reviewReadVersion;
   try {
     const reviews=await readReviews(file);
@@ -1178,9 +1273,8 @@ async function refreshSharedReviews(render=true): Promise<void> {
   } catch {
     if(version!==loadVersion||file!==datasetFile||request!==reviewReadVersion)return;
     reviewsAvailable=false;
-    $('review-service-status')!.textContent=t('Valutazioni condivise non disponibili. Riprova con Aggiorna valutazioni.');
+    $('review-service-status')!.textContent=t('Valutazioni condivise non disponibili. Ricarica la pagina per riprovare.');
   }
-  if(render)renderDataset();
 }
 function closeReview() {
   ++reviewVersion;reviewSaveController?.abort();reviewSaveController=null;reviewSaving=false;reviewContext=null;
@@ -1191,33 +1285,29 @@ function renderReviewDialog(message='') {
   if(!reviewContext)return;
   const context=reviewContext;
   const box=$('review-rows')!;box.replaceChildren();
-  $('review-dialog-status')!.textContent=message||t(reviewsAvailable?
+  $('review-dialog-status')!.textContent=message||t(authEnabled!==false&&!authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
     'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; Non fixato la mantiene attiva.':
-    'Valutazioni condivise non disponibili. Chiudi e aggiorna le valutazioni prima di riprovare.');
+    'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.');
   for(const source of reviewContext.sources) {
     const row=element('article',null,'review-row');
     const identity=element('p');identity.append(wikiLink(source.title,reviewContext.language),element('span',' → '),wikiLink(reviewContext.target_title,reviewContext.language));row.append(identity);
     const review=editorialReviews.get(reviewKey(reviewContext.language,source.page_id,reviewContext.target_id));
-    row.append(element('p',review?t('Valutazione condivisa: {status}',{status:t(reviewLabels[review.status])}):t('Non ancora valutata')));
+    row.append(review?reviewBadge(review):element('p',t('Non ancora valutata')));
     const actions=element('div',null,'review-actions');
     for(const status of ['fixed','not_fixed','bad_link'] as const) {
-      const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable;
+      const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||authEnabled!==false&&!authUsername;
       button.setAttribute('aria-pressed',String(review?.status===status));
       button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
     }
     row.append(actions);box.append(row);
   }
 }
-async function showReview(context: ReviewContext) {
-  closePrompt();reviewContext=context;reviewSaving=true;
-  const version=reviewVersion;
-  renderReviewDialog(t('Caricamento delle valutazioni condivise…'));$('review-dialog')!.showModal();
-  await refreshSharedReviews();
-  if(version!==reviewVersion||!reviewContext)return;
-  reviewSaving=false;renderReviewDialog();
+function showReview(context: ReviewContext) {
+  closePrompt();reviewContext=context;
+  renderReviewDialog();$('review-dialog')!.showModal();
 }
 async function saveReview(context: ReviewContext,source: {page_id: number; title: string},status: ReviewStatus) {
-  if(reviewSaving||!reviewsAvailable||context!==reviewContext)return;
+  if(reviewSaving||!reviewsAvailable||context!==reviewContext||authEnabled!==false&&!authUsername)return;
   ++reviewReadVersion;
   const version=reviewVersion,key=reviewKey(context.language,source.page_id,context.target_id);
   const current=editorialReviews.get(key);
@@ -1225,17 +1315,18 @@ async function saveReview(context: ReviewContext,source: {page_id: number; title
   const timer=setTimeout(()=>controller.abort(),8000);
   let message='';
   try {
-    const response=await fetch('api/reviews',{method:'POST',cache:'no-store',credentials:'omit',signal:controller.signal,
+    const response=await fetch('api/reviews',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:context.dataset,language:context.language,
         source_id:source.page_id,target_id:context.target_id,status,version:current?.version??0})});
     const payload: unknown=await response.json();
     if(version!==reviewVersion||context!==reviewContext)return;
+    if(response.status===401){await loadAuth();message=t('Accedi con Wikipedia per salvare la valutazione');return;}
     if(!isRecord(payload)||(response.status!==409&&!response.ok))throw new Error('Salvataggio non riuscito');
     const review=parseReview(response.status===409?payload.current:payload.review);
     if(reviewKey(review.language,review.source_id,review.target_id)!==key)throw new Error('Valutazione non valida');
     editorialReviews.set(key,review);renderDataset();
     message=t(response.status===409?'Un altro utente ha aggiornato questa coppia. Controlla lo stato e riprova.':'Valutazione salvata e visibile a tutti gli utenti.');
-  } catch {message=t('Salvataggio non confermato. Aggiorna le valutazioni prima di riprovare.');}
+  } catch {message=t('Salvataggio non confermato. Ricarica la pagina prima di riprovare.');}
   finally {
     clearTimeout(timer);
     if(version===reviewVersion){reviewSaving=false;reviewSaveController=null;renderReviewDialog(message);}
@@ -1334,9 +1425,11 @@ async function showPrompt(request: PromptRequest) {
   closePrompt();activePromptReview=request.review??null;
   const version=promptVersion,controller=new AbortController();promptController=controller;
   const timer=setTimeout(()=>controller.abort(),30_000);
-  $('llm-prompt-title')!.textContent=t('Prompt per {provider}',{provider:request.provider.name});
+  $('llm-prompt-title')!.textContent=t('Prompt per {provider}',{provider:t(request.provider.name)});
   $('llm-prompt-status')!.textContent=t('Preparazione del wikitesto: {current}/{total} fonti…',{current:0,total:request.sources.length});
-  const open=$('llm-prompt-open')!;open.href=request.provider.url;open.textContent=t('Apri {provider}',{provider:request.provider.name});
+  const open=$('llm-prompt-open')!;open.hidden=request.provider.url===null;
+  if(request.provider.url)open.href=request.provider.url;else open.removeAttribute('href');
+  open.textContent=t('Apri {provider}',{provider:t(request.provider.name)});
   $('llm-prompt')!.showModal();
   const documents=new Map<string,PromptDocument>(),errors=new Map<string,string>();
   let next=0,finished=0;
@@ -1383,7 +1476,7 @@ function fixLink(request: PromptRequest | null) {
     return disabled;
   }
   const link=element('button','Fix this','fix-link');
-  link.type='button';link.title=t('Prepara prompt e wikitesto per {provider}',{provider:request.provider.name});
+  link.type='button';link.title=t('Prepara prompt e wikitesto per {provider}',{provider:t(request.provider.name)});
   link.addEventListener('click',()=>showPrompt(request));
   return link;
 }
@@ -1574,7 +1667,7 @@ function renderConnections() {
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
     if(candidate.dead_end===true)header.append(element('span','Dead-end page','dead-end-badge'));
     const review=reviewedEdge(page,candidate.page_id);
-    if(review)header.append(element('span',t('Valutazione condivisa: {status}',{status:t(reviewLabels[review.status])}),'review-badge'));
+    if(review)header.append(reviewBadge(review));
     body.append(header);
     const proposed=element('div',null,'connection-proposed');
     proposed.append(element('h3',t('Collegamento da valutare in {language}',{language:pageLanguage(page).toUpperCase()})));
@@ -1827,16 +1920,17 @@ async function load(entry: ManifestEntry) {
   $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
   if(deorphanizePage||connectionsPage) {
     editorialReviews=new Map();reviewsAvailable=false;
-    await refreshSharedReviews(false);
+    await loadSharedReviews();
     if(version!==loadVersion)return;
   }
   refreshCategoryChoices();
   if(creatorsPage)prepareCreators();
   lastError=null;
   document.body.dataset.loading='false';
-  renderDataset();
+  renderDataset();renderAuth();
   if(deorphanizePage)await cardHydration;
   if(version!==loadVersion)return;
+  if(deorphanizePage&&authUsername&&!profileContributions){await applyProfile();return;}
   if(deorphanizePage&&profileContributions){const profileVersion=++profileRequestVersion;void scoreProfile(profileContributions,profileVersion).catch(error=>{
     if(profileVersion===profileRequestVersion)$('profile-status')!.textContent=t('Personalizzazione non disponibile: {error}',{error:String(error)});
   });}
@@ -1923,12 +2017,18 @@ function renderCharts() {
     distribution('length','length_bytes','byte');
   }
 }
+function populateLlmProviders() {
+  const select=$('llm-provider');if(!select)return;
+  select.replaceChildren(...Object.entries(llmProviders).map(([key,provider])=>new Option(t(provider.name),key)));
+  select.value=llmProvider;
+}
 let lastError: Error | null = null;
 function fail(cause: unknown) {const error=cause instanceof Error?cause:new Error(String(cause));lastError=error;$('status')!.hidden=false;$('status')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',{error:t(error.message)});}
 applyTheme();applyTranslations();
 $('ui-language-toggle')!.addEventListener('click',()=>{
   closePrompt();
   uiLanguage=uiLanguage==='it'?'en':'it';savePreference('orphanwiki-language',uiLanguage);applyTranslations();
+  renderAuth();populateLlmProviders();
   if(data) {refreshCategoryChoices();renderDataset();}
   if(lastError)fail(lastError);
 });
@@ -1937,8 +2037,7 @@ $('theme-toggle')!.addEventListener('click',()=>{
 });
 systemTheme?.addEventListener?.('change',()=>{if(theme==='system')applyTheme();});
 if($('llm-provider')!) {
-  for(const [key,provider] of Object.entries(llmProviders))$('llm-provider')!.append(new Option(provider.name,key));
-  $('llm-provider')!.value=llmProvider;
+  populateLlmProviders();
   $('llm-provider')!.addEventListener('change',()=>{
     const value=$('llm-provider')!.value;if(!Object.hasOwn(llmProviders,value)){$('llm-provider')!.value=llmProvider;return;}
     closePrompt();
@@ -1953,12 +2052,16 @@ $('llm-prompt-close')?.addEventListener('click',closePrompt);
 $('llm-prompt-finished')?.addEventListener('click',()=>{if(activePromptReview)void showReview(activePromptReview);});
 $('review-close')?.addEventListener('click',closeReview);
 $('review-dialog')?.addEventListener('cancel',event=>{event.preventDefault();closeReview();});
-$('review-refresh')?.addEventListener('click',()=>{if(data)void refreshSharedReviews();});
 $('llm-prompt')?.addEventListener('cancel',event=>{event.preventDefault();closePrompt();});
 $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.loading!=='true')renderCharts();});
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
+$('auth-menu')?.addEventListener('keydown',event=>{
+  if(event.key==='Escape') {event.preventDefault();$('auth-menu')!.open=false;$('auth-toggle')!.focus();}
+});
+$('auth-login')?.addEventListener('click',()=>{void login();});
+$('auth-logout')?.addEventListener('click',()=>{void logout();});
 $('profile-apply')?.addEventListener('click',()=>{if(data)void applyProfile();});
 for(const id of ['article-search','article-category','article-group','article-sort']) $(id)?.addEventListener('input',()=>{articleLimit=25;if(data)articleList();});
 $('article-macro')?.addEventListener('change',()=>{articleLimit=25;if(data)articleList();});
@@ -1969,6 +2072,7 @@ $('creator-more')?.addEventListener('click',()=>{creatorLimit+=25;creatorList();
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>{candidateLimit+=25;candidateCards();});
 const dashboardReady=(async()=>{
+  await loadAuth();
   const bindings: DashboardModule = await import(nativeModuleUrl);
   await bindings.default();nativeCalculate=bindings.calculate;
   for(const label of calculateReport<string[]>('taxonomy',null)) {
