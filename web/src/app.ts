@@ -163,6 +163,7 @@ interface UIElements {
   'candidate-search': HTMLInputElement;
   'candidate-section': HTMLElement;
   'candidate-sort': HTMLSelectElement;
+  'candidate-hide-special': HTMLButtonElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;
   'auth-login': HTMLButtonElement;
@@ -419,6 +420,8 @@ const translations: Record<string, string> = {
   "Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.": "Select Connect to see candidate pages and existing links in other languages. Each proposal requires a content review.",
   "Cerca una voce orfana": "Search orphan articles",
   "Cerca una categoria…": "Search categories…",
+  "Nascondi disambigue e insiemi di caratteri": "Hide disambiguation pages and character sets",
+  "Filtro basato sulla categoria visualizzata.": "Filter based on the displayed category.",
   "Mostra altre 25 schede": "Show 25 more cards",
   "Valuta le coppie di pagine": "Review candidate page pairs",
   "Fixato": "Fixed",
@@ -592,7 +595,7 @@ function applyTranslations() {
   languageButton.setAttribute('aria-label',description);languageButton.title=description;
   applyTheme();
   for(const node of document.querySelectorAll<HTMLElement>('[data-i18n]'))node.textContent=t(node.dataset.i18n!);
-  for(const attr of ['placeholder','aria-label'])for(const node of document.querySelectorAll(`[data-i18n-${attr}]`))node.setAttribute(attr,t(node.getAttribute('data-i18n-'+attr)!));
+  for(const attr of ['placeholder','aria-label','title'])for(const node of document.querySelectorAll(`[data-i18n-${attr}]`))node.setAttribute(attr,t(node.getAttribute('data-i18n-'+attr)!));
 }
 const number = (value: number | null | undefined) => value == null ? '—' : new Intl.NumberFormat(locale(), {maximumFractionDigits: 1}).format(value);
 const pageLanguage = (row: PageObservation) => row.language || data.metadata.language;
@@ -608,6 +611,7 @@ const attributedCreatorKey = (row: PageObservation) => {
 };
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, candidateLimit = 25, connectionLimit = 50, articleLimit = 25, creatorLimit = 25, creatorRows: CreatorRow[] = [];
+let hideSpecialOrphans = true;
 let precomputed: DashboardSummaryData | null = null, precomputedCreators: CreatorRow[] | null = null;
 let summaryOnly = false, articleListLoading = false;
 let profileRequestVersion = 0;
@@ -1600,13 +1604,28 @@ async function hydrateVisibleCards(requests: VisibleCardRequest[],request: numbe
     }
   }));
 }
+// These are category labels, not a classification inferred from article titles or topics.
+const specialOrphanCategories=new Set([
+  'disambigua','disambigue','disambiguazione','disambiguazioni','disanbigua','disanbigue',
+  'registar da pagin da desambiguazziun',
+  'pagine di disambiguazione','disambiguation','disambiguation pages',
+  'pagines de desambiguacio','paginas de desambiguacao','homonymie','homonymies',
+  'insiemi di caratteri','set di caratteri','character sets','jeux de caracteres',
+  'conjunts de caracters','conjuntos de caracteres'
+]);
+function specialOrphanCategory(page: PageObservation): boolean {
+  const category=(page.category??'').normalize('NFD').replace(/\p{M}/gu,'').toLowerCase().replace(/[_\s]+/g,' ').trim();
+  return specialOrphanCategories.has(category);
+}
 function candidateCards() {
   if(!deorphanizePage)return;
   const request=++cardRequestVersion;cardController.abort();cardController=new AbortController();
   const records=data.link_candidates||{};
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
   const orphans=data.pages.filter(p=>p.orphan);
-  const sorted=orphans.filter(p=>p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category));
+  $('candidate-hide-special')!.setAttribute('aria-pressed',String(hideSpecialOrphans));
+  const sorted=orphans.filter(p=>(!hideSpecialOrphans||!specialOrphanCategory(p))&&
+    p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category));
   const order=$('candidate-sort')!.value||'candidates-desc';
   if(order==='personalized'&&profileScores) {
     const counts=(page: PageObservation)=>records[pageKey(page)]?.candidate_count??0;
@@ -2057,6 +2076,9 @@ $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.l
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
+$('candidate-hide-special')?.addEventListener('click',()=>{
+  hideSpecialOrphans=!hideSpecialOrphans;candidateLimit=25;if(data)candidateCards();
+});
 $('auth-menu')?.addEventListener('keydown',event=>{
   if(event.key==='Escape') {event.preventDefault();$('auth-menu')!.open=false;$('auth-toggle')!.focus();}
 });

@@ -1040,6 +1040,61 @@ async function checkCandidateSorting() {
   }
   console.log('Candidate sorting: ascending/descending counts, ties, zero and missing data passed.');
 }
+async function checkSpecialOrphanFilter() {
+  const raw=fixture(),template=required(raw.pages.find(page=>page.orphan));
+  raw.metadata.demo=false;
+  const excluded=['Disambigua','Disanbìgue','Pagine di disambiguazione','  INSIEMI_DI_CARATTERI  ',
+    'Disambiguation pages','Homonymie','Pàgines de desambiguació','Páginas de desambiguação','Jeux de caractères',
+    'Regístar da pàgin da desambiguazziun'];
+  const visible=Array.from({length:30},(_,i)=>({...template,page_id:i+1,title:`Regular ${String(i+1).padStart(2,'0')}`,
+    category:i===0?null:i===1?'Disambiguazione linguistica':'Musica'}));
+  // Titles and model topics must never substitute for the displayed category.
+  visible[2].title='Disambigua';visible[3].title='Insiemi di caratteri';
+  visible[4].topic_labels=['STEM.Computing'];
+  const hidden=excluded.map((category,i)=>({...template,page_id:100+i,title:`Excluded ${i+1}`,category}));
+  raw.pages=[...visible,...hidden,{...template,page_id:200,title:'Not orphan',orphan:false,category:'Musica'}];
+  raw.link_candidates={};
+  const original=JSON.stringify(raw),columns=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'];
+  const index: CardIndexFixture={format:'orphan_cards_v2',metadata:raw.metadata,census_page_count:raw.pages.length,
+    card_identity:'a'.repeat(64),columns,rows:raw.pages.filter(page=>page.orphan).map(page=>columns.map(key=>page[key]??null)),link_candidates:{}};
+  const legacy={format:'orphan_cards_v1',metadata:raw.metadata,census_page_count:raw.pages.length,
+    pages:raw.pages.filter(page=>page.orphan),link_candidates:{}};
+  const entry: ManifestEntry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:raw.metadata.demo};
+  const files={'fixture.json':raw,'cards.json':index,'legacy-cards.json':legacy};
+  for(const transport of [entry,{...entry,cards_file:'legacy-cards.json'},
+    {...entry,cards_file:'cards.json',cards_dir:'card-records'}]) {
+    const result=await harness('deorphanize',raw,'?dataset=fixture.json',[transport],{},files),{nodes,html}=result;
+    const toggle=nodes['candidate-hide-special'];
+    const titles=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
+    assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hide-special"[^>]*aria-pressed="true"/);
+    assert.equal(toggle.getAttribute('aria-pressed'),'true');
+    assert.match(nodes['candidate-info'].textContent,/30 orfane/);
+    assert.equal(titles().length,25);assert(!titles().some(title=>title.startsWith('Excluded')));
+    nodes['candidate-more'].listeners.click();assert.equal(titles().length,30);
+    assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));
+    toggle.listeners.click();assert.equal(toggle.getAttribute('aria-pressed'),'false');
+    assert.equal(titles().length,25);assert.match(nodes['candidate-info'].textContent,/40 orfane/);
+    nodes['candidate-search'].value='Excluded';nodes['candidate-search'].listeners.input();
+    assert.equal(titles().length,excluded.length);
+    toggle.listeners.click();assert.equal(titles().length,0);assert.equal(nodes['candidate-more'].hidden,true);
+    assert.equal(nodes['candidate-cards'].children[0].textContent,'Nessuna voce orfana corrispondente.');
+    nodes['candidate-search'].value='';nodes['candidate-search'].listeners.input();
+    nodes['candidate-category'].value='insiemi';nodes['candidate-category'].listeners.input();assert.equal(titles().length,0);
+    toggle.listeners.click();assert.deepEqual(titles(),['Excluded 4']);
+    nodes['candidate-sort'].value='candidates-asc';nodes['candidate-sort'].listeners.input();
+    assert.equal(toggle.getAttribute('aria-pressed'),'false');assert.deepEqual(titles(),['Excluded 4']);
+    nodes['ui-language-toggle'].listeners.click();
+    assert.equal(toggle.textContent,'Hide disambiguation pages and character sets');
+    assert.equal(toggle.title,'Filter based on the displayed category.');
+    assert.equal(toggle.getAttribute('aria-pressed'),'false');
+    assert(!result.requests.some(request=>request.url.startsWith('https://')||request.url.startsWith('data/card-records/')));
+  }
+  const articles=await harness('articles',raw);
+  articles.nodes['article-search'].value='Excluded';articles.nodes['article-search'].listeners.input();
+  assert.equal(articles.nodes['article-rows'].children.length,excluded.length);
+  assert.equal(JSON.stringify(raw),original);
+  console.log('Special orphan filter: active by default, reversible, category-only, canonical/legacy/index parity, pagination, combined controls and translations passed.');
+}
 async function checkConnections() {
   const raw=fixture();
   raw.metadata.demo=false;
@@ -2775,4 +2830,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkSpecialOrphanFilter();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

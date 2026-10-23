@@ -538,6 +538,20 @@ body[data-page="connections"] #connection-copy-prompt {
   padding: 6px 8px;
 }
 
+#candidate-hide-special {
+  padding: 6px 8px;
+  font-size: .85rem;
+}
+
+#candidate-hide-special[aria-pressed="true"] {
+  background: var(--teal);
+  color: var(--surface);
+}
+
+#candidate-hide-special[aria-pressed="true"]::before {
+  content: '✓ ';
+}
+
 .table-scroll {
   overflow-x: auto;
 }
