@@ -5,12 +5,14 @@
   "scripts": {
     "build": "node scripts/build-web.ts",
     "check": "tsc --noEmit && tsc -p tsconfig.node.json",
-    "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --bin orphanwiki && npm run build && node tests/web/dashboard.ts"
+    "test": "sh scripts/prepare-fasttext.sh && cargo build --locked --bin orphanwiki && npm run build && node tests/web/dashboard.ts",
+    "test:browser": "playwright test --config tests/web/playwright.config.ts"
   },
   "engines": {
     "node": ">=22.18.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@types/node": "22.20.1",
     "typescript": "6.0.3"
   }

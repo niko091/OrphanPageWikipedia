@@ -10,6 +10,8 @@ node_modules/
 web/assets/
 /web/orphanwiki-refresh-*/
 /benchmarks/
+/test-results/
+/playwright-report/
 /AGENTS.md
 .env
 .env.*

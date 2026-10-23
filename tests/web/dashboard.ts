@@ -1889,6 +1889,15 @@ async function checkCardIndex() {
   const snapshot=(result: Awaited<ReturnType<typeof harness>>)=>cards(result).map(card=>[titleLink(card).textContent,findClass(card,'candidate-badge').textContent,
     findClass(card,'connect-button').href,findClass(card,'fix-link').getAttribute('aria-disabled')??false]);
   assert.deepEqual(snapshot(next),snapshot(old));assert.equal(maximum,4);
+  const missingTopics=structuredClone(files);
+  const missingCard=cardRecord(missingTopics['card-records/2.json']);
+  delete missingCard.page.topic_status;delete missingCard.page.topic_labels;
+  const missingIndex=missingTopics['card-index.json'];assert(isRecord(missingIndex)&&Array.isArray(missingIndex.rows));
+  const missingRow: unknown=missingIndex.rows[1];assert(Array.isArray(missingRow));
+  missingRow[columns.indexOf('topic_status')]=null;missingRow[columns.indexOf('topic_labels')]=null;
+  const unavailable=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{reviewStore:reviews},missingTopics);
+  assert.equal(findClass(cards(unavailable)[0],'fix-link').getAttribute('aria-disabled'),undefined);
+  assert(!unavailable.requests.some(request=>request.url.startsWith('https://')));
   const firstRequests=next.requests.filter(request=>request.url.startsWith('data/card-records/'));
   assert.equal(firstRequests.length,25);
   assert.deepEqual(firstRequests.map(request=>Number(required(request.url.match(/(\d+)\.json$/))[1])).sort((a,b)=>a-b),Array.from({length:25},(_,i)=>i+2));
@@ -1961,6 +1970,7 @@ async function checkCardIndex() {
   assert.equal(evaluate('data.metadata.language',next.context),'lmo');
   assert(cards(next).every(card=>findClass(card,'connect-button').href.includes('dataset=lmo.json')));
   for(const mutate of [(card: OrphanCardRecord)=>card.card_identity='b'.repeat(64),(card: OrphanCardRecord)=>card.page.title='wrong',
+    (card: OrphanCardRecord)=>{delete card.page.topic_status;delete card.page.topic_labels;},
     (card: OrphanCardRecord)=>required(card.candidate_record.candidates).pop(),(card: OrphanCardRecord)=>required(required(card.candidate_record.candidates)[0].evidence)[0].language='vec']) {
     const bad=structuredClone(cardRecord(files['card-records/2.json']));mutate(bad);
     const result=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{reviewStore:reviews}, {...files,'card-records/2.json':bad});

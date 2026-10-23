@@ -1578,7 +1578,7 @@ async function hydrateVisibleCards(requests: VisibleCardRequest[],request: numbe
         if(payload.format!=='orphan_card_v1'||payload.card_identity!==transport.identity||
           payload.census_page_count!==transport.census_page_count||fullPage.page_id!==page.page_id||
           fullPage.title!==page.title||fullPage.orphan!==true||
-          canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>fullPage[key]))!==canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>page[key]))||
+          canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>fullPage[key]??null))!==canonicalJSON(ARTICLE_INDEX_FIELDS.map(key=>page[key]??null))||
           fullRecord.status!==record.status||fullRecord.candidate_count!==record.candidate_count||
           !Array.isArray(fullRecord.candidates))throw new Error('Osservazioni compatte non valide');
         const candidates: unknown[]=fullRecord.candidates;

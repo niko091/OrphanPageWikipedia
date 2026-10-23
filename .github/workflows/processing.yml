@@ -1,15 +1,18 @@
-name: Tests
+name: Elaborazione
 
 'on':
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  ubuntu:
+  processing:
+    name: Elaborazione
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     services:
       mariadb:
         image: mariadb:11.4@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
@@ -24,11 +27,7 @@ jobs:
     env:
       ORPHANWIKI_TEST_MYSQL_URL: mysql://root:orphanwiki-local-test@127.0.0.1:3306/orphanwiki_test
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: npm
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check repository sources
         run: |
           if [ -n "$(git ls-files -- data web/data web/assets)" ]; then
@@ -43,26 +42,20 @@ jobs:
             echo 'A contributor-specific absolute path was found.' >&2
             exit 1
           fi
-      - name: Install Rust components and WebAssembly target
-        run: |
-          rustup component add clippy rustfmt
-          rustup target add wasm32-unknown-unknown
+      - name: Install Rust components
+        run: rustup component add clippy rustfmt
       - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev pkg-config g++ curl tar
-          cargo install wasm-bindgen-cli --version 0.2.105 --locked
-          npm ci
-      - name: Check Rust
-        run: |
           sh scripts/prepare-fasttext.sh
-          cargo fmt --check
-          cargo test --locked
-          cargo test --locked --no-default-features
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test native pipeline and editorial databases
+        run: cargo test --locked
+      - name: Test core without CLI
+        run: cargo test --locked --no-default-features
+      - name: Lint Rust
+        run: |
           cargo clippy --locked --all-targets -- -D warnings
           cargo clippy --locked --no-default-features --all-targets -- -D warnings
-          cargo clippy --locked --no-default-features --features dashboard --target wasm32-unknown-unknown -- -D warnings
-      - name: Check TypeScript and browser dashboard
-        run: |
-          npm run check
-          npm test

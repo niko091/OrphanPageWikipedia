@@ -11,5 +11,5 @@
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true
   },
-  "files": ["scripts/build-web.ts", "tests/web/dashboard.ts", "web/src/app.ts"]
+  "files": ["scripts/build-web.ts", "tests/web/dashboard.ts", "tests/web/browser.spec.ts", "tests/web/playwright.config.ts", "web/src/app.ts"]
 }

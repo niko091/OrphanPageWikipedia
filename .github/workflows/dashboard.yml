@@ -1,0 +1,49 @@
+name: Dashboard
+
+'on':
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dashboard build tools
+        run: |
+          rustup component add clippy
+          rustup target add wasm32-unknown-unknown
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config g++ curl tar
+          cargo install wasm-bindgen-cli --version 0.2.105 --locked
+          npm ci
+      - name: Check TypeScript
+        run: npm run check
+      - name: Lint WebAssembly boundary
+        run: cargo clippy --locked --no-default-features --features dashboard --target wasm32-unknown-unknown -- -D warnings
+      - name: Build dashboard and test DOM contracts
+        run: npm test
+      - name: Install browser engines
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Test real browsers and local HTTP service
+        run: npm run test:browser
+      - name: Upload browser diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-results
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
