@@ -1,6 +1,7 @@
 {
   "name": "orphanwiki-dashboard",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "node scripts/build-web.ts",
