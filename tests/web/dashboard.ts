@@ -27,6 +27,7 @@ interface FetchOptions {
 interface RecordedRequest extends FetchOptions { url: string; method: string; }
 interface MockResponse { ok: boolean; status?: number; json: () => Promise<unknown>; }
 interface HarnessPreferences {
+  chooseLanguage?: string;
   storage?: Map<string,string>;
   systemDark?: boolean;
   blockStorage?: boolean;
@@ -660,6 +661,9 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
   await nativeReady;
   evaluate(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
   await evaluate('dashboardReady',context);
+  if(preferences.chooseLanguage) {
+    nodes.dataset.value=preferences.chooseLanguage;await nodes.dataset.listeners.change();
+  }
   return {nodes,context,html,staticNodes,storage,media,document,copied,requests,authRequests,navigations,getFetchCount:()=>fetchCount};
 }
 async function checkFreshResources() {
@@ -970,6 +974,82 @@ async function checkDatasetSelection() {
   assert.match(invalid.nodes.status.textContent,/Nessuna raccolta reale/);
   console.log('Dataset selection: demos excluded, newest real collection selected, empty state passed.');
 }
+async function checkProgressiveCandidates() {
+  const raw=fixture(),summary=fixtureTransport('summary_file');
+  raw.metadata.demo=false;summary.metadata=structuredClone(raw.metadata);
+  const lmo=structuredClone(raw);lmo.metadata.language='lmo';
+  lmo.metadata.creators.language='lmo';lmo.metadata.creators.languages_scanned=['lmo'];
+  const lmoSummary=structuredClone(summary);lmoSummary.metadata=structuredClone(lmo.metadata);
+  const index={metadata:{kind:'aggregate',language:'all',languages:['vec','lmo'],complete:true,demo:false,
+    started_at:raw.metadata.started_at,finished_at:raw.metadata.finished_at},members:[
+      {language:'vec',file:'vec.json',page_count:raw.pages.length,metadata:raw.metadata},
+      {language:'lmo',file:'lmo.json',page_count:lmo.pages.length,metadata:lmo.metadata}]};
+  const entries: ManifestEntry[]=[{language:'all',file:'all.json',kind:'aggregate',date:raw.metadata.finished_at},
+    {language:'vec',file:'vec.json',summary_file:'vec-summary.json',date:raw.metadata.finished_at},
+    {language:'lmo',file:'lmo.json',summary_file:'lmo-summary.json',date:lmo.metadata.finished_at}];
+  const files={'all.json':index,'vec.json':raw,'lmo.json':lmo,'vec-summary.json':summary,'lmo-summary.json':lmoSummary};
+  const original=JSON.stringify(files),hold=new Set(['data/vec.json','data/lmo.json']);
+  const pending=new Map<string,{signal:AbortSignal;release:()=>void}>();
+  const beforeFetch=async(url: string,options: FetchOptions)=>{
+    if(!hold.has(url))return;
+    await new Promise<void>((resolve,reject)=>{
+      const signal=required(options.signal);
+      pending.set(url,{signal,release:()=>{hold.delete(url);resolve();}});
+      signal.addEventListener('abort',()=>{hold.delete(url);reject(new Error('aborted'));},{once:true});
+    });
+  };
+  const result=await harness('deorphanize',index,'?dataset=all.json',entries,{beforeFetch},files),{nodes,context,document}=result;
+  const cards=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card');
+  assert.equal(nodes.dataset.value,'');assert.equal(nodes.dataset.children[0].textContent,'Seleziona');
+  assert.match(nodes.status.textContent,/Seleziona una lingua/);
+  assert.equal(nodes['dataset-date'].disabled,true);assert.equal(nodes['profile-apply'].disabled,true);
+  assert.equal(cards().length,0);
+  await evaluate('Promise.all(candidatePreviews.values())',context);
+  assert.deepEqual(result.requests.filter(row=>row.url.startsWith('data/')).map(row=>row.url).sort(),
+    ['data/manifest.json','data/lmo-summary.json','data/vec-summary.json'].sort());
+  nodes.dataset.value='vec';const first=nodes.dataset.listeners.change();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(document.body.dataset.loading,'false');assert.equal(cards().length,25);
+  assert.match(nodes['candidate-info'].textContent,/Anteprima: 25/);
+  assert.match(nodes.status.textContent,/Caricamento dell’elenco completo/);
+  assert.equal(nodes['candidate-more'].hidden,true);
+  assert(cards().every(card=>findClass(card,'candidate-badge').textContent==='…'));
+  assert(cards().every(card=>findClass(card,'fix-link').getAttribute('aria-disabled')==='true'));
+  assert.equal(result.requests.filter(row=>row.url==='data/vec-summary.json').length,1);
+  assert(!result.requests.some(row=>row.url.startsWith('https://')));
+  const target=required(raw.pages.find(page=>page.orphan&& !summary.article_preview?.some(preview=>preview.page_id===page.page_id)));
+  nodes['candidate-search'].value=target.title;nodes['candidate-search'].listeners.input();
+  assert.match(nodes['candidate-info'].textContent,/Anteprima/);
+  required(pending.get('data/vec.json')).release();await first;
+  assert.equal(evaluate('candidatePreview',context),false);
+  assert.equal(nodes['candidate-search'].value,target.title);
+  assert(cards().some(card=>titleLink(card).textContent===target.title));
+  assert(!nodes['candidate-info'].textContent.includes('Anteprima'));
+  assert.equal(nodes['profile-apply'].disabled,false);
+  nodes.dataset.value='lmo';const stale=nodes.dataset.listeners.change();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(cards().length,25);assert.equal(evaluate('data.metadata.language',context),'lmo');
+  assert(cards().every(card=>findClass(card,'connect-button').href.includes('dataset=lmo.json')));
+  const previous=required(pending.get('data/lmo.json'));
+  nodes.dataset.value='vec';await nodes.dataset.listeners.change();await stale;
+  assert(previous.signal.aborted);assert.equal(evaluate('data.metadata.language',context),'vec');
+  assert(!nodes.status.textContent.includes('Impossibile'));
+  assert.equal(result.requests.filter(row=>row.url.endsWith('-summary.json')).length,2);
+  nodes.dataset.value='';await nodes.dataset.listeners.change();
+  assert.equal(cards().length,0);assert.equal(document.body.dataset.loading,'true');
+  nodes['ui-language-toggle'].listeners.click();
+  assert.equal(nodes.dataset.children[0].textContent,'Select');assert.match(nodes.status.textContent,/Select a language/);
+  nodes.dataset.value='all';await nodes.dataset.listeners.change();
+  assert.equal(evaluate('data.pages.length',context),raw.pages.length*2);
+  assert.equal(document.body.dataset.loading,'false');
+  assert(cards().every(card=>findClass(card,'connect-button').href.includes('language=')));
+  const staleSummary=structuredClone(summary);staleSummary.metadata.finished_at='stale';
+  const fallback=await harness('deorphanize',raw,'?dataset=vec.json',[entries[1]],{}, {...files,'vec-summary.json':staleSummary});
+  assert.equal(fallback.document.body.dataset.loading,'false');
+  assert.equal(evaluate('candidatePreview',fallback.context),false);
+  assert.equal(JSON.stringify(files),original);
+  console.log('Progressive orphan cards: aggregate entry opens Select, two bounded preview preloads, immediate per-language cards, preserved search, full replacement, abort on switch, explicit aggregate and stale-preview fallback passed.');
+}
 async function checkCompactLists() {
   const raw=fixture(),template=raw.pages[0];
   raw.pages=Array.from({length:32},(_,i)=>({...template,page_id:i+1,title:`Title ${i}`,creator_key:`local:actor:${i}`,orphan:i%2===0,creator_articles_created_total:i===0?null:i}));
@@ -1066,13 +1146,15 @@ async function checkSpecialOrphanFilter() {
     const result=await harness('deorphanize',raw,'?dataset=fixture.json',[transport],{},files),{nodes,html}=result;
     const toggle=nodes['candidate-hide-special'];
     const titles=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
-    assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hide-special"[^>]*aria-pressed="true"/);
-    assert.equal(toggle.getAttribute('aria-pressed'),'true');
+    assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hide-special"[^>]*aria-pressed="false"/);
+    assert(!html.includes('Gli interessi usano'));
+    assert.equal(nodes['review-service-status'].textContent,'');
+    assert.equal(toggle.getAttribute('aria-pressed'),'false');
     assert.match(nodes['candidate-info'].textContent,/30 orfane/);
     assert.equal(titles().length,25);assert(!titles().some(title=>title.startsWith('Excluded')));
     nodes['candidate-more'].listeners.click();assert.equal(titles().length,30);
     assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));
-    toggle.listeners.click();assert.equal(toggle.getAttribute('aria-pressed'),'false');
+    toggle.listeners.click();assert.equal(toggle.getAttribute('aria-pressed'),'true');
     assert.equal(titles().length,25);assert.match(nodes['candidate-info'].textContent,/40 orfane/);
     nodes['candidate-search'].value='Excluded';nodes['candidate-search'].listeners.input();
     assert.equal(titles().length,excluded.length);
@@ -1082,18 +1164,18 @@ async function checkSpecialOrphanFilter() {
     nodes['candidate-category'].value='insiemi';nodes['candidate-category'].listeners.input();assert.equal(titles().length,0);
     toggle.listeners.click();assert.deepEqual(titles(),['Excluded 4']);
     nodes['candidate-sort'].value='candidates-asc';nodes['candidate-sort'].listeners.input();
-    assert.equal(toggle.getAttribute('aria-pressed'),'false');assert.deepEqual(titles(),['Excluded 4']);
+    assert.equal(toggle.getAttribute('aria-pressed'),'true');assert.deepEqual(titles(),['Excluded 4']);
     nodes['ui-language-toggle'].listeners.click();
-    assert.equal(toggle.textContent,'Hide disambiguation pages and character sets');
+    assert.equal(toggle.textContent,'Show disambiguation pages');
     assert.equal(toggle.title,'Filter based on the displayed category.');
-    assert.equal(toggle.getAttribute('aria-pressed'),'false');
+    assert.equal(toggle.getAttribute('aria-pressed'),'true');
     assert(!result.requests.some(request=>request.url.startsWith('https://')||request.url.startsWith('data/card-records/')));
   }
   const articles=await harness('articles',raw);
   articles.nodes['article-search'].value='Excluded';articles.nodes['article-search'].listeners.input();
   assert.equal(articles.nodes['article-rows'].children.length,excluded.length);
   assert.equal(JSON.stringify(raw),original);
-  console.log('Special orphan filter: active by default, reversible, category-only, canonical/legacy/index parity, pagination, combined controls and translations passed.');
+  console.log('Show special orphans: off by default, reversible, category-only, canonical/legacy/index parity, pagination, combined controls and translations passed.');
 }
 async function checkConnections() {
   const raw=fixture();
@@ -1599,7 +1681,7 @@ async function checkAggregation() {
   const files={'all.json':index,'vec.json':a,'lmo.json':b};
   for(const page of ['articles','creators','deorphanize','connections']) {
     const route='?dataset=all.json'+(page==='connections'?'&page=1&language=vec':'');
-    const result=await harness(page,index,route,entries,{},files),{nodes,context}=result;
+    const result=await harness(page,index,route,entries,page==='deorphanize'?{chooseLanguage:'all'}:{},files),{nodes,context}=result;
     assert(!nodes.status.textContent.includes('Impossibile caricare'),nodes.status.textContent);
     assert.equal(result.requests.filter(request=>request.url.startsWith('data/')).length,4);
     assert(result.requests.every(request=>request.cache==='no-store'));
@@ -1637,7 +1719,7 @@ async function checkAggregation() {
       assert(prompt.includes('https://vec.wikipedia.org/wiki/'));assert(!prompt.includes('https://all.wikipedia.org'));
     }
     nodes['ui-language-toggle'].listeners.click();
-    if(nodes.dataset)assert.equal(nodes.dataset.children[0].textContent,'All languages');
+    if(nodes.dataset)assert.equal(nodes.dataset.children[0].textContent,page==='deorphanize'?'Select':'All languages');
     assert(!nodes.source);
   }
   let result=await harness('connections',index,'?dataset=all.json&page=1',entries,{},files);
@@ -1772,7 +1854,7 @@ async function checkEditorialTransports() {
   files['all.json']=index;
   entries.unshift({language:'all',file:'all.json',date:index.metadata.finished_at,kind:'aggregate'});
   const before=JSON.stringify(files);
-  const all=await harness('deorphanize',index,'?dataset=all.json',entries,{},files);
+  const all=await harness('deorphanize',index,'?dataset=all.json',entries,{chooseLanguage:'all'},files);
   assert.equal(all.document.body.dataset.loading,'false',all.nodes.status.textContent);
   assert.equal(all.nodes['candidate-cards'].children.length,11);
   const allData=all.requests.filter(request=>request.url.startsWith('data/'));
@@ -1809,7 +1891,7 @@ async function checkEditorialTransports() {
   ]) {
     const bad=structuredClone(files),card=bad['pms-cards.json'];
     assert(isFixture(card));mutation(card);
-    const invalid=await harness('deorphanize',index,'?dataset=all.json',entries,{},bad);
+    const invalid=await harness('deorphanize',index,'?dataset=all.json',entries,{chooseLanguage:'all'},bad);
     assert.match(invalid.nodes.status.textContent,/Impossibile caricare/);
     assert.equal(invalid.document.body.dataset.loading,'true');
   }
@@ -2013,8 +2095,8 @@ async function checkCardIndex() {
       {language:'lmo',file:'lmo.json',page_count:raw.pages.length,metadata:lmoMetadata}]};
   files['all.json']=aggregate;
   const allEntry={language:'all',file:'all.json',date:raw.metadata.finished_at,kind:'aggregate'};
-  const oldAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,legacyEntry,lmoLegacyEntry],{reviewStore:reviews},files);
-  const newAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,entry,lmoEntry],{reviewStore:reviews,beforeFetch},files);
+  const oldAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,legacyEntry,lmoLegacyEntry],{reviewStore:reviews,chooseLanguage:'all'},files);
+  const newAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,entry,lmoEntry],{reviewStore:reviews,beforeFetch,chooseLanguage:'all'},files);
   assert.deepEqual(snapshot(newAll),snapshot(oldAll));
   assert.equal(newAll.requests.filter(request=>/^data\/(?:lmo-)?card-records\//.test(request.url)).length,25);assert(maximum<=4);
   assert(!newAll.requests.some(request=>request.url==='data/fixture.json'||request.url==='data/lmo.json'));
@@ -2830,4 +2912,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkSpecialOrphanFilter();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkSpecialOrphanFilter();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

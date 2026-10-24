@@ -252,6 +252,8 @@ const creatorsPage = document.body.dataset.page === 'creators';
 const connectionsPage = document.body.dataset.page === 'connections';
 const deorphanizePage = document.body.dataset.page === 'deorphanize';
 const translations: Record<string, string> = {
+  "Chi crea le pagine orfane": "Who creates the Orphan pages",
+  "studio di riferimento": "reference study",
   "De-orfanizzare le pagine": "De-orphan articles",
   "{label}: dato non disponibile; copertura {known}/{population}.": "{label}: unavailable data; coverage {known}/{population}.",
   "{label}: Nessuna voce soddisfa questo requisito; percentuale non definita. Copertura {known}/{population}.": "{label}: No articles meet this feature; percentage undefined. Coverage {known}/{population}.",
@@ -308,13 +310,17 @@ const translations: Record<string, string> = {
   "Copia automatica non disponibile. Seleziona il testo e copialo manualmente.": "Automatic copying is unavailable. Select the text and copy it manually.",
   "Nessuna pagina candidata disponibile per preparare il prompt.": "No candidate pages are available to prepare the prompt.",
   "Tutte le lingue": "All languages",
+  "Seleziona": "Select",
+  "Seleziona una lingua per visualizzare le voci orfane.": "Select a language to view orphan articles.",
+  "Caricamento dell’elenco completo delle voci orfane…": "Loading the complete list of orphan articles…",
+  "Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.": "Preview: {shown} cards shown. The remaining articles are loading.",
+  "Caricamento dei collegamenti…": "Loading connections…",
   "Scarica l’indice delle raccolte JSON": "Download the dataset index as JSON",
   "Indice aggregato non valido": "Invalid aggregate index",
   "Interfaccia italiana: passa all’inglese": "Italian interface: switch to English",
   "Interfaccia inglese: passa all’italiano": "English interface: switch to Italian",
   "Modalità chiara: passa alla modalità scura": "Light mode: switch to dark mode",
   "Modalità scura: passa alla modalità chiara": "Dark mode: switch to light mode",
-  "Categorie, età e lunghezza delle voci senza collegamenti entranti.": "Categories, age and length of articles with no incoming links.",
   "Analisi delle voci": "Article analysis",
   "Pagine di analisi": "Analysis pages",
   "Lingua di Wikipedia": "Wikipedia language",
@@ -375,7 +381,6 @@ const translations: Record<string, string> = {
   "Anteprima: {shown} di {total} voci orfane.": "Preview: {shown} of {total} orphan articles.",
   "Anteprima non disponibile per questa raccolta. Mostra altre 25 voci per caricare l’elenco.": "Preview unavailable for this collection. Show 25 more articles to load the list.",
   "Caricamento dell’elenco completo delle voci…": "Loading the complete article list…",
-  "Studio di riferimento": "Reference study",
   "Analisi descrittiva": "Descriptive analysis",
   "Provenienza delle voci ed esperienza dei loro creatori.": "Article origins and creator experience.",
   "Dati sui creatori non disponibili per questa raccolta.": "Creator data are unavailable for this dataset.",
@@ -420,7 +425,7 @@ const translations: Record<string, string> = {
   "Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.": "Select Connect to see candidate pages and existing links in other languages. Each proposal requires a content review.",
   "Cerca una voce orfana": "Search orphan articles",
   "Cerca una categoria…": "Search categories…",
-  "Nascondi disambigue e insiemi di caratteri": "Hide disambiguation pages and character sets",
+  "Mostra pagine di disambiguazione": "Show disambiguation pages",
   "Filtro basato sulla categoria visualizzata.": "Filter based on the displayed category.",
   "Mostra altre 25 schede": "Show 25 more cards",
   "Valuta le coppie di pagine": "Review candidate page pairs",
@@ -453,7 +458,6 @@ const translations: Record<string, string> = {
   "Personalizza le proposte": "Personalize suggestions",
   "Affinità con i miei temi": "Affinity with my topics",
   "Caricamento delle ultime 100 modifiche…": "Loading the last 100 edits…",
-  "Gli interessi usano l’ultima raccolta disponibile di ogni Wikipedia; le proposte restano nella raccolta selezionata.": "Interests use the latest available collection of each Wikipedia; suggestions stay within the selected collection.",
   "Profilo: {edits} modifiche in tutte le Wikipedie; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.": "Profile: {edits} edits across all Wikipedias; usable topics for {known}, in languages {languages}. Other edits remain without usable topics. Sources: latest available collections per language.",
   "Personalizzazione non disponibile: {error}": "Personalization unavailable: {error}",
   "Nessuna delle ultime 100 modifiche a voci ha temi utilizzabili nelle ultime raccolte disponibili delle Wikipedie interessate.": "None of the last 100 edits to articles has usable topics in the latest available collections of the relevant Wikipedias.",
@@ -596,6 +600,11 @@ function applyTranslations() {
   applyTheme();
   for(const node of document.querySelectorAll<HTMLElement>('[data-i18n]'))node.textContent=t(node.dataset.i18n!);
   for(const attr of ['placeholder','aria-label','title'])for(const node of document.querySelectorAll(`[data-i18n-${attr}]`))node.setAttribute(attr,t(node.getAttribute('data-i18n-'+attr)!));
+  if(deorphanizePage&&$('dataset'))for(const option of $('dataset')!.children) {
+    if((option as HTMLOptionElement).value==='')option.textContent=t('Seleziona');
+    if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
+  }
+  if(deorphanizePage&&datasetEntries.length&&$('dataset')!.value==='')$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
 }
 const number = (value: number | null | undefined) => value == null ? '—' : new Intl.NumberFormat(locale(), {maximumFractionDigits: 1}).format(value);
 const pageLanguage = (row: PageObservation) => row.language || data.metadata.language;
@@ -611,7 +620,10 @@ const attributedCreatorKey = (row: PageObservation) => {
 };
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, candidateLimit = 25, connectionLimit = 50, articleLimit = 25, creatorLimit = 25, creatorRows: CreatorRow[] = [];
-let hideSpecialOrphans = true;
+let showSpecialOrphans = false;
+let candidatePreview = false;
+let datasetController = new AbortController();
+const candidatePreviews = new Map<string, Promise<Dataset | null>>();
 let precomputed: DashboardSummaryData | null = null, precomputedCreators: CreatorRow[] | null = null;
 let summaryOnly = false, articleListLoading = false;
 let profileRequestVersion = 0;
@@ -896,6 +908,7 @@ async function scoreProfile(edits: RecentEdit[], version: number) {
     {edits:number(report.total_edits),known:number(report.known_topic_edits),languages:languages.map(language=>language.toUpperCase()).join(', ')});
 }
 async function applyProfile() {
+  if(deorphanizePage&&(!$('dataset')!.value||candidatePreview||document.body.dataset.loading==='true'))return;
   const version=++profileRequestVersion;
   profileController.abort();profileController=new AbortController();profileTopicCache.clear();
   const button=$('profile-apply')!;button.disabled=true;
@@ -1273,7 +1286,7 @@ async function loadSharedReviews(): Promise<void> {
     const reviews=await readReviews(file);
     if(version!==loadVersion||file!==datasetFile||request!==reviewReadVersion)return;
     editorialReviews=reviews;reviewsAvailable=true;
-    $('review-service-status')!.textContent=t('Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.');
+    $('review-service-status')!.textContent=deorphanizePage?'':t('Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.');
   } catch {
     if(version!==loadVersion||file!==datasetFile||request!==reviewReadVersion)return;
     reviewsAvailable=false;
@@ -1618,13 +1631,13 @@ function specialOrphanCategory(page: PageObservation): boolean {
   return specialOrphanCategories.has(category);
 }
 function candidateCards() {
-  if(!deorphanizePage)return;
+  if(!deorphanizePage||$('dataset')!.value==='')return;
   const request=++cardRequestVersion;cardController.abort();cardController=new AbortController();
-  const records=data.link_candidates||{};
+  const records=candidatePreview?{}:data.link_candidates||{};
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
   const orphans=data.pages.filter(p=>p.orphan);
-  $('candidate-hide-special')!.setAttribute('aria-pressed',String(hideSpecialOrphans));
-  const sorted=orphans.filter(p=>(!hideSpecialOrphans||!specialOrphanCategory(p))&&
+  $('candidate-hide-special')!.setAttribute('aria-pressed',String(showSpecialOrphans));
+  const sorted=orphans.filter(p=>(showSpecialOrphans||!specialOrphanCategory(p))&&
     p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category));
   const order=$('candidate-sort')!.value||'candidates-desc';
   if(order==='personalized'&&profileScores) {
@@ -1636,7 +1649,9 @@ function candidateCards() {
     });
   } else sortArticles(sorted,order==='personalized'?'candidates-desc':order);
   sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
-  $('candidate-info')!.textContent=t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
+  $('candidate-info')!.textContent=candidatePreview?
+    t('Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.',{shown:number(Math.min(candidateLimit,sorted.length))}):
+    t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
   const box=$('candidate-cards')!;box.replaceChildren();
   const visible=sorted.slice(0,candidateLimit),keys=new Set(visible.map(pageKey)),pending: VisibleCardRequest[]=[];
   for(const [key,record] of Object.entries(records))if(record?.candidate_ids&&!keys.has(key))delete record.candidates;
@@ -1644,8 +1659,8 @@ function candidateCards() {
     const record=records[pageKey(page)],count=record?.candidate_count;
     const card=element('article',null,'candidate-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');
-    header.append(cardTitle('h3',page.title,pageLanguage(page)),element('span',count==null?'—':number(count),'candidate-badge'));
-    body.append(header,element('p',label(page),'candidate-category'),element('p',count==null?t('Dati non disponibili'):t('{n} pagine candidate',{n:number(count)}),'candidate-hint'));
+    header.append(cardTitle('h3',page.title,pageLanguage(page)),element('span',candidatePreview?'…':count==null?'—':number(count),'candidate-badge'));
+    body.append(header,element('p',label(page),'candidate-category'),element('p',candidatePreview?t('Caricamento dei collegamenti…'):count==null?t('Dati non disponibili'):t('{n} pagine candidate',{n:number(count)}),'candidate-hint'));
     const reviewed=(record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[]).filter(id=>closedEdge(page,id)).length;
     if(reviewed)body.append(element('p',t('{n} coppie segnate come Fixato o Bad link, escluse dai prompt.',{n:number(reviewed)}),'candidate-hint'));
     const footer=element('div',null,'candidate-footer'),connect=element('a',t('Connetti'),'connect-button');
@@ -1658,8 +1673,8 @@ function candidateCards() {
       pending.push({page,record,footer,connect});
     }
   }
-  if(!sorted.length)box.append(element('p',t('Nessuna voce orfana corrispondente.')));
-  $('candidate-more')!.hidden=candidateLimit>=sorted.length;
+  if(!sorted.length)box.append(element('p',t(candidatePreview?'Caricamento dell’elenco completo delle voci orfane…':'Nessuna voce orfana corrispondente.')));
+  $('candidate-more')!.hidden=candidatePreview||candidateLimit>=sorted.length;
   cardHydration=hydrateVisibleCards(pending,request,cardController.signal);
 }
 function renderConnections() {
@@ -1725,11 +1740,11 @@ function unpackObservations(next: CompactObservations, expectedFormat: 'observat
   });
   return {format:next.format,metadata:next.metadata,pages,census_page_count:next.census_page_count,link_candidates:next.link_candidates||{}};
 }
-async function readConnectionMetadata(entry: ManifestEntry): Promise<ConnectionMetadata | null> {
+async function readConnectionMetadata(entry: ManifestEntry,signal?: AbortSignal): Promise<ConnectionMetadata | null> {
   const filename=entry.connections_metadata_file;
   if(filename===undefined)return null;
   if(typeof filename!=='string'||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome dataset non valido');
-  const response=await fetch('data/'+filename,{cache:'no-store'});
+  const response=await fetch('data/'+filename,{cache:'no-store',signal});
   if(!response.ok)throw new Error('Dataset non disponibile');
   const shared=await response.json() as ConnectionMetadata;
   if(shared?.format!=='connections_metadata_v1'||typeof shared.connection_identity!=='string'||!/^[a-f0-9]{64}$/.test(shared.connection_identity)||
@@ -1738,7 +1753,7 @@ async function readConnectionMetadata(entry: ManifestEntry): Promise<ConnectionM
     throw new Error('Metadati dei collegamenti non validi');
   return shared;
 }
-async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promise<Dataset> {
+async function readDataset(entry: ManifestEntry,forArticleExplorer=false,signal?: AbortSignal): Promise<Dataset> {
   const articleIndex=forArticleExplorer&&!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&entry.articles_file;
   const compact=!deorphanizePage&&!connectionsPage&&entry.kind!=='aggregate'&&(articleIndex||entry.observations_file);
   const cards=deorphanizePage&&entry.kind!=='aggregate'&&entry.cards_file;
@@ -1752,8 +1767,8 @@ async function readDataset(entry: ManifestEntry,forArticleExplorer=false): Promi
     if(!/^[1-9][0-9]*$/.test(pageID||''))throw new Error('Identificativo della pagina non valido');
     filename=`${detail}/${pageID}.json`;
   }
-  const [response,shared]=await Promise.all([fetch('data/'+filename,{cache:'no-store'}),
-    detail?readConnectionMetadata(entry):Promise.resolve(null)]);
+  const [response,shared]=await Promise.all([fetch('data/'+filename,{cache:'no-store',signal}),
+    detail?readConnectionMetadata(entry,signal):Promise.resolve(null)]);
   if(!response.ok)throw new Error('Dataset non disponibile');
   // Legacy canonical exports may exceed the browser's single-string limit.
   // Reject an advertised oversized file before buffering it; never sample it.
@@ -1824,6 +1839,27 @@ async function readSummary(entry: ManifestEntry): Promise<DashboardSummaryData> 
     throw new Error('Riepilogo non valido');
   return summary;
 }
+function readCandidatePreview(entry: ManifestEntry): Promise<Dataset | null> {
+  if(!entry.summary_file)return Promise.resolve(null);
+  const cached=candidatePreviews.get(entry.file);if(cached)return cached;
+  const pending=readSummary(entry).then(summary=>summary.article_preview?
+    {metadata:summary.metadata,pages:summary.article_preview,link_candidates:{}}:null).catch(()=>{
+    candidatePreviews.delete(entry.file);return null;
+  });
+  candidatePreviews.set(entry.file,pending);
+  return pending;
+}
+async function preloadCandidatePreviews(): Promise<void> {
+  const languages=new Set<string>();
+  const entries=datasetEntries.filter(entry=>{
+    if(languages.has(entry.language))return false;
+    languages.add(entry.language);return Boolean(entry.summary_file);
+  });
+  let position=0;
+  await Promise.all(Array.from({length:Math.min(2,entries.length)},async()=>{
+    while(position<entries.length)await readCandidatePreview(entries[position++]);
+  }));
+}
 async function readCreatorIndex(entry: ManifestEntry, summary: DashboardSummaryData): Promise<CreatorRow[]> {
   const filename=entry.creator_index_file;
   if(!filename||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome indice dei creatori non valido');
@@ -1837,7 +1873,7 @@ async function readCreatorIndex(entry: ManifestEntry, summary: DashboardSummaryD
     throw new Error('Indice dei creatori non valido');
   return index.creators;
 }
-async function loadAggregate(index: Dataset,version: number,forArticleExplorer=false): Promise<Dataset | null> {
+async function loadAggregate(index: Dataset,version: number,forArticleExplorer=false,signal?: AbortSignal): Promise<Dataset | null> {
   if(!Array.isArray(index.members)||!index.members.length||index.metadata.language!=='all'||index.metadata.complete!==true||!Array.isArray(index.metadata.languages))throw new Error('Indice aggregato non valido');
   const pooled: Dataset & {link_candidates: Record<string, CandidateRecord>} = {metadata:{...index.metadata},pages:[],link_candidates:{}};
   const languages=new Set<string>(),creatorMetadata: CreatorMetadata[] = [],historyMetadata: HistoryMetadata[] = [];
@@ -1856,7 +1892,7 @@ async function loadAggregate(index: Dataset,version: number,forArticleExplorer=f
     if(focused&&member.language!==targetLanguage)continue;
     if(version!==loadVersion)return null;
     $('status')!.textContent=t('Caricamento {language}: {current}/{total} lingue…',{language:member.language.toUpperCase(),current:position+1,total:index.members.length});
-    const wiki=await readDataset(entry,forArticleExplorer);if(version!==loadVersion)return null;validateDataset(wiki);
+    const wiki=await readDataset(entry,forArticleExplorer,signal);if(version!==loadVersion)return null;validateDataset(wiki);
     if(wiki.metadata.language!==member.language||wiki.metadata.complete!==true||Boolean(wiki.metadata.demo)!==Boolean(index.metadata.demo)||canonicalJSON(wiki.metadata)!==canonicalJSON(member.metadata)||(wiki.census_page_count??wiki.pages.length)!==member.page_count)throw new Error('Indice aggregato non valido');
     for(const page of wiki.pages) {
       // Assign identities by local wiki, even when page IDs or actor keys overlap.
@@ -1895,14 +1931,38 @@ function selectedEntry(): ManifestEntry | undefined {
   const date=$('dataset-date')!.value;
   return date==='latest'?choices[0]:choices.find(entry=>entry.date.startsWith(date));
 }
+function datasetLinks(entry: ManifestEntry) {
+  if($('download')){$('download')!.hidden=false;$('download')!.href='data/'+(entry.kind==='aggregate'?entry.file:entry.file.replace(/\.json$/,'.csv'));}
+  $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
+  $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
+  $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
+}
+function clearLanguageSelection() {
+  ++loadVersion;datasetController.abort();
+  ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
+  ++profileRequestVersion;profileController.abort();profileScores=null;
+  closePrompt();candidatePreview=false;lastError=null;
+  document.body.dataset.loading='true';
+  $('dataset-date')!.disabled=true;
+  $('profile-apply')!.disabled=true;
+  $('download')!.hidden=true;
+  $('candidate-cards')!.replaceChildren();$('candidate-info')!.textContent='';
+  $('status')!.hidden=false;$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
+  for(const [id,file] of [['articles-link','index.html'],['creators-link','creators.html'],['deorphanize-link','deorphanize.html']] as const)$(id)!.href=file;
+}
 async function load(entry: ManifestEntry) {
   closePrompt();
   ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
   const version=++loadVersion;
+  datasetController.abort();datasetController=new AbortController();
+  const signal=datasetController.signal;
+  candidatePreview=false;
+  let fullReady=false;
   articleListLoading=false;
   ++profileRequestVersion;profileScores=null;
   profileController.abort();profileController=new AbortController();
-  if($('profile-apply'))$('profile-apply')!.disabled=false;
+  if($('profile-apply'))$('profile-apply')!.disabled=deorphanizePage;
+  if($('dataset-date'))$('dataset-date')!.disabled=false;
   if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
   if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
   connectionCopyRequest=null;
@@ -1910,6 +1970,17 @@ async function load(entry: ManifestEntry) {
   document.body.dataset.loading='true';
   $('status')!.hidden=false;
   $('status')!.textContent=t('Caricamento…');
+  candidateLimit=25;
+  for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
+  if(deorphanizePage)void readCandidatePreview(entry).then(preview=>{
+    if(!preview||fullReady||version!==loadVersion)return;
+    data=preview;datasetFile=entry.file;candidatePreview=true;
+    editorialReviews=new Map();reviewsAvailable=false;
+    datasetLinks(entry);refreshCategoryChoices();
+    document.body.dataset.loading='false';renderDataset();renderAuth();
+  }).catch(()=>{
+    if(version===loadVersion&&!fullReady){candidatePreview=false;document.body.dataset.loading='true';}
+  });
   let next;
   try {
     if(entry.summary_file&&!deorphanizePage&&!connectionsPage) {
@@ -1921,22 +1992,18 @@ async function load(entry: ManifestEntry) {
       precomputed=summary;summaryOnly=true;
     } else {
       precomputed=null;precomputedCreators=null;summaryOnly=false;
-      next=await readDataset(entry);
+      next=await readDataset(entry,false,signal);
       if(version!==loadVersion)return;
-      if(next.metadata?.kind==='aggregate')next=await loadAggregate(next,version);else validateDataset(next);
+      if(next.metadata?.kind==='aggregate')next=await loadAggregate(next,version,false,signal);else validateDataset(next);
     }
     if(version!==loadVersion)return;
   } catch(error) {
-    if(version===loadVersion)throw error;
+    if(version===loadVersion){document.body.dataset.loading='true';throw error;}
     return;
-  }
+  } finally {fullReady=true;}
   if(!next)return;
-  data=next; datasetFile=entry.file; candidateLimit=25; connectionLimit=50; articleLimit=25; creatorLimit=25;
-  for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
-  if($('download'))$('download')!.href='data/'+(entry.kind==='aggregate'?entry.file:entry.file.replace(/\.json$/,'.csv'));
-  $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
-  $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
-  $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
+  data=next; datasetFile=entry.file; connectionLimit=50; articleLimit=25; creatorLimit=25;
+  datasetLinks(entry);
   if(deorphanizePage||connectionsPage) {
     editorialReviews=new Map();reviewsAvailable=false;
     await loadSharedReviews();
@@ -1944,6 +2011,8 @@ async function load(entry: ManifestEntry) {
   }
   refreshCategoryChoices();
   if(creatorsPage)prepareCreators();
+  candidatePreview=false;
+  if($('profile-apply'))$('profile-apply')!.disabled=false;
   lastError=null;
   document.body.dataset.loading='false';
   renderDataset();renderAuth();
@@ -1998,6 +2067,7 @@ function refreshCategoryChoices() {
 }
 function renderDataset() {
   if(document.body.dataset.loading==='true')return;
+  if(deorphanizePage&&$('dataset')!.value==='')return;
   if($('download'))$('download')!.textContent=t(data.metadata.kind==='aggregate'?'Scarica l’indice delle raccolte JSON':'Scarica tutti i dati CSV');
   if($('dataset')) for(const option of $('dataset')!.children)if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
   if($('dataset-date'))$('dataset-date')!.children[0].textContent=t('Ultima disponibile');
@@ -2010,7 +2080,10 @@ function renderDataset() {
   $('status')!.textContent=data.metadata.demo?t('DEMO · Dati sintetici per verificare il sistema. Questi non sono risultati di Wikipedia.'):'';
   $('status')!.hidden=!data.metadata.demo;
   if(connectionsPage) {renderConnections();return;}
-  if(deorphanizePage) {candidateCards();return;}
+  if(deorphanizePage) {
+    if(candidatePreview){$('status')!.hidden=false;$('status')!.textContent=t('Caricamento dell’elenco completo delle voci orfane…');}
+    candidateCards();return;
+  }
   const report=precomputed?.reports.overview??calculateReport<OverviewReport>('overview',data.pages.map(page=>[
     page.orphan,page.out_degree??null,attributedCreatorKey(page)
   ]));
@@ -2077,7 +2150,7 @@ $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
 $('candidate-hide-special')?.addEventListener('click',()=>{
-  hideSpecialOrphans=!hideSpecialOrphans;candidateLimit=25;if(data)candidateCards();
+  showSpecialOrphans=!showSpecialOrphans;candidateLimit=25;if(data)candidateCards();
 });
 $('auth-menu')?.addEventListener('keydown',event=>{
   if(event.key==='Escape') {event.preventDefault();$('auth-menu')!.open=false;$('auth-toggle')!.focus();}
@@ -2115,19 +2188,24 @@ const dashboardReady=(async()=>{
     await load(entry);return;
   }
   const languages=[...new Set(entries.map(entry=>entry.language))].sort();
+  if(deorphanizePage)$('dataset')!.append(new Option(t('Seleziona'),''));
   if(languages.includes('all'))$('dataset')!.append(new Option(t('Tutte le lingue'),'all'));
   for(const language of languages)if(language!=='all')$('dataset')!.append(new Option(language.toUpperCase(),language));
   const matching=entries.find(entry=>entry.file===requested);
-  $('dataset')!.value=matching?.language??(languages.includes('all')?'all':languages[0]);
+  $('dataset')!.value=deorphanizePage&&(!matching||matching.language==='all')?'':matching?.language??(languages.includes('all')?'all':languages[0]);
   refreshDateChoices(matching?.date.slice(0,10));
-  $('dataset')!.addEventListener('change',()=>{
+  $('dataset')!.addEventListener('change',async()=>{
     const previous=$('dataset-date')!.value;
     refreshDateChoices(previous);
-    const entry=selectedEntry();if(entry)void load(entry).catch(fail);
+    if(deorphanizePage&&$('dataset')!.value===''){clearLanguageSelection();return;}
+    const entry=selectedEntry();if(entry)await load(entry).catch(fail);
   });
-  $('dataset-date')!.addEventListener('change',()=>{
-    const entry=selectedEntry();if(entry)void load(entry).catch(fail);
+  $('dataset-date')!.addEventListener('change',async()=>{
+    const entry=selectedEntry();if(entry)await load(entry).catch(fail);
   });
+  if(deorphanizePage&&$('dataset')!.value==='') {
+    clearLanguageSelection();void preloadCandidatePreviews();return;
+  }
   const initial=matching??selectedEntry();
   if(!initial)throw new Error('Nessuna raccolta reale presente');
   await load(initial);
