@@ -22,6 +22,8 @@ Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wik
 
 Usare Node.js 22.18 o successivo: build e test DOM sono TypeScript, eseguiti direttamente da Node e verificati con tipi strict da `npm run check`.
 
+Per installare le dipendenze e avviare direttamente la dashboard locale usare `bash scripts/start-dashboard.sh`. Richiede Node.js, npm e Rust 1.89 o successivo con rustup già installati; su Ubuntu/Debian installa con `apt-get` (e `sudo` quando necessario) i pacchetti di compilazione mancanti. Scarica le dipendenze npm, il target WebAssembly, wasm-bindgen 0.2.105 nella cache locale e il sorgente fastText verificato, poi compila CLI e asset. Non scarica dump o modelli e usa i dati già presenti in `web/data/`. I singoli passaggi equivalenti sono:
+
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.105 --locked
@@ -113,6 +115,8 @@ target/release/orphanwiki refresh-measures --languages vec lmo
 Omettere `--languages vec lmo` nei comandi precedenti per tutte le edizioni di `config/languages.json`. Ogni edizione selezionata è completa. I checkpoint della qualità riutilizzano le partizioni verificate e le feature SQLite; non richiedono di ripetere il modello dei temi. I nuovi export datati mantengono disponibili quelli precedenti. `target/release/orphanwiki dashboard --data-dir web/data` ricostruisce soltanto i trasporti da export approvati, inclusi i blocchi dei temi necessari per velocizzare i profili nelle raccolte già pubblicate: non acquisisce date o qualità mancanti e non riscrive i dataset JSON/CSV originali. Ogni conversione prepara una nuova generazione dei trasporti e aggiorna il manifest per ultimo; le generazioni precedenti restano disponibili. `npm test` include benchmark deterministici della personalizzazione su dati sintetici: confronta byte JSON, righe lette, dimensioni del buffer di unione e turni di richieste a risposte controllate, verifica risultati identici e il riuso in memoria dei temi al cambio di raccolta; non misura la latenza reale delle API.
 
 #### Avvio Dashboard
+
+Lo script funziona da qualsiasi directory, avvia il servizio in primo piano su `http://127.0.0.1:8000` e accetta le opzioni di `serve`, ad esempio `bash scripts/start-dashboard.sh --port 8080`. Fermarlo con `Ctrl+C`. I percorsi relativi passati allo script sono risolti dalla radice del repository; restano utilizzabili le variabili di configurazione del servizio descritte sotto. Senza dati approvati occorre prima eseguire la pipeline descritta sopra. Per avviare un build già pronto:
 
 ```sh
 target/release/orphanwiki serve --web-root web --database data/editorial.sqlite --bind 127.0.0.1 --port 8000
