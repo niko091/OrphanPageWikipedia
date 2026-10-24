@@ -1,28 +1,29 @@
 # Orphan Articles in Wikipedia
 
-Analisi descrittiva delle pagine orfane di edizioni linguistiche complete di Wikipedia. I dati di ricerca provengono esclusivamente dai dump ufficiali Wikimedia: SQL per pagine, collegamenti e categorie; MediaWiki History per creazione ricostruita e cronologia degli autori; XML `mediawiki_content_current` per la qualità strutturale stimata con Johnson V2. L’età usa `page_creation_timestamp`; i conteggi degli autori si riferiscono alla cronologia pubblica e alle voci attribuite nel censimento. Le soglie di qualità sono relative alla singola edizione. La qualità usa la revisione dell'export XML ufficiale selezionato anche quando differisce da quella SQL; entrambe le identità e il disallineamento restano registrati. Il modello locale dei 64 temi usa i collegamenti del grafo e pesi preaddestrati verificati. Le proposte di collegamento sono suggerimenti da controllare manualmente, non modifiche automatiche. Con **Fix this**, la webapp legge su richiesta il wikitesto corrente delle pagine coinvolte dalle API ufficiali di Wikipedia e prepara prompt e fonti da copiare in una chat nuova; l’invio al modello è manuale. Il selettore offre ChatGPT, Gemini, Claude, Qwen, Kimi, GLM e Mistral, in ordine indicativo per [visite web stimate a settembre 2026](https://www.alphamoat.ai/en/ai/t/llm); **Altro/Other** prepara lo stesso pacchetto da incollare nella chat preferita, senza aprire un sito predefinito. I testi restano in memoria fino alla chiusura della finestra e non aggiornano i dati del censimento. Revisioni, dimensioni e checksum accompagnano le fonti; quelle non verificabili sono segnalate. **Finished** apre la valutazione delle coppie incluse nel prompt: Fixato, Non fixato o Bad link. Le valutazioni condivise sono segnalazioni manuali separate dal censimento: Fixato e Bad link escludono la coppia dai prompt e la spostano in fondo a Connect, conservando tutte le evidenze; Non fixato la rende nuovamente suggeribile.
+A web app for analyzing **orphan articles on Wikipedia**. Inspired by the paper [Orphan Articles: The Dark Matter of Wikipedia](https://ojs.aaai.org/index.php/ICWSM/article/view/31300), it lets you explore the characteristics of articles and the editors who created them.
 
-## Struttura
+Research data comes exclusively from official Wikimedia dumps: SQL for the page graph, MediaWiki History for reconstructed creation dates and editor histories, and `mediawiki_content_current` XML for Johnson V2 structural quality, normalized per edition. A local model classifies articles into 64 topics based on their links.
 
-- `config/languages.json`: unico elenco delle edizioni da raccogliere. Aggiungere qui un codice valido per includere l'intera edizione in download, importazione, temi e confronto. `databases` contiene solo eventuali nomi tecnici non derivabili dal codice.
-- `config/quality.json`: definizione verificabile di Johnson V2, pesi e alias dell’estrattore di riferimento. I nomi canonici dei namespace sono letti dallo stesso XML. La lunghezza segue la convenzione documentata dei byte UTF-8; le regex conservano i limiti del riferimento per commenti, nowiki e template.
-- `src/lib.rs`: grafo, redirect, categorie, ranking delle evidenze, età e join a blocchi delle misure; API condivise con la dashboard WebAssembly.
-- `src/dumps.rs`: download verificato, import SQL/History, qualità Johnson V2 da XML, temi, analisi, cache incrementale del matching, CSV e trasporti dashboard. Elabora censimenti completi e conserva tutte le evidenze; pubblica il manifest dopo i file della nuova generazione.
-- `src/dumps.cc` e `build.rs`: stesso motore ufficiale fastText 0.9.3, compilato da sorgente verificato e incorporato nella CLI come worker locale. La licenza è in `LICENSE.fasttext`.
-- `src/main.rs` e `src/pipeline.rs`: comandi, controller sequenziale, checkpoint e benchmark appaiato. `src/runtime.rs` gestisce cancellazione, span gerarchici e misure operative delle risorse, separate dai dataset.
-- `src/dashboard.rs`: statistiche scientifiche e riepiloghi preparati in Rust; l’interfaccia usa gli stessi calcoli tramite WebAssembly. Il codice Rust vieta `unsafe` in compilazione.
-- `src/editorial.rs`: servizio HTTP per le quattro pagine e `/api/reviews`; SQLite locale/Cloud VPS o MariaDB ToolsDB su Toolforge. Salva identità delle coppie, stato, versione, data e autore Wikimedia verificato dei nuovi check; controlla le coppie nei dettagli approvati e rileva aggiornamenti concorrenti.
-- `web/src/`: interfaccia TypeScript e CSS; `web/assets/` è prodotto dal build. Su invio esplicito dello username Wikimedia o dopo l’accesso OAuth, la personalizzazione associa le ultime 100 modifiche pubbliche complessive nelle sole Wikipedie presenti con raccolte reali nel manifest ai temi dell’ultima raccolta disponibile per ogni lingua, anche diversa da quella delle proposte selezionate; mostra la copertura e mantiene in memoria il profilo. In De-orfanizzare, **Pagine nascoste** apre due opzioni indipendenti per mostrare le disambiguazioni e le voci con zero collegamenti possibili o dato mancante; entrambe sono disattivate di default. Una voce che rientra in entrambi i gruppi richiede entrambe le opzioni; il filtro usa il numero di pagine candidate. Legge i blocchi dei temi di più lingue con un limite condiviso di quattro richieste, limita a 200 record il buffer di unione dei contributi e salta il calcolo dei punteggi quando non emergono temi utilizzabili. Nel dialogo di Fix this, l’opzione DEBUG aggiunge al prompt domande diagnostiche separate dalla risposta normale; è disattivata di default.
-- `tests/`: test Rust, TypeScript/DOM e Playwright su Chromium, Firefox e WebKit; le fixture del browser sono preparate dalla CLI Rust e servite dal server HTTP locale con un database temporaneo. Le richieste editoriali a Wikimedia sono simulate e le altre richieste esterne sono bloccate. Le fixture sintetiche non sono dati di ricerca.
-- `.github/workflows/processing.yml`, `dashboard.yml` e `security.yml`: workflow indipendenti per elaborazione, dashboard e sicurezza delle dipendenze su Ubuntu 24.04 a ogni push e pull request, avviabili anche manualmente; l’audit viene eseguito anche settimanalmente. `.github/dependabot.yml` configura aggiornamenti settimanali per Cargo, npm e GitHub Actions.
+The deorphanization tool identifies possible links based on those present in other language editions. **Fix this** retrieves the relevant pages’ wikitext on request and prepares a prompt with source material to copy into a chat with a large language model (LLM). The model suggests links or text additions, which users must review and manually apply on Wikipedia. The web app does not edit Wikipedia.
 
-## Comandi
+## Installation
 
-#### Download dipendenze:
+Currently configured editions:
 
-Usare Node.js 22.18 o successivo: build e test DOM sono TypeScript, eseguiti direttamente da Node e verificati con tipi strict da `npm run check`.
+`vec`, `lmo`, `fur`, `roa-tara`, `nap`, `pms`, `scn`, `sc`, `lij`, `eml`, `co`, `lld`, `it`, `ca`, `pt`, `fr`.
 
-Per installare le dipendenze e avviare direttamente la dashboard locale usare `bash scripts/start-dashboard.sh`. Richiede Node.js, npm e Rust 1.89 o successivo con rustup già installati; su Ubuntu/Debian installa con `apt-get` (e `sudo` quando necessario) i pacchetti di compilazione mancanti. Scarica le dipendenze npm, il target WebAssembly, wasm-bindgen 0.2.105 nella cache locale e il sorgente fastText verificato, poi compila CLI e asset. Non scarica dump o modelli e usa i dati già presenti in `web/data/`. I singoli passaggi equivalenti sono:
+To analyze other editions, download the project locally and edit the `languages` list in [config/languages.json](config/languages.json). Suggestions based on comparisons between languages require at least two processed editions.
+
+### Dependencies
+
+Requires **Rust 1.89 or later**, installed through rustup, and **Node.js 22.18 or later**, with npm. Download the repository and run commands from its root directory. On Ubuntu/Debian, install the build dependencies first:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential libsqlite3-dev pkg-config curl tar ca-certificates coreutils
+```
+
+Build the CLI and dashboard:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -33,108 +34,24 @@ npm ci
 npm run build
 ```
 
-Il modello dei temi deve essere già presente in `data/models/johnson-outlink-20220727.bin` (`--model` per un altro percorso). Procurarsi il file dall'URL `model_url` di `config/topics.json`: la pipeline non scarica i pesi e verifica il loro SHA-512 prima dell'inferenza.
+For analysis, download the model from `model_url` in `config/topics.json` and save it as `data/models/johnson-outlink-20220727.bin`. The pipeline verifies its checksum but does not download the weights.
 
-Per preparare la CLI con Rust 1.89 o successivo eseguire dalla radice `sh scripts/prepare-fasttext.sh`, poi `cargo build --release --locked`. Lo script conserva nella cache ignorata il sorgente ufficiale fastText 0.9.3 verificato con SHA-256; non scarica pesi. Il build controlla nuovamente il sorgente e non scarica il motore; il binario non richiede Python. Il worker fastText incorporato viene estratto in una directory temporanea privata, avviato localmente e rimosso alla chiusura; probabilità e tassonomia mantengono il contratto originale. La licenza del motore è in `LICENSE.fasttext`. `target/release/orphanwiki --help` elenca il contratto dei comandi. `fetch-dumps` e `fetch-content` eseguono piani e download; `import-dumps --manifest FILE` importa grafo e History; l’export del grafo conserva ordine dei campi e separatori del riferimento, mantenendo i checksum dei file a parità di input; `import-history --manifest FILE` aggiorna solo il supplemento dallo staging SQL esistente; `quality --content-release YYYY-MM-DD --languages vec lmo` calcola Johnson V2 dai file locali verificati; `topics --input-dir data/imported --output-dir data/imported --work-dir data/dumps/staging --languages vec lmo` applica il modello approvato all'intero censimento. Batch, budget totale e `topic-run.json` conservano checkpoint soltanto per edizioni complete: le edizioni rinviate non pubblicano predizioni parziali. Il comando `pipeline` esegue la sequenza completa e riusa soltanto checkpoint con input e output corrispondenti. `--repo-root DIR` risolve configurazioni e percorsi relativi dalla radice indicata; senza opzione cerca `config/languages.json` risalendo dalla directory corrente, senza incorporare il percorso del computer usato per compilare. Le fasi native possono scrivere gli span nel file operativo `ORPHANWIKI_SPANS_FILE`, con `ORPHANWIKI_RUN_ID` e `ORPHANWIKI_PARENT_SPAN` per collegarsi al controller; i piani ignorano anche il tracciamento ereditato. SIGTERM/SIGINT fermano i cicli a blocchi senza sostituire il manifest approvato; la gestione dei segnali funziona anche senza span. I download parziali Rust richiedono una sidecar che ne identifica URL, dimensione e checksum disponibile; un parziale precedente privo di identità viene riscaricato, mentre gli archivi completi verificati sono riutilizzati.
+### Language analysis
 
-Per compilare la feature `cli` su Ubuntu installare `sudo apt-get install libsqlite3-dev pkg-config g++ curl tar`. L’importatore usa SQLite di sistema; in CI vengono installati gli stessi pacchetti e preparato il sorgente nativo. `cargo test --locked` verifica la CLI; `cargo test --locked --no-default-features` verifica il nucleo. Il build WebAssembly usa `--no-default-features --features dashboard` e non richiede fastText C++.
-
-Per verificare la dashboard eseguire `npm run check` e `npm test`, poi `npx playwright install --with-deps chromium firefox webkit` e `npm run test:browser`. Quest’ultimo riusa CLI e asset compilati da `npm test` e controlla le quattro pagine, ricerca, filtri, paginazione, dialoghi, valutazioni condivise, tastiera e layout mobile. I report restano nelle directory ignorate `playwright-report/` e `test-results/`; in CI sono conservati per sette giorni, con screenshot e tracce dei test falliti. `npm audit --audit-level=low` e `cargo audit` verificano le dipendenze; installare quest’ultimo con `cargo install cargo-audit --version 0.22.2 --locked`.
-
-`target/release/orphanwiki analyze data/imported/vec-raw.json --history data/imported/vec-history.json --rules config/categories.json --work-dir data/dumps/staging --output web/data/vec.json` prepara JSON canonico, CSV e tutti i trasporti in una directory privata e pubblica il manifest per ultimo. I supplementi temi/qualità adiacenti sono rilevati automaticamente; `--topics` e `--quality` li selezionano esplicitamente. Il percorso a blocchi per SQL da almeno 128 MiB mantiene le identità precedenti; i grafi più piccoli conservano il checksum JSON canonico. Un risultato diverso richiede un nome di output distinto: i file scientifici approvati non sono sovrascritti. Un risultato identico può essere ripubblicato con nuovi trasporti.
-
-`target/release/orphanwiki compare --input-dir data/imported --work-dir data/dumps/staging --output-dir web/data` confronta tutte le raccolte locali configurate e include quelle già pubblicate con le loro fonti conservate. Accetta anche percorsi espliciti dei grafi. Riusa gli indici verificati e le coppie completate, conserva ogni evidenza e prepara insieme membri e aggregati prima del manifest. L’aggregato disponibile distingue i confronti parziali; i riepiloghi sono riusati solo con fingerprint corrispondenti. Risultati diversi conservano nomi distinti, anche quando una vecchia convenzione non distingueva un cambiamento delle sole misure.
-
-`target/release/orphanwiki refresh-measures --languages vec lmo --input-dir data/imported --data-dir web/data` aggiorna gli export approvati con i supplementi History e qualità locali. Conserva gradi, temi e tutte le evidenze senza ricalcolare grafo o matching, prepara nuovi file datati e pubblica il manifest per ultimo. Una qualità precedente senza la definizione corrente mantiene la propria versione finché non viene fornito il nuovo supplemento.
-
-`target/release/orphanwiki dashboard --data-dir web/data` rigenera tutti i trasporti delle edizioni approvate senza Python e senza riscrivere i JSON/CSV canonici. Prepara una generazione distinta, conserva i file precedenti e sposta il manifest per ultimo; un errore di conversione lascia intatta la raccolta approvata. I writer sono serializzati e una modifica concorrente del manifest interrompe la pubblicazione.
-
-Eseguire questa conversione anche per le raccolte precedenti agli indici tematici a blocchi: la personalizzazione leggerà soltanto i blocchi delle pagine modificate invece del JSON di un’intera edizione. Il profilo usa le ultime 100 modifiche complessive nelle sole Wikipedie analizzate presenti nel manifest e collegate all’account, con tre richieste simultanee e un budget condiviso di 180 richieste al minuto nella scheda. Le richieste lente scadono dopo 15 secondi; gli errori temporanei hanno fino a tre tentativi rispettando `Retry-After`. Un’attesa richiesta superiore a un minuto viene segnalata per un nuovo tentativo manuale. L’interfaccia mostra avanzamento, dominio e codice degli errori. Le risposte verificate rimangono soltanto in memoria per cinque minuti dall’inizio della ricerca, con una data limite comune: un nuovo tentativo verifica nuovamente l’identità e riprende dalle wiki mancanti. Un profilo incompleto non attiva la classifica personalizzata.
-
-#### Analisi delle lingue:
-
-Scegliere release ufficiali esistenti e modificare solo `config/languages.json` per cambiare le edizioni. Il piano elenca i file e lo spazio compresso stimato senza scaricare:
-
-```sh
-target/release/orphanwiki fetch-dumps --sql-release 20261001 --history-release 2026-09 --plan
-```
-
-Per un'esecuzione locale più piccola, selezionare le lingue da acquisire con `--languages`:
-
-```sh
-target/release/orphanwiki pipeline --sql-release 20261001 --history-release 2026-09 --languages vec lmo
-```
-
-Per estendere una raccolta, aggiungere i nuovi codici in `config/languages.json` e passare a `--languages` soltanto le nuove edizioni. Il confronto include automaticamente anche tutte le edizioni configurate già pubblicate nella stessa directory di output, con le rispettive release originali: produce suggerimenti dalle nuove verso le precedenti, dalle precedenti verso le nuove e tra le nuove. Conservare i grafi `*-raw.json`, i supplementi locali e la directory `--work-dir`.
-
-Gli indici e le coppie ordinate complete, comprese quelle senza candidati, restano in `<work-dir>/comparison-cache/`. Ogni ripresa verifica gli SHA-256 degli input e della cache. Un nuovo grafo invalida solo le coppie che coinvolgono la sua lingua; aggiornare History, qualità o categorie conserva le coppie quando il grafo coincide. Gli export precedenti alla cache possono fornire le coppie già pubblicate dopo verifica delle identità e delle evidenze; in questa prima migrazione occorre comunque costruire gli indici dei grafi. Le generazioni SQLite precedenti restano disponibili e il manifest della cache cambia soltanto a completamento dell'aggiornamento. Restano necessari I/O per verifica e copia della cache, spazio per le generazioni conservate e l'unione/esportazione dei suggerimenti aggiornati per tutte le lingue; i log distinguono coppie nuove e riutilizzate. Il comando diretto `compare` usa gli stessi indici; senza `--work-dir` li salva in `staging` accanto ai grafi di input.
-
-Per scaricare, importare, calcolare età, autori, temi e qualità, quindi confrontare tutte le edizioni configurate:
+Data is not included in the repository. The following command downloads and analyzes all languages in `config/languages.json`. Releases must be specified explicitly: choose available official release dates; the dates below are examples:
 
 ```sh
 target/release/orphanwiki pipeline --sql-release 20261001 --history-release 2026-09
 ```
 
-La pipeline include automaticamente il contenuto XML e Johnson V2. La release del contenuto è la data SQL (`20261001` → `2026-10-01`); `--content-release YYYY-MM-DD` permette di sceglierne un’altra. Se la release non è disponibile, il passo si arresta senza sostituirla con dati diversi. La revisione XML selezionata fornisce il punteggio quando il testo è disponibile, anche se differisce dalla revisione SQL; il censimento conserva entrambe le revisioni e la loro relazione. Aggiungere `--plan` allo stesso comando per il piano SQL, History e XML, senza creare log o checkpoint. Le fasi completate e verificate sono riutilizzate; per gli export esistenti vengono aggiornate le misure senza ripetere grafo, temi e confronto quando gli input coincidono.
+The pipeline downloads and verifies the dumps, analyzes complete editions, compares languages, and publishes the results in `web/data/`.
 
-Su un server raggiunto via SSH, avviare il comando dentro `tmux` per poter chiudere la connessione. Dalla radice del progetto, dopo aver installato `tmux` sul server:
+### Starting the dashboard
 
-```sh
-tmux new -s orphanwiki
-target/release/orphanwiki pipeline --sql-release 20261001 --history-release 2026-09 --languages vec lmo --metrics-interval 5
-```
-
-Premere `Ctrl+B`, poi `D` per staccarsi; dopo una nuova connessione SSH usare `tmux attach -t orphanwiki`. Il processo continua sul server, che deve restare acceso. Dopo un arresto, rilanciare il comando per riutilizzare i checkpoint verificati.
-
-Ogni esecuzione normale salva in `data/logs/` (`--log-dir` per cambiarlo): `.log` con comandi, output, errori e messaggi periodici; `.benchmark.json` con tempi, CPU ed esiti per fase; `.benchmark.metrics.jsonl` con eventi e campioni leggibili durante il lavoro; `.benchmark.spans.jsonl` con inizio/fine monotonic delle sottofasi, ID di esecuzione, fase e padre, righe e byte disponibili. Gli intervalli distinguono hash, proiezione SQL, JSON del grafo, scansioni/indici/misure History, inferenza del modello, XML/feature/percentili della qualità, indice degli archi, matching per lingua/blocco, CSV, trasporti e aggregati. I tempi includono i figli: per ricostruire il tempo esclusivo sottrarre l'unione dei loro intervalli, senza sommarli al padre. `--no-phase-spans` disabilita questi soli intervalli dettagliati. I report includono hardware, affinità CPU, limiti cgroup alla radice del mount, configurazioni e loro checksum, release richieste e identità del codice. Errori e interruzioni gestite producono il riepilogo; gli intervalli dei worker terminati bruscamente sono chiusi con un limite temporale dichiarato al rilevamento. Dopo un arresto forzato dell'intera pipeline possono restare soltanto log ed eventi parziali. Il piano non produce benchmark. Le fasi riutilizzate sono indicate con `SALTA` e il motivo del checkpoint nel log e non misurano un ricalcolo. Tutte queste misure sono operative e restano fuori dai dataset di ricerca.
-
-`--metrics-interval` regola il campionamento (10 secondi di default): CPU, somma RSS e swap dei processi, memoria disponibile, carico e pressione delle risorse del sistema, spazio libero e I/O. `100%` CPU equivale a un core. La RSS può perdere picchi brevi e contare pagine condivise più volte; non garantisce il fabbisogno di RAM. La CPU per fase comprende i worker attesi; quella periodica è una stima. L'I/O comprende il processo principale e i discendenti già attesi: i worker attivi vengono contabilizzati alla terminazione; rete e cache sono escluse dai byte fisici. Le misure Linux mancanti restano `null`; carico e memoria disponibile includono gli altri programmi del server.
-
-Per confrontare i server, usare prima lo stesso censimento completo `vec lmo`, identiche release e directory nuove su ciascuna macchina, distinguendo download, elaborazione e cache/checkpoint. Le edizioni piccole non dimensionano l'italiano. La pipeline è sequenziale e usa SQLite su disco: più RAM non attiva più core. `--work-dir` sceglie il disco di staging. Il matching interlingua interroga gli archi per blocchi fino a 512 orfane, ridotti secondo il fanout osservato; ordina su SQLite e costruisce un record finale per orfana, conservando tutti i candidati e tutte le evidenze. `--topic-batch-size` regola i blocchi dei temi (256 voci, intervallo 1–10000), senza ridurre il censimento. `--topic-budget-seconds` è il budget complessivo dei temi (86400 secondi); aumentarlo, ad esempio a `604800`, se necessario. Se si esaurisce, il controllo di completezza ferma la pipeline. Due server non condividono automaticamente RAM o calcolo; usare directory indipendenti e riunire gli input selezionati su una macchina per il confronto finale.
-
-Per misurare la migrazione, `target/release/orphanwiki benchmark --spec benchmarks/rust/analyze-vec.json --output-dir benchmarks/rust/analyze-vec-run-01` esegue prove alternate in directory nuove e confronta gli output dichiarati, tempi, CPU e memoria. La specifica JSON ha `version: 1`, `inputs` immutabili, eventuali `copies` private, `baseline` e `candidate` con `cwd` e `commands` (liste di argomenti senza shell), e `outputs` con `kind` e `path`. `{repo}` indica la radice del progetto e `{run}` una directory nuova per ogni prova. Gli output `canonical` confrontano tutti i record ordinati; `manifest` confronta i membri canonici; `bytes` confronta byte esatti. Includere configurazioni, modello e file referenziati, non soltanto i manifest. Il report `comparison.json` distingue miglioramento, mancato miglioramento, risultato inconcludente ed errore. Il criterio predefinito richiede parità esatta, almeno 1,10× di speedup mediano, miglioramento in ogni coppia e RSS al massimo 1,10× in ogni coppia; hash e copie riscaldano la cache del sistema operativo. Non dimostra letture a cache fredda né prestazioni dei censimenti reali a partire da fixture sintetiche. Specifiche e report restano sotto `benchmarks/`, ignorati da Git.
-
-History usa una cache SQLite di 256 MiB e commit ogni circa 250.000 tentativi di inserimento, con buffer fino a 5.000 record per tipo e una cache esatta di 100.000 identità di creazione per partizione. `--history-cache-mib` (1–65536) e `--history-commit-rows` (1–10000000) sono disponibili in `pipeline`, `import-dumps` e `import-history`. Con molta RAM si può provare `--history-cache-mib 2048`, confrontando i benchmark. Censimento, definizioni, checksum e checkpoint completi restano validi. Il log mostra righe lette e utili, duplicati evitati, commit e tempo SQLite, circa ogni 30 secondi quando il parser riprende il controllo.
-
-Dopo un'interruzione si riusano le partizioni complete e si ripete quella incompleta. Mantenere gli stessi percorsi; attendere la chiusura della pipeline prima di aggiornare il codice e ricompilare il binario Rust. Il merge degli export evita le query per articolo, secondo il principio di elaborazione a blocchi discusso in [Database Supported Haskell](https://db.cs.uni-tuebingen.de/publications/2013/analysing-the-entire-wikipedia-history-with-database-supported-haskell/padl2013.pdf); [Hedera](https://arxiv.org/abs/1701.03937) e [WikiBrain](https://toby.li/files/WikiBrain-WikiSym2014.pdf) trattano streaming, partizioni e riuso. I tempi sintetici non prevedono la durata di un censimento reale.
-
-Per aggiornare età e autori dai dump locali già verificati, mantenendo grafo, temi e candidate degli export pubblicati:
+Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service.
 
 ```sh
-target/release/orphanwiki import-history --sql-release 20261001 --history-release 2026-09 --languages vec lmo
-target/release/orphanwiki refresh-measures --languages vec lmo
+bash scripts/start-dashboard.sh
 ```
 
-Per aggiungere la qualità separatamente, scegliere una release di contenuto disponibile e controllare prima il piano. La revisione XML selezionata è valutata quando il testo è disponibile, conservando la sua identità e la relazione con la revisione SQL:
-
-```sh
-target/release/orphanwiki fetch-content --content-release 2026-10-01 --languages vec lmo --plan
-target/release/orphanwiki fetch-content --content-release 2026-10-01 --languages vec lmo
-target/release/orphanwiki quality --content-release 2026-10-01 --languages vec lmo
-target/release/orphanwiki refresh-measures --languages vec lmo
-```
-
-Omettere `--languages vec lmo` nei comandi precedenti per tutte le edizioni di `config/languages.json`. Ogni edizione selezionata è completa. I checkpoint della qualità riutilizzano le partizioni verificate e le feature SQLite; non richiedono di ripetere il modello dei temi. I nuovi export datati mantengono disponibili quelli precedenti. `target/release/orphanwiki dashboard --data-dir web/data` ricostruisce soltanto i trasporti da export approvati, inclusi i blocchi dei temi necessari per velocizzare i profili nelle raccolte già pubblicate: non acquisisce date o qualità mancanti e non riscrive i dataset JSON/CSV originali. Ogni conversione prepara una nuova generazione dei trasporti e aggiorna il manifest per ultimo; le generazioni precedenti restano disponibili. `npm test` include benchmark deterministici della personalizzazione su dati sintetici: confronta byte JSON, righe lette, dimensioni del buffer di unione e turni di richieste a risposte controllate, verifica risultati identici e il riuso in memoria dei temi al cambio di raccolta; non misura la latenza reale delle API.
-
-#### Avvio Dashboard
-
-Lo script funziona da qualsiasi directory, avvia il servizio in primo piano su `http://127.0.0.1:8000` e accetta le opzioni di `serve`, ad esempio `bash scripts/start-dashboard.sh --port 8080`. Fermarlo con `Ctrl+C`. I percorsi relativi passati allo script sono risolti dalla radice del repository; restano utilizzabili le variabili di configurazione del servizio descritte sotto. Senza dati approvati occorre prima eseguire la pipeline descritta sopra. Per avviare un build già pronto:
-
-```sh
-target/release/orphanwiki serve --web-root web --database data/editorial.sqlite --bind 127.0.0.1 --port 8000
-```
-
-Il server Rust serve anche le valutazioni condivise; il database resta fuori dalla cartella pubblica e dai dataset di ricerca. Gli stati vengono letti all’apertura e a ogni ricaricamento della pagina. I pulsanti **Valuta coppia** in Connect permettono anche di riaprire coppie già valutate. Con OAuth configurato, i nuovi check richiedono l’accesso Wikipedia e salvano il nome verificato dell’autore, mostrato con un link alla sua pagina utente; i check precedenti restano anonimi. Nessuna risposta del modello o wikitesto viene salvato. Senza il servizio API resta possibile consultare i dati e preparare i prompt, ma le valutazioni non possono essere pubblicate.
-
-Per abilitare **Accedi con Wikipedia**, [registrare un’applicazione OAuth 2 riservata sul server](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose/oauth2), accessibile agli utenti (non «owner-only»), con grant **User identity verification only**, flusso **Authorization code** e callback esatto `https://DOMINIO/api/auth/callback` (includere l’eventuale prefisso del servizio). Configurare nell’ambiente del server `ORPHANWIKI_OAUTH_CLIENT_ID`, `ORPHANWIKI_OAUTH_CLIENT_SECRET` e `ORPHANWIKI_OAUTH_REDIRECT_URI` con quel callback, poi avviare `serve`. Non inserire il segreto negli asset o nel repository. HTTP è ammesso solo per lo sviluppo su localhost, ad esempio `http://127.0.0.1:8000/api/auth/callback`. Una configurazione parziale impedisce l’avvio. Senza queste variabili il servizio mantiene i check anonimi.
-
-Il nome autenticato appare nelle quattro pagine e apre il profilo Wikipedia al clic; in De-orfanizzare alimenta automaticamente i consigli basati sulle ultime 100 modifiche pubbliche complessive nelle Wikipedie analizzate. L’accesso autorizza questa personalizzazione senza inserire di nuovo il nome. I token Wikimedia vengono scartati dopo l’identificazione; la sessione dura otto ore e termina con **Esci** o al riavvio del server. Le sessioni sono in memoria: usare una sola istanza del servizio. I nomi dei revisori restano nel database editoriale separato, mai negli export scientifici. Le chiamate OAuth seguono il [flusso ufficiale Wikimedia](https://www.mediawiki.org/wiki/OAuth/For_Developers); non autorizzano modifiche su Wikipedia.
-
-Su Cloud VPS o Toolforge avviare lo stesso binario dalla radice del repository, dopo aver costruito gli asset e configurato il database:
-
-```sh
-target/release/orphanwiki serve --bind 0.0.0.0 --port "${PORT:-8000}"
-```
-
-Su Cloud VPS SQLite deve risiedere su disco locale persistente: `ORPHANWIKI_REVIEW_SQLITE` ne configura il percorso; `ORPHANWIKI_WEB_ROOT` configura la cartella pubblica. Su Toolforge creare prima un database [ToolsDB](https://wikitech.wikimedia.org/wiki/Help:Toolforge/ToolsDB) con il prefisso delle credenziali del tool, poi impostare `ORPHANWIKI_REVIEW_MYSQL_DATABASE` al suo nome. Il servizio usa `TOOL_TOOLSDB_USER` e `TOOL_TOOLSDB_PASSWORD`, forniti dal [Build Service](https://wikitech.wikimedia.org/wiki/Help:Toolforge/Build_service), oppure il file credenziali indicato da `ORPHANWIKI_REVIEW_MYSQL_DEFAULTS_FILE` nei runtime che lo montano. L’host predefinito è `tools.db.svc.wikimedia.cloud`; `ORPHANWIKI_REVIEW_MYSQL_HOST` lo può configurare. Su Toolforge il servizio rifiuta di ripiegare su SQLite quando manca la configurazione MariaDB. La scelta del runtime, dei mount per gli export e dell’avvio pubblico va completata sull’hosting scelto; i test locali non verificano un deployment Wikimedia reale.
-
+Open `http://127.0.0.1:8000` and stop the service with `Ctrl+C`.
