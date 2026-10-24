@@ -184,6 +184,47 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   expect(traffic.editorial).toEqual([]);
 });
 
+test('hidden pages opens independent options with keyboard and mobile support', async ({page, site, traffic}) => {
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({width, height: 844});
+    await open(page, site, 'deorphanize.html');
+    const button = page.getByRole('button', {name: 'Pagine nascoste', exact: true});
+    const options = page.locator('#candidate-hidden-options');
+    const disambiguation = page.getByRole('checkbox', {name: 'Mostra pagine di disambiguazione', exact: true});
+    const connections = page.getByRole('checkbox', {name: 'Mostra pagine senza collegamenti possibili', exact: true});
+    await expect(options).toBeHidden();
+    await expect(button).toHaveAttribute('aria-expanded', 'false');
+    await button.click();
+    await expect(options).toBeVisible();
+    await expect(button).toHaveAttribute('aria-expanded', 'true');
+    await expect(disambiguation).not.toBeChecked();
+    await expect(connections).not.toBeChecked();
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+    const bounds = await options.boundingBox();
+    expect(bounds).not.toBeNull();
+    assert(bounds);
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+    await disambiguation.check();
+    await expect(connections).not.toBeChecked();
+    await expect(options).toBeVisible();
+    await connections.check();
+    await disambiguation.uncheck();
+    await expect(connections).toBeChecked();
+    await page.keyboard.press('Escape');
+    await expect(options).toBeHidden();
+    await expect(button).toBeFocused();
+    await button.click();
+    await expect(disambiguation).not.toBeChecked();
+    await expect(connections).toBeChecked();
+    await connections.uncheck();
+    await button.click();
+    await expect(options).toBeHidden();
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+  }
+  expect(traffic.editorial).toEqual([]);
+});
+
 test('article search, filtering, sorting and pagination', async ({page, site}) => {
   await open(page, site, 'index.html');
   await page.locator('#article-group').selectOption('all');

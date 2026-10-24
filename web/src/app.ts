@@ -163,7 +163,11 @@ interface UIElements {
   'candidate-search': HTMLInputElement;
   'candidate-section': HTMLElement;
   'candidate-sort': HTMLSelectElement;
-  'candidate-hide-special': HTMLButtonElement;
+  'candidate-hidden': HTMLButtonElement;
+  'candidate-hidden-control': HTMLElement;
+  'candidate-hidden-options': HTMLElement;
+  'candidate-show-disambiguation': HTMLInputElement;
+  'candidate-show-without-connections': HTMLInputElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;
   'auth-login': HTMLButtonElement;
@@ -425,8 +429,12 @@ const translations: Record<string, string> = {
   "Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.": "Select Connect to see candidate pages and existing links in other languages. Each proposal requires a content review.",
   "Cerca una voce orfana": "Search orphan articles",
   "Cerca una categoria…": "Search categories…",
+  "Pagine nascoste": "Hidden pages",
+  "Scegli quali pagine nascoste mostrare.": "Choose which hidden pages to show.",
   "Mostra pagine di disambiguazione": "Show disambiguation pages",
-  "Filtro basato sulla categoria visualizzata.": "Filter based on the displayed category.",
+  "Mostra pagine senza collegamenti possibili": "Show pages without possible connections",
+  "Include anche le voci con dato non disponibile.": "Also includes articles with unavailable data.",
+  "Caricamento dei collegamenti possibili…": "Loading possible connections…",
   "Mostra altre 25 schede": "Show 25 more cards",
   "Valuta le coppie di pagine": "Review candidate page pairs",
   "Fixato": "Fixed",
@@ -457,15 +465,28 @@ const translations: Record<string, string> = {
   "Nome utente": "Username",
   "Personalizza le proposte": "Personalize suggestions",
   "Affinità con i miei temi": "Affinity with my topics",
-  "Caricamento delle ultime 100 modifiche…": "Loading the last 100 edits…",
-  "Profilo: {edits} modifiche in tutte le Wikipedie; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.": "Profile: {edits} edits across all Wikipedias; usable topics for {known}, in languages {languages}. Other edits remain without usable topics. Sources: latest available collections per language.",
+  "Il profilo usa le ultime 100 modifiche pubbliche nelle Wikipedie analizzate dalla piattaforma, anche in lingue diverse da quella selezionata.": "The profile uses the last 100 public edits across Wikipedias analyzed by the platform, including languages other than the selected one.",
+  "Caricamento delle ultime 100 modifiche nelle Wikipedie analizzate…": "Loading the last 100 edits across analyzed Wikipedias…",
+  "Wikipedie analizzate verificate: {done}/{total}.": "Analyzed Wikipedias checked: {done}/{total}.",
+  "Attesa di {seconds} s prima di interrogare {host}…": "Waiting {seconds} s before querying {host}…",
+  "Caricamento dei temi delle pagine modificate…": "Loading topics for edited pages…",
+  "API Wikimedia: {host}, HTTP {status}": "Wikimedia API: {host}, HTTP {status}",
+  "API Wikimedia: {host}, errore {code}": "Wikimedia API: {host}, error {code}",
+  "API Wikimedia: {host}, tempo di attesa scaduto": "Wikimedia API: {host}, request timed out",
+  "API Wikimedia: {host}, errore di rete": "Wikimedia API: {host}, network error",
+  "API Wikimedia: {host}, riprova tra {seconds} s": "Wikimedia API: {host}, try again in {seconds} s",
+  "Risposta API Wikimedia non valida: {host}": "Invalid Wikimedia API response: {host}",
+  "Modifiche Wikimedia non verificabili: {host}": "Wikimedia contributions could not be verified: {host}",
+  "Riprova: le risposte verificate restano in memoria per cinque minuti dall’inizio della ricerca.": "Try again: verified responses stay in memory for five minutes from the start of the search.",
+  "Profilo: {edits} modifiche nelle Wikipedie analizzate; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.": "Profile: {edits} edits across analyzed Wikipedias; usable topics for {known}, in languages {languages}. Other edits remain without usable topics. Sources: latest available collections per language.",
   "Personalizzazione non disponibile: {error}": "Personalization unavailable: {error}",
-  "Nessuna delle ultime 100 modifiche a voci ha temi utilizzabili nelle ultime raccolte disponibili delle Wikipedie interessate.": "None of the last 100 edits to articles has usable topics in the latest available collections of the relevant Wikipedias.",
+  "Nessuna delle ultime 100 modifiche nelle Wikipedie analizzate ha temi utilizzabili nelle ultime raccolte disponibili.": "None of the last 100 edits across analyzed Wikipedias has usable topics in the latest available collections.",
   "Nome utente Wikimedia non valido": "Invalid Wikimedia username",
   "Identità globale Wikimedia non verificata": "Global Wikimedia identity could not be verified",
   "Identità globale Wikimedia ambigua": "Ambiguous global Wikimedia identity",
   "Nessuna Wikipedia collegata all’account globale": "No Wikipedia is attached to the global account",
-  "L’utente non ha modifiche pubbliche nelle Wikipedie collegate": "The user has no public edits on attached Wikipedias",
+  "Nessuna delle Wikipedie collegate all’account è presente nelle raccolte disponibili": "None of the Wikipedias attached to the account is present in the available collections",
+  "L’utente non ha modifiche pubbliche nelle Wikipedie analizzate collegate": "The user has no public edits on attached analyzed Wikipedias",
   "Connetti una pagina orfana": "Connect an orphan page",
   "Confronta le pagine candidate con i collegamenti già presenti nelle altre lingue.": "Compare candidate pages with existing links in other languages.",
   "Caricamento…": "Loading…",
@@ -620,7 +641,6 @@ const attributedCreatorKey = (row: PageObservation) => {
 };
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, candidateLimit = 25, connectionLimit = 50, articleLimit = 25, creatorLimit = 25, creatorRows: CreatorRow[] = [];
-let showSpecialOrphans = false;
 let candidatePreview = false;
 let datasetController = new AbortController();
 const candidatePreviews = new Map<string, Promise<Dataset | null>>();
@@ -630,6 +650,10 @@ let profileRequestVersion = 0;
 let profileController = new AbortController();
 // Only requested page IDs are retained, never full observation files or text.
 const profileTopicCache = new Map<string, Map<number, string[] | null>>();
+// One submitted profile, held only in this tab; the merge always retains at most 100 edits.
+let recentProfileCache: {identity: string; started: number; completed: Set<string>; edits: RecentEdit[]} | null=null;
+const profileAPIStarts: number[]=[];
+let profileAPINotBefore=0;
 let profileContributions: RecentEdit[] | null = null;
 let profileScores: Map<string, {topic: number; language: number}> | null = null;
 let cardRequestVersion=0,cardController=new AbortController(),cardHydration: Promise<void>=Promise.resolve();
@@ -657,7 +681,7 @@ function renderAuth() {
 }
 function clearProfile() {
   ++profileRequestVersion;profileController.abort();profileController=new AbortController();
-  profileContributions=null;profileScores=null;profileTopicCache.clear();
+  profileContributions=null;profileScores=null;profileTopicCache.clear();recentProfileCache=null;
   if($('profile-username'))$('profile-username')!.value='';
   if($('profile-status'))$('profile-status')!.textContent='';
   if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
@@ -703,15 +727,87 @@ async function logout() {
   finally {$('auth-logout')!.disabled=false;}
 }
 
-async function wikimediaAPI(url: URL, signal?: AbortSignal): Promise<unknown> {
+function profileWait(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve,reject)=>{
+    const abort=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);reject(signal?.reason);};
+    const timer=setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},milliseconds);
+    signal?.addEventListener('abort',abort,{once:true});
+  });
+}
+async function wikimediaAPI(url: URL, signal?: AbortSignal, onWait?: (seconds: number) => void): Promise<unknown> {
   if(url.protocol!=='https:' || !(url.hostname==='meta.wikimedia.org'||/^[a-z][a-z0-9-]{0,19}\.wikipedia\.org$/.test(url.hostname)))
     throw new Error('API Wikimedia non valida');
   url.searchParams.set('format','json');url.searchParams.set('origin','*');
-  const response=await fetch(url.href,{cache:'no-store',credentials:'omit',signal});
-  if(!response.ok)throw new Error('API Wikimedia non disponibile');
-  const payload: unknown=await response.json();
-  if(!payload||typeof payload!=='object'||'error' in payload)throw new Error('Risposta API Wikimedia non valida');
-  return payload;
+  // Editorial requests retain their single attempt and their existing outer cancellation.
+  if(!onWait) {
+    const response=await fetch(url.href,{cache:'no-store',credentials:'omit',signal});
+    if(!response.ok)throw new Error(t('API Wikimedia: {host}, HTTP {status}',{host:url.hostname,status:response.status}));
+    const payload: unknown=await response.json();
+    if(!isRecord(payload)||'error' in payload)throw new Error(t('Risposta API Wikimedia non valida: {host}',{host:url.hostname}));
+    return payload;
+  }
+  for(let attempt=0;attempt<3;attempt++) {
+    // A shared rolling budget includes identity lookups, retries and later submissions.
+    // A cooldown from any wiki also applies to all other profile workers in this tab.
+    while(true) {
+      signal?.throwIfAborted();
+      const now=Date.now();
+      while(profileAPIStarts.length&&profileAPIStarts[0]<=now-60_000)profileAPIStarts.shift();
+      const wait=Math.max(profileAPINotBefore-now,profileAPIStarts.length>=180?profileAPIStarts[0]+60_000-now:0);
+      if(wait<=0){profileAPIStarts.push(now);break;}
+      const seconds=Math.ceil(wait/1000);
+      if(wait>60_000)throw new Error(t('API Wikimedia: {host}, riprova tra {seconds} s',{host:url.hostname,seconds}));
+      onWait(seconds);await profileWait(wait,signal);
+    }
+    const controller=new AbortController();
+    const abort=()=>controller.abort(signal?.reason);
+    signal?.addEventListener('abort',abort,{once:true});
+    const timer=setTimeout(()=>controller.abort(),15_000);
+    let failure: Error | null=null,retry=false,delay=5000*2**attempt;
+    try {
+      const response=await fetch(url.href,{cache:'no-store',credentials:'omit',signal:controller.signal});
+      const after=response.headers.get('Retry-After');
+      if(after!==null) {
+        const seconds=Number(after),date=Date.parse(after);
+        if(after.trim()!==''&&Number.isFinite(seconds)&&seconds>=0)delay=seconds*1000;
+        else if(Number.isFinite(date))delay=Math.max(0,date-Date.now());
+      }
+      if(!response.ok) {
+        failure=new Error(t('API Wikimedia: {host}, HTTP {status}',{host:url.hostname,status:response.status}));
+        retry=[429,502,503,504].includes(response.status);
+        throw failure;
+      }
+      let payload: unknown;
+      try {payload=await response.json();}
+      catch {failure=new Error(t('Risposta API Wikimedia non valida: {host}',{host:url.hostname}));throw failure;}
+      if(!isRecord(payload)) {
+        failure=new Error(t('Risposta API Wikimedia non valida: {host}',{host:url.hostname}));throw failure;
+      }
+      if('error' in payload) {
+        const code=isRecord(payload.error)&&typeof payload.error.code==='string'?payload.error.code:'unknown';
+        failure=new Error(t('API Wikimedia: {host}, errore {code}',{host:url.hostname,code}));
+        retry=['ratelimited','maxlag'].includes(code);throw failure;
+      }
+      signal?.throwIfAborted();
+      return payload;
+    } catch {
+      signal?.throwIfAborted();
+      if(controller.signal.aborted) {
+        failure=new Error(t('API Wikimedia: {host}, tempo di attesa scaduto',{host:url.hostname}));retry=true;
+      } else if(!failure) {
+        failure=new Error(t('API Wikimedia: {host}, errore di rete',{host:url.hostname}));retry=true;
+      }
+      if(!retry)throw failure;
+      profileAPINotBefore=Math.max(profileAPINotBefore,Date.now()+delay);
+      if(attempt===2)throw failure;
+      if(delay>60_000)throw new Error(failure.message+'. '+t('API Wikimedia: {host}, riprova tra {seconds} s',{
+        host:url.hostname,seconds:Math.ceil(delay/1000)}));
+    } finally {
+      clearTimeout(timer);signal?.removeEventListener('abort',abort);
+    }
+  }
+  throw new Error(t('Risposta API Wikimedia non valida: {host}',{host:url.hostname}));
 }
 function attachedWikipedia(value: unknown): {language: string; id: number; url: string} | null {
   if(!value||typeof value!=='object')return null;
@@ -721,48 +817,76 @@ function attachedWikipedia(value: unknown): {language: string; id: number; url: 
   if(!match||typeof wiki.wiki!=='string'||!wiki.wiki.endsWith('wiki'))return null;
   return {language:match[1],id:wiki.id,url:`https://${match[1]}.wikipedia.org`};
 }
-async function recentWikipediaEdits(username: string, signal: AbortSignal): Promise<RecentEdit[]> {
+async function recentWikipediaEdits(username: string, signal: AbortSignal, progress: (message: string) => void = ()=>{}): Promise<RecentEdit[]> {
   if(!username||username.length>255||/[\u0000-\u001f\u007f#<>|\[\]{}]/.test(username))throw new Error('Nome utente Wikimedia non valido');
   const globalURL=new URL('https://meta.wikimedia.org/w/api.php');
   globalURL.searchParams.set('action','query');globalURL.searchParams.set('meta','globaluserinfo');
   globalURL.searchParams.set('guiuser',username);globalURL.searchParams.set('guiprop','merged');
-  const payload=await wikimediaAPI(globalURL,signal) as {query?: {globaluserinfo?: GlobalUser}};
+  const waiting=(host: string)=>(seconds: number)=>progress(t('Attesa di {seconds} s prima di interrogare {host}…',{host,seconds}));
+  const payload=await wikimediaAPI(globalURL,signal,waiting(globalURL.hostname)) as {query?: {globaluserinfo?: GlobalUser}};
   const user=payload.query?.globaluserinfo;
   if(!user||user.missing||!Number.isSafeInteger(user.id)||user.id<=0||!Array.isArray(user.merged)||typeof user.name!=='string')
     throw new Error('Identità globale Wikimedia non verificata');
   const attached=new Map<string,{language: string; id: number; url: string}>();
   for(const merged of user.merged){const wiki=attachedWikipedia(merged);if(wiki){if(attached.has(wiki.language))throw new Error('Identità globale Wikimedia ambigua');attached.set(wiki.language,wiki);}}
   if(!attached.size)throw new Error('Nessuna Wikipedia collegata all’account globale');
-  const wikis=[...attached.values()], edits: RecentEdit[]=[];
-  let next=0, failure: unknown=null;
+  const available=new Set(datasetEntries.filter(entry=>!entry.demo&&entry.kind!=='aggregate'&&entry.language!=='all').map(entry=>entry.language));
+  const wikis=[...attached.values()].filter(wiki=>available.has(wiki.language));
+  if(!wikis.length) {
+    recentProfileCache=null;profileTopicCache.clear();
+    throw new Error('Nessuna delle Wikipedie collegate all’account è presente nelle raccolte disponibili');
+  }
+  const identity=JSON.stringify([user.id,wikis.map(wiki=>[wiki.language,wiki.id]).sort()]);
+  if(!recentProfileCache||recentProfileCache.identity!==identity||Date.now()-recentProfileCache.started>=300_000) {
+    profileTopicCache.clear();
+    recentProfileCache={identity,started:Date.now(),completed:new Set(),edits:[]};
+  }
+  const cached=recentProfileCache,edits=cached.edits;
+  const status=()=>t('Wikipedie analizzate verificate: {done}/{total}.',{done:cached.completed.size,total:wikis.length});
+  const pending=wikis.filter(wiki=>!cached.completed.has(wiki.language));
+  const failures: string[]=[];
+  let next=0;
+  progress(status());
   async function worker() {
-    while(next<wikis.length&&failure===null) {
-      const wiki=wikis[next++],url=new URL(wiki.url+'/w/api.php');
+    while(next<pending.length&&failures.length===0) {
+      signal.throwIfAborted();
+      const wiki=pending[next++],url=new URL(wiki.url+'/w/api.php');
       url.searchParams.set('action','query');url.searchParams.set('list','usercontribs');
       url.searchParams.set('ucuserids',String(wiki.id));url.searchParams.set('uclimit','100');
       url.searchParams.set('ucprop','ids|title|timestamp');url.searchParams.set('ucdir','older');
+      // Retries and cached responses refer to the same submitted snapshot.
+      url.searchParams.set('ucstart',new Date(cached.started).toISOString());
       try {
-        const result=await wikimediaAPI(url,signal) as {query?: {usercontribs?: UserContribution[]}};
+        const result=await wikimediaAPI(url,signal,seconds=>progress(status()+' '+t(
+          'Attesa di {seconds} s prima di interrogare {host}…',{host:url.hostname,seconds}))) as {query?: {usercontribs?: UserContribution[]}};
         const rows=result.query?.usercontribs;
-        if(!Array.isArray(rows)||rows.length>100)throw new Error('Modifiche Wikimedia non verificabili');
+        const invalid=()=>new Error(t('Modifiche Wikimedia non verificabili: {host}',{host:url.hostname}));
+        if(!Array.isArray(rows)||rows.length>100)throw invalid();
         for(const row of rows) {
-          if(row.userid!==wiki.id||!Number.isSafeInteger(row.ns)||
-            typeof row.timestamp!=='string'||!Number.isFinite(Date.parse(row.timestamp)))throw new Error('Modifiche Wikimedia non verificabili');
+          if(!isRecord(row)||row.userid!==wiki.id||!Number.isSafeInteger(row.ns)||
+            typeof row.timestamp!=='string'||!Number.isFinite(Date.parse(row.timestamp)))throw invalid();
+        }
+        signal.throwIfAborted();
+        for(const row of rows) {
           edits.push({language:wiki.language,page_id:Number.isSafeInteger(row.pageid)&&row.pageid>0?row.pageid:0,
             namespace:row.ns,timestamp:row.timestamp,topic_labels:null});
         }
-        // Trimming the union after each wiki preserves its global top 100,
+        // Trimming after each analyzed wiki preserves the platform-wide top 100,
         // regardless of response order, with at most 200 retained edits.
         edits.sort((a,b)=>b.timestamp.localeCompare(a.timestamp)||a.language.localeCompare(b.language)||a.page_id-b.page_id);
         if(edits.length>100)edits.length=100;
+        cached.completed.add(wiki.language);progress(status());
       } catch(error) {
-        failure=error;
+        signal.throwIfAborted();
+        failures.push(error instanceof Error?error.message:String(error));
       }
     }
   }
-  await Promise.all(Array.from({length:Math.min(8,wikis.length)},()=>worker()));
-  if(failure!==null)throw failure;
-  return edits;
+  await Promise.all(Array.from({length:Math.min(3,pending.length)},()=>worker()));
+  signal.throwIfAborted();
+  if(failures.length)throw new Error(status()+' '+failures.join('; ')+'. '+t(
+    'Riprova: le risposte verificate restano in memoria per cinque minuti dall’inizio della ricerca.'));
+  return edits.slice();
 }
 async function readProfileTopics(entry: ManifestEntry, wanted: Set<number>, signal: AbortSignal,
   schedule: (operation: () => Promise<unknown>) => Promise<unknown> = operation=>operation()): Promise<Map<number, string[] | null>> {
@@ -888,13 +1012,14 @@ async function observedTopics(edits: RecentEdit[], version: number): Promise<Rec
   return enriched;
 }
 async function scoreProfile(edits: RecentEdit[], version: number) {
+  $('profile-status')!.textContent=t('Caricamento dei temi delle pagine modificate…');
   const enriched=await observedTopics(edits,version);
   if(version!==profileRequestVersion||!enriched||!data)return;
   if(!enriched.some(edit=>edit.topic_labels?.length)){
     profileScores=null;$('profile-sort-option')!.disabled=true;
     if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
     candidateCards();
-    $('profile-status')!.textContent=t('Nessuna delle ultime 100 modifiche a voci ha temi utilizzabili nelle ultime raccolte disponibili delle Wikipedie interessate.');
+    $('profile-status')!.textContent=t('Nessuna delle ultime 100 modifiche nelle Wikipedie analizzate ha temi utilizzabili nelle ultime raccolte disponibili.');
     return;
   }
   const report=calculateReport<InterestReport>('interests',{edits:enriched,candidates:data.pages.filter(page=>page.orphan).map(page=>({
@@ -904,22 +1029,23 @@ async function scoreProfile(edits: RecentEdit[], version: number) {
   $('profile-sort-option')!.disabled=false;
   $('candidate-sort')!.value='personalized';candidateLimit=25;candidateCards();
   const languages=[...new Set(enriched.filter(edit=>edit.topic_labels?.length).map(edit=>edit.language))].sort();
-  $('profile-status')!.textContent=t('Profilo: {edits} modifiche in tutte le Wikipedie; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.',
+  $('profile-status')!.textContent=t('Profilo: {edits} modifiche nelle Wikipedie analizzate; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.',
     {edits:number(report.total_edits),known:number(report.known_topic_edits),languages:languages.map(language=>language.toUpperCase()).join(', ')});
 }
 async function applyProfile() {
   if(deorphanizePage&&(!$('dataset')!.value||candidatePreview||document.body.dataset.loading==='true'))return;
   const version=++profileRequestVersion;
-  profileController.abort();profileController=new AbortController();profileTopicCache.clear();
+  profileController.abort();profileController=new AbortController();
   const button=$('profile-apply')!;button.disabled=true;
   profileScores=null;$('profile-sort-option')!.disabled=true;
   if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
-  $('profile-status')!.textContent=t('Caricamento delle ultime 100 modifiche…');
+  $('profile-status')!.textContent=t('Caricamento delle ultime 100 modifiche nelle Wikipedie analizzate…');
   try {
-    const edits=await recentWikipediaEdits(authUsername??$('profile-username')!.value.trim(),profileController.signal);
+    const edits=await recentWikipediaEdits(authUsername??$('profile-username')!.value.trim(),profileController.signal,
+      message=>{if(version===profileRequestVersion)$('profile-status')!.textContent=message;});
     if(version!==profileRequestVersion)return;
     profileContributions=edits;
-    if(!edits.length)throw new Error('L’utente non ha modifiche pubbliche nelle Wikipedie collegate');
+    if(!edits.length)throw new Error('L’utente non ha modifiche pubbliche nelle Wikipedie analizzate collegate');
     await scoreProfile(edits,version);
   } catch(error) {
     if(version===profileRequestVersion) {
@@ -1636,9 +1762,14 @@ function candidateCards() {
   const records=candidatePreview?{}:data.link_candidates||{};
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
   const orphans=data.pages.filter(p=>p.orphan);
-  $('candidate-hide-special')!.setAttribute('aria-pressed',String(showSpecialOrphans));
-  const sorted=orphans.filter(p=>(showSpecialOrphans||!specialOrphanCategory(p))&&
-    p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category));
+  const showDisambiguation=$('candidate-show-disambiguation')!.checked;
+  const showWithoutConnections=$('candidate-show-without-connections')!.checked;
+  const sorted=orphans.filter(p=>{
+    const count=records[pageKey(p)]?.candidate_count;
+    return (showDisambiguation||!specialOrphanCategory(p))&&
+      (showWithoutConnections||(typeof count==='number'&&Number.isSafeInteger(count)&&count>0))&&
+      p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category);
+  });
   const order=$('candidate-sort')!.value||'candidates-desc';
   if(order==='personalized'&&profileScores) {
     const counts=(page: PageObservation)=>records[pageKey(page)]?.candidate_count??0;
@@ -1649,7 +1780,7 @@ function candidateCards() {
     });
   } else sortArticles(sorted,order==='personalized'?'candidates-desc':order);
   sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
-  $('candidate-info')!.textContent=candidatePreview?
+  $('candidate-info')!.textContent=candidatePreview&&!showWithoutConnections?t('Caricamento dei collegamenti possibili…'):candidatePreview?
     t('Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.',{shown:number(Math.min(candidateLimit,sorted.length))}):
     t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
   const box=$('candidate-cards')!;box.replaceChildren();
@@ -2149,8 +2280,17 @@ $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.l
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
-$('candidate-hide-special')?.addEventListener('click',()=>{
-  showSpecialOrphans=!showSpecialOrphans;candidateLimit=25;if(data)candidateCards();
+if(deorphanizePage) {
+  const button=$('candidate-hidden')!,options=$('candidate-hidden-options')!;
+  const open=(visible: boolean)=>{options.hidden=!visible;button.setAttribute('aria-expanded',String(visible));};
+  open(false);
+  button.addEventListener('click',()=>open(Boolean(options.hidden)));
+  $('candidate-hidden-control')!.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&!options.hidden){event.preventDefault();open(false);button.focus();}
+  });
+}
+for(const id of ['candidate-show-disambiguation','candidate-show-without-connections'] as const)$(id)?.addEventListener('change',()=>{
+  candidateLimit=25;if(data)candidateCards();
 });
 $('auth-menu')?.addEventListener('keydown',event=>{
   if(event.key==='Escape') {event.preventDefault();$('auth-menu')!.open=false;$('auth-toggle')!.focus();}

@@ -25,7 +25,7 @@ interface FetchOptions {
   signal?: AbortSignal;
 }
 interface RecordedRequest extends FetchOptions { url: string; method: string; }
-interface MockResponse { ok: boolean; status?: number; json: () => Promise<unknown>; }
+interface MockResponse { ok: boolean; status?: number; headers?: {get: (name: string) => string | null}; json: () => Promise<unknown>; }
 interface HarnessPreferences {
   chooseLanguage?: string;
   storage?: Map<string,string>;
@@ -40,6 +40,7 @@ interface HarnessPreferences {
   reviewsUnavailable?: boolean;
   beforeFetch?: (url: string,options: FetchOptions) => unknown;
   apiResponse?: (url: URL,options: FetchOptions) => unknown;
+  apiHTTP?: (url: URL,options: FetchOptions) => MockResponse | Promise<MockResponse>;
   contentLengths?: Record<string,string | number>;
   cachedFiles?: Record<string,unknown>;
 }
@@ -533,6 +534,9 @@ function findClass(node: Element | undefined,name: string): Element {
   return found;
 }
 const titleLink=(card: Element | undefined): Element=>findClass(card,'candidate-title').children[0];
+function changeCheckbox(nodes: Record<string,Element>,id: string,checked: boolean): void {
+  nodes[id].checked=checked;nodes[id].listeners.change();
+}
 function revisionFixture(url: URL,roots: unknown[]) {
   const language=url.hostname.split('.')[0],pageId=Number(url.searchParams.get('pageids'))||null;
   let title=url.searchParams.get('titles'),id=pageId;
@@ -657,6 +661,7 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
       }
       return {ok:true,status:200,json:async()=>({format:'editorial_reviews_v1',reviews:[...reviewStore.values()]})};
     }
+    if(String(url).startsWith('https://')&&preferences.apiHTTP)return preferences.apiHTTP(new URL(url),options);
     return {ok:true,headers:{get:()=>preferences.contentLengths?.[url]??null},json:async()=>String(url).startsWith('https://')?(preferences.apiResponse?preferences.apiResponse(new URL(url),options):revisionFixture(new URL(url),[raw,...Object.values(files||{})])):options?.cache!=='no-store'&&preferences.cachedFiles?.[url]?preferences.cachedFiles[url]:url.endsWith('manifest.json')?(entries||[{language:'vec',file:'demo.json',date:'2026-10-01',demo:true},{language:'vec',file:'unused.json',date:'2026-09-28',demo:false},{language:'vec',file:'fixture.json',date:'2026-09-29',demo:false}]):files?structuredClone(files[url.slice(5)]):raw};}});
   await nativeReady;
   evaluate(appCode,context,{filename:path.resolve('web/assets/app.js'),importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
@@ -940,6 +945,7 @@ async function checkPaperProfiles() {
 
 async function checkDeorphanize() {
   const raw=fixture();
+  const eligible=raw.pages.filter(page=>page.orphan&&(raw.link_candidates[page.page_id]?.candidate_count??0)>0);
   const {nodes,html}=await harness('deorphanize',raw);
   assert(html.includes('<h1 data-i18n="De-orfanizzare le pagine">De-orfanizzare le pagine</h1>'));
   assert(!html.includes('candidate-coverage'));
@@ -949,7 +955,8 @@ async function checkDeorphanize() {
   assert.equal(footer.children[0].tag,'span'); // synthetic titles never open Wikipedia
   assert.equal(footer.children[1].textContent,'Connetti');
   assert.match(footer.children[1].href,/^connections\.html\?dataset=fixture\.json&page=\d+$/);
-  nodes['candidate-more'].listeners.click();assert.equal(nodes['candidate-cards'].children.length,50);
+  nodes['candidate-more'].listeners.click();assert.equal(nodes['candidate-cards'].children.length,Math.min(50,eligible.length));
+  assert(nodes['candidate-cards'].children.every(card=>eligible.some(page=>page.title===titleLink(card).textContent)));
   nodes['candidate-search'].value='none';nodes['candidate-search'].listeners.input();
   assert.equal(nodes['candidate-cards'].children[0].textContent,'Nessuna voce orfana corrispondente.');
   nodes['candidate-search'].value='';nodes['candidate-category'].value='scri';nodes['candidate-category'].listeners.input();
@@ -1009,17 +1016,21 @@ async function checkProgressiveCandidates() {
     ['data/manifest.json','data/lmo-summary.json','data/vec-summary.json'].sort());
   nodes.dataset.value='vec';const first=nodes.dataset.listeners.change();
   await new Promise<void>(resolve=>setImmediate(resolve));
-  assert.equal(document.body.dataset.loading,'false');assert.equal(cards().length,25);
-  assert.match(nodes['candidate-info'].textContent,/Anteprima: 25/);
+  assert.equal(document.body.dataset.loading,'false');assert.equal(cards().length,0);
+  assert.match(nodes['candidate-info'].textContent,/Caricamento dei collegamenti possibili/);
+  changeCheckbox(nodes,'candidate-show-without-connections',true);
+  assert.equal(cards().length,25);assert.match(nodes['candidate-info'].textContent,/Anteprima: 25/);
   assert.match(nodes.status.textContent,/Caricamento dell’elenco completo/);
   assert.equal(nodes['candidate-more'].hidden,true);
   assert(cards().every(card=>findClass(card,'candidate-badge').textContent==='…'));
   assert(cards().every(card=>findClass(card,'fix-link').getAttribute('aria-disabled')==='true'));
   assert.equal(result.requests.filter(row=>row.url==='data/vec-summary.json').length,1);
   assert(!result.requests.some(row=>row.url.startsWith('https://')));
-  const target=required(raw.pages.find(page=>page.orphan&& !summary.article_preview?.some(preview=>preview.page_id===page.page_id)));
+  const target=required(raw.pages.find(page=>page.orphan&&(raw.link_candidates[page.page_id]?.candidate_count??0)>0&&
+    !summary.article_preview?.some(preview=>preview.page_id===page.page_id)));
+  changeCheckbox(nodes,'candidate-show-without-connections',false);assert.equal(cards().length,0);
   nodes['candidate-search'].value=target.title;nodes['candidate-search'].listeners.input();
-  assert.match(nodes['candidate-info'].textContent,/Anteprima/);
+  assert.match(nodes['candidate-info'].textContent,/Caricamento dei collegamenti possibili/);
   required(pending.get('data/vec.json')).release();await first;
   assert.equal(evaluate('candidatePreview',context),false);
   assert.equal(nodes['candidate-search'].value,target.title);
@@ -1028,8 +1039,11 @@ async function checkProgressiveCandidates() {
   assert.equal(nodes['profile-apply'].disabled,false);
   nodes.dataset.value='lmo';const stale=nodes.dataset.listeners.change();
   await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(cards().length,0);
+  changeCheckbox(nodes,'candidate-show-without-connections',true);
   assert.equal(cards().length,25);assert.equal(evaluate('data.metadata.language',context),'lmo');
   assert(cards().every(card=>findClass(card,'connect-button').href.includes('dataset=lmo.json')));
+  changeCheckbox(nodes,'candidate-show-without-connections',false);assert.equal(cards().length,0);
   const previous=required(pending.get('data/lmo.json'));
   nodes.dataset.value='vec';await nodes.dataset.listeners.change();await stale;
   assert(previous.signal.aborted);assert.equal(evaluate('data.metadata.language',context),'vec');
@@ -1048,7 +1062,7 @@ async function checkProgressiveCandidates() {
   assert.equal(fallback.document.body.dataset.loading,'false');
   assert.equal(evaluate('candidatePreview',fallback.context),false);
   assert.equal(JSON.stringify(files),original);
-  console.log('Progressive orphan cards: aggregate entry opens Select, two bounded preview preloads, immediate per-language cards, preserved search, full replacement, abort on switch, explicit aggregate and stale-preview fallback passed.');
+  console.log('Progressive orphan cards: unverified preview counts hidden by default, opt-in previews, bounded preloads, preserved search, replacement, cancellation, aggregate and stale-preview fallback passed.');
 }
 async function checkCompactLists() {
   const raw=fixture(),template=raw.pages[0];
@@ -1107,20 +1121,31 @@ async function checkCandidateSorting() {
     1:{candidate_count:0},2:{candidate_count:2},3:{candidate_count:2},
     4:{candidate_count:null},6:{candidate_count:5}
   };
-  const {nodes,html}=await harness('deorphanize',raw);
+  const {nodes,html,context}=await harness('deorphanize',raw);
   for(const order of ['candidates-desc','candidates-asc'])assert(html.includes(`value="${order}"`));
-  const titles=()=>nodes['candidate-cards'].children.map(card=>titleLink(card).textContent);
-  assert.deepEqual(titles(),['Highest','Alfa','Beta','Zero','Absent','Unknown']);
+  const titles=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
+  assert.deepEqual(titles(),['Highest','Alfa','Beta']);
   for(const [order,expected] of [
-    ['candidates-asc',['Zero','Alfa','Beta','Highest','Absent','Unknown']],
-    ['candidates-desc',['Highest','Alfa','Beta','Zero','Absent','Unknown']]
+    ['candidates-asc',['Alfa','Beta','Highest']],
+    ['candidates-desc',['Highest','Alfa','Beta']]
   ] as const) {
     nodes['candidate-sort'].value=order;nodes['candidate-sort'].listeners.input();
     assert.deepEqual(titles(),expected);
   }
-  console.log('Candidate sorting: ascending/descending counts, ties, zero and missing data passed.');
+  changeCheckbox(nodes,'candidate-show-without-connections',true);
+  assert.deepEqual(titles(),['Highest','Alfa','Beta','Zero','Absent','Unknown']);
+  nodes['candidate-sort'].value='candidates-asc';nodes['candidate-sort'].listeners.input();
+  assert.deepEqual(titles(),['Zero','Alfa','Beta','Highest','Absent','Unknown']);
+  changeCheckbox(nodes,'candidate-show-without-connections',false);
+  assert.deepEqual(titles(),['Alfa','Beta','Highest']);
+  evaluate(`profileScores=new Map(data.pages.map(page=>[pageKey(page),{topic:page.page_id===1?100:1,language:0}]));
+    $('profile-sort-option').disabled=false;$('candidate-sort').value='personalized';candidateCards();`,context);
+  assert.deepEqual(titles(),['Highest','Alfa','Beta']);
+  changeCheckbox(nodes,'candidate-show-without-connections',true);assert.equal(titles()[0],'Zero');
+  changeCheckbox(nodes,'candidate-show-without-connections',false);assert.deepEqual(titles(),['Highest','Alfa','Beta']);
+  console.log('Candidate sorting: positive counts by default, reversible zero/missing visibility, personalized exclusions, ascending/descending counts and ties passed.');
 }
-async function checkSpecialOrphanFilter() {
+async function checkHiddenPages() {
   const raw=fixture(),template=required(raw.pages.find(page=>page.orphan));
   raw.metadata.demo=false;
   const excluded=['Disambigua','Disanbìgue','Pagine di disambiguazione','  INSIEMI_DI_CARATTERI  ',
@@ -1132,50 +1157,88 @@ async function checkSpecialOrphanFilter() {
   visible[2].title='Disambigua';visible[3].title='Insiemi di caratteri';
   visible[4].topic_labels=['STEM.Computing'];
   const hidden=excluded.map((category,i)=>({...template,page_id:100+i,title:`Excluded ${i+1}`,category}));
-  raw.pages=[...visible,...hidden,{...template,page_id:200,title:'Not orphan',orphan:false,category:'Musica'}];
-  raw.link_candidates={};
+  const unavailable=[
+    {...template,page_id:201,title:'No connections',category:'Musica'},
+    {...template,page_id:202,title:'Unknown connections',category:'Musica'},
+    {...template,page_id:203,title:'Absent connections',category:'Musica'}];
+  const both={...template,page_id:204,title:'Both hidden',category:'Disambigua'};
+  raw.pages=[...visible,...hidden,...unavailable,both,{...template,page_id:200,title:'Not orphan',orphan:false,category:'Musica'}];
+  raw.link_candidates=Object.fromEntries([...visible,...hidden].map(page=>[page.page_id,{status:'compared',candidate_count:1,candidates:[]}]));
+  raw.link_candidates[201]={status:'compared',candidate_count:0,candidates:[]};
+  raw.link_candidates[202]={status:'missing_item',candidate_count:null,candidates:[]};
+  raw.link_candidates[204]={status:'compared',candidate_count:0,candidates:[]};
   const original=JSON.stringify(raw),columns=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'];
   const index: CardIndexFixture={format:'orphan_cards_v2',metadata:raw.metadata,census_page_count:raw.pages.length,
-    card_identity:'a'.repeat(64),columns,rows:raw.pages.filter(page=>page.orphan).map(page=>columns.map(key=>page[key]??null)),link_candidates:{}};
+    card_identity:'a'.repeat(64),columns,rows:raw.pages.filter(page=>page.orphan).map(page=>columns.map(key=>page[key]??null)),
+    link_candidates:Object.fromEntries(Object.entries(raw.link_candidates).map(([id,record])=>[id,{...required(record),candidate_ids:[]}]))};
   const legacy={format:'orphan_cards_v1',metadata:raw.metadata,census_page_count:raw.pages.length,
-    pages:raw.pages.filter(page=>page.orphan),link_candidates:{}};
+    pages:raw.pages.filter(page=>page.orphan),link_candidates:raw.link_candidates};
   const entry: ManifestEntry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:raw.metadata.demo};
   const files={'fixture.json':raw,'cards.json':index,'legacy-cards.json':legacy};
   for(const transport of [entry,{...entry,cards_file:'legacy-cards.json'},
     {...entry,cards_file:'cards.json',cards_dir:'card-records'}]) {
     const result=await harness('deorphanize',raw,'?dataset=fixture.json',[transport],{},files),{nodes,html}=result;
-    const toggle=nodes['candidate-hide-special'];
+    const toggle=nodes['candidate-hidden'],options=nodes['candidate-hidden-options'];
+    const disambiguation=nodes['candidate-show-disambiguation'],connections=nodes['candidate-show-without-connections'];
     const titles=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
-    assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hide-special"[^>]*aria-pressed="false"/);
+    assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hidden"[^>]*aria-expanded="false"[^>]*aria-controls="candidate-hidden-options"/);
     assert(!html.includes('Gli interessi usano'));
     assert.equal(nodes['review-service-status'].textContent,'');
-    assert.equal(toggle.getAttribute('aria-pressed'),'false');
+    assert.equal(toggle.getAttribute('aria-expanded'),'false');assert.equal(options.hidden,true);
+    assert.equal(disambiguation.checked,false);assert.equal(connections.checked,false);
     assert.match(nodes['candidate-info'].textContent,/30 orfane/);
     assert.equal(titles().length,25);assert(!titles().some(title=>title.startsWith('Excluded')));
     nodes['candidate-more'].listeners.click();assert.equal(titles().length,30);
     assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));
-    toggle.listeners.click();assert.equal(toggle.getAttribute('aria-pressed'),'true');
-    assert.equal(titles().length,25);assert.match(nodes['candidate-info'].textContent,/40 orfane/);
+    const beforeOpen=titles(),fetches=result.getFetchCount();
+    toggle.listeners.click();assert.equal(toggle.getAttribute('aria-expanded'),'true');assert.equal(options.hidden,false);
+    assert.deepEqual(titles(),beforeOpen);assert.equal(result.getFetchCount(),fetches);
+    toggle.listeners.click();assert.equal(options.hidden,true);assert.deepEqual(titles(),beforeOpen);
+    toggle.listeners.click();
+    // Independent controls: the overlap requires both; checkbox changes keep the list open.
+    for(const [showDisambiguation,showWithoutConnections,total] of [
+      [true,false,40],[false,true,33],[true,true,44],[false,false,30]
+    ] as const) {
+      changeCheckbox(nodes,'candidate-show-disambiguation',showDisambiguation);
+      changeCheckbox(nodes,'candidate-show-without-connections',showWithoutConnections);
+      assert.equal(options.hidden,false);assert.equal(titles().length,25);
+      assert.match(nodes['candidate-info'].textContent,new RegExp('^'+total+' orfane'));
+      nodes['candidate-more'].listeners.click();assert.equal(titles().length,total);
+      assert.equal(titles().includes('Excluded 1'),showDisambiguation);
+      for(const page of unavailable)assert.equal(titles().includes(page.title),showWithoutConnections);
+      assert.equal(titles().includes(both.title),showDisambiguation&&showWithoutConnections);
+    }
+    changeCheckbox(nodes,'candidate-show-disambiguation',true);
+    changeCheckbox(nodes,'candidate-show-without-connections',true);
     nodes['candidate-search'].value='Excluded';nodes['candidate-search'].listeners.input();
     assert.equal(titles().length,excluded.length);
-    toggle.listeners.click();assert.equal(titles().length,0);assert.equal(nodes['candidate-more'].hidden,true);
+    changeCheckbox(nodes,'candidate-show-disambiguation',false);
+    assert.equal(titles().length,0);assert.equal(nodes['candidate-more'].hidden,true);
     assert.equal(nodes['candidate-cards'].children[0].textContent,'Nessuna voce orfana corrispondente.');
     nodes['candidate-search'].value='';nodes['candidate-search'].listeners.input();
     nodes['candidate-category'].value='insiemi';nodes['candidate-category'].listeners.input();assert.equal(titles().length,0);
-    toggle.listeners.click();assert.deepEqual(titles(),['Excluded 4']);
+    changeCheckbox(nodes,'candidate-show-disambiguation',true);assert.deepEqual(titles(),['Excluded 4']);
     nodes['candidate-sort'].value='candidates-asc';nodes['candidate-sort'].listeners.input();
-    assert.equal(toggle.getAttribute('aria-pressed'),'true');assert.deepEqual(titles(),['Excluded 4']);
+    assert.equal(toggle.getAttribute('aria-expanded'),'true');assert.deepEqual(titles(),['Excluded 4']);
     nodes['ui-language-toggle'].listeners.click();
-    assert.equal(toggle.textContent,'Show disambiguation pages');
-    assert.equal(toggle.title,'Filter based on the displayed category.');
-    assert.equal(toggle.getAttribute('aria-pressed'),'true');
+    assert.equal(toggle.textContent,'Hidden pages');
+    assert.equal(toggle.title,'Choose which hidden pages to show.');
+    assert(result.staticNodes.some(node=>node.textContent==='Show disambiguation pages'));
+    assert(result.staticNodes.some(node=>node.textContent==='Show pages without possible connections'));
+    assert.equal(disambiguation.checked,true);assert.equal(connections.checked,true);
+    let prevented=false;
+    nodes['candidate-hidden-control'].listeners.keydown({key:'Escape',preventDefault(){prevented=true;}});
+    assert(prevented);assert.equal(options.hidden,true);assert.equal(toggle.getAttribute('aria-expanded'),'false');
+    assert.equal(toggle.focused,true);assert.deepEqual(titles(),['Excluded 4']);
+    toggle.listeners.click();assert.equal(options.hidden,false);
+    assert.equal(disambiguation.checked,true);assert.equal(connections.checked,true);
     assert(!result.requests.some(request=>request.url.startsWith('https://')||request.url.startsWith('data/card-records/')));
   }
   const articles=await harness('articles',raw);
   articles.nodes['article-search'].value='Excluded';articles.nodes['article-search'].listeners.input();
   assert.equal(articles.nodes['article-rows'].children.length,excluded.length);
   assert.equal(JSON.stringify(raw),original);
-  console.log('Show special orphans: off by default, reversible, category-only, canonical/legacy/index parity, pagination, combined controls and translations passed.');
+  console.log('Hidden pages: disclosure without filtering, independent checkboxes/overlap, unchecked defaults, Escape/focus, canonical/legacy/index parity, pagination, translations and unchanged data passed.');
 }
 async function checkConnections() {
   const raw=fixture();
@@ -1348,6 +1411,7 @@ async function checkFixPrompts() {
   evaluate('candidateCards()',context);await preparePrompt(result,fix());
   assert(result.requests.slice(before).some(row=>new URL(row.url).searchParams.get('titles')==='Reference unknown'));
   assert(result.requests.slice(before).every(row=>new URL(row.url).searchParams.get('action')==='query'));
+  changeCheckbox(nodes,'candidate-show-without-connections',true);
   for(const record of [undefined,{candidate_count:null,candidates},{candidate_count:0,candidates:[]},{candidate_count:1,candidates:[{page_id:2,title:'No evidence',evidence:[{language:'lmo.evil',source_title:'X',target_title:'Y'}]}]}]) {
     raw.link_candidates[1]=record;evaluate('candidateCards()',context);assert.equal(fix().tag,'span');assert.equal(fix()['aria-disabled'],'true');
   }
@@ -1621,7 +1685,7 @@ async function checkPreferences() {
       assert(nodes['candidate-cards'].children.every(card=>raw.pages.some(p=>p.title===titleLink(card).textContent)));
       nodes['candidate-more'].listeners.click();
       nodes['ui-language-toggle'].listeners.click();
-      assert.equal(nodes['candidate-cards'].children.length,50);
+      assert.equal(nodes['candidate-cards'].children.length,Math.min(50,raw.pages.filter(p=>p.orphan&&(raw.link_candidates[p.page_id]?.candidate_count??0)>0).length));
     } else {
       assert.equal(nodes['connection-title'].textContent,'Titolo originale');
       const card=nodes['connection-candidates'].children[0];
@@ -1706,10 +1770,12 @@ async function checkAggregation() {
       assert.deepEqual(rows.map(r=>r.children[5].textContent),['100%','50%']);
     }
     if(page==='deorphanize') {
-      const cards=nodes['candidate-cards'].children;
-      assert.equal(cards.length,3);
+      let cards=nodes['candidate-cards'].children;
+      assert.equal(cards.length,1);
       assert.match(findClass(cards[0],'connect-button').href,/language=vec/);
       assert.equal(findClass(cards[0],'candidate-badge').textContent,'1');
+      changeCheckbox(nodes,'candidate-show-without-connections',true);cards=nodes['candidate-cards'].children;
+      assert.equal(cards.length,3);
       assert.equal(findClass(cards[2],'candidate-badge').textContent,'—');
     }
     if(page==='connections') {
@@ -2075,8 +2141,12 @@ async function checkCardIndex() {
   assert.equal(evaluate('Object.values(data.link_candidates).filter(record=>record.candidates).length',next.context),25);
   for(const [search,badge] of [['Target 299','0'],['Target 300','—']]) {
     const before=next.requests.length;await change('candidate-search',search);
+    assert.equal(cards(next).length,0);assert.equal(next.requests.length,before);
+    for(const result of [old,next])changeCheckbox(result.nodes,'candidate-show-without-connections',true);
+    await evaluate('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));
     assert.equal(findClass(cards(next)[0],'candidate-badge').textContent,badge);
     assert.equal(next.requests.length,before);
+    for(const result of [old,next])changeCheckbox(result.nodes,'candidate-show-without-connections',false);
   }
   const lmoMetadata={...raw.metadata,language:'lmo',creators:{...raw.metadata.creators,language:'lmo',languages_scanned:['lmo']}};
   const lmoIndex=structuredClone(index);lmoIndex.metadata=lmoMetadata;lmoIndex.card_identity='b'.repeat(64);
@@ -2402,7 +2472,7 @@ async function checkWikipediaAuthentication() {
 async function checkPersonalization() {
   const raw=fixture();raw.metadata.demo=false;
   raw.metadata.topics={status:'predicted'};
-  const target=raw.pages.find(page=>page.orphan);
+  const target=raw.pages.find(page=>page.orphan&&(raw.link_candidates[page.page_id]?.candidate_count??0)>0);
   for(const page of raw.pages){page.topic_status='predicted';page.topic_labels=page.page_id===required(target).page_id?['Culture.Media.Music']:[];}
   const entries=[{language:'vec',file:'fixture.json',date:raw.metadata.finished_at,demo:false,observations_file:'fixture-observations.json'}];
   const files={'fixture.json':raw,'fixture-observations.json':{
@@ -2411,7 +2481,8 @@ async function checkPersonalization() {
   const apiResponse=(url: URL)=>{
     if(url.hostname==='meta.wikimedia.org')return {query:{globaluserinfo:{id:1,name:'Editor',merged:[
       {wiki:'vecwiki',url:'https://vec.wikipedia.org',id:11,editcount:1},
-      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1}]}}};
+      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1},
+      ...Array.from({length:133},(_,i)=>({wiki:'a'+i+'wiki',url:'https://a'+i+'.wikipedia.org',id:i+100,editcount:0}))]}}};
     if(url.hostname==='vec.wikipedia.org')return {query:{usercontribs:[{userid:11,pageid:required(target).page_id,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}};
     if(url.hostname==='en.wikipedia.org')return {query:{usercontribs:[{userid:22,pageid:999,ns:0,timestamp:'2026-09-30T00:00:00Z'}]}};
     throw new Error('Unapproved API');
@@ -2424,9 +2495,10 @@ async function checkPersonalization() {
   assert.equal(result.nodes['candidate-sort'].value,'personalized');
   assert.equal(result.nodes['profile-sort-option'].disabled,false);
   assert.equal(titleLink(result.nodes['candidate-cards'].children[0]).textContent,required(target).title);
-  assert.match(result.nodes['profile-status'].textContent,/2 modifiche.*1/);
+  assert.match(result.nodes['profile-status'].textContent,/1 modifiche nelle Wikipedie analizzate.*1/);
   const api=result.requests.filter(request=>request.url.startsWith('https://')).map(request=>new URL(request.url));
-  assert.equal(api.length,3);
+  assert.equal(api.length,2);
+  assert.deepEqual(api.map(url=>url.hostname),['meta.wikimedia.org','vec.wikipedia.org']);
   assert(api.every(url=>url.searchParams.get('origin')==='*'&&['globaluserinfo','usercontribs'].includes(url.searchParams.get('meta')||url.searchParams.get('list')||'')));
   assert(api.filter(url=>url.searchParams.get('list')==='usercontribs').every(url=>url.searchParams.get('uclimit')==='100'&&url.searchParams.has('ucuserids')));
   const uncovered=await harness('deorphanize',raw,'?dataset=fixture.json',entries.map(({observations_file,...entry})=>entry),{apiResponse},{'fixture.json':raw});
@@ -2437,15 +2509,24 @@ async function checkPersonalization() {
   assert.equal(uncovered.nodes['profile-sort-option'].disabled,true);
   assert.match(uncovered.nodes['profile-status'].textContent,/Nessuna.*temi utilizzabili/);
   assert.equal(evaluate('interestCalls',uncovered.context),0);
-  const outside=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiResponse:url=>{
+  const outside=await harness('deorphanize',raw,'?dataset=fixture.json',[
+    ...entries,{language:'en',file:'demo-en.json',date:raw.metadata.finished_at,demo:true},
+    {language:'fr',kind:'aggregate',file:'aggregate-fr.json',date:raw.metadata.finished_at}],{apiResponse:url=>{
     if(url.hostname==='meta.wikimedia.org')return {query:{globaluserinfo:{id:1,name:'Editor',merged:[
-      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1}]}}};
+      {wiki:'enwiki',url:'https://en.wikipedia.org',id:22,editcount:1},
+      {wiki:'frwiki',url:'https://fr.wikipedia.org',id:33,editcount:1},
+      {wiki:'dewiki',url:'https://de.wikipedia.org',id:44,editcount:1}]}}};
     return {query:{usercontribs:[{userid:22,pageid:999,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}};
   }},files);
   outside.nodes['profile-username'].value='Editor';outside.nodes['profile-apply'].listeners.click();
   await new Promise<void>(resolve=>setImmediate(resolve));await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(outside.nodes['profile-sort-option'].disabled,true);
-  assert.match(outside.nodes['profile-status'].textContent,/Nessuna delle ultime 100 modifiche/);
+  assert.match(outside.nodes['profile-status'].textContent,/Nessuna delle Wikipedie collegate all’account è presente nelle raccolte disponibili/);
+  assert.equal(outside.requests.filter(request=>request.url.startsWith('https://')).length,1);
+  outside.nodes['ui-language-toggle'].listeners.click();
+  await evaluateAsync('applyProfile()',outside.context);
+  assert.match(outside.nodes['profile-status'].textContent,/None of the Wikipedias attached to the account is present in the available collections/);
+  assert.equal(outside.requests.filter(request=>request.url.startsWith('https://')).length,2);
   const missing=structuredClone(raw);delete missing.metadata.topics;
   const noModel=await harness('deorphanize',missing,'?dataset=fixture.json',entries,{apiResponse},
     {'fixture.json':missing,'fixture-observations.json':{...files['fixture-observations.json'],metadata:missing.metadata}});
@@ -2457,7 +2538,7 @@ async function checkPersonalization() {
   // English edits inform the ranking of Venetian cards without loading English
   // cards or an aggregate. Read only the newest real census for each language.
   const crossRaw=structuredClone(raw);
-  const crossTarget=crossRaw.pages.filter(page=>page.orphan).at(-1);
+  const crossTarget=crossRaw.pages.filter(page=>page.orphan&&(crossRaw.link_candidates[page.page_id]?.candidate_count??0)>0).at(-1);
   assert.notEqual(required(crossTarget).page_id,required(target).page_id);
   for(const page of crossRaw.pages)page.topic_labels=page.page_id===required(crossTarget).page_id?['Culture.Media.Music']:[];
   const englishMetadata={...raw.metadata,language:'en',finished_at:'2026-10-02T00:00:00Z'};
@@ -2479,7 +2560,7 @@ async function checkPersonalization() {
   assert.equal(cross.nodes['candidate-sort'].value,'personalized');
   assert.equal(titleLink(cross.nodes['candidate-cards'].children[0]).textContent,required(crossTarget).title);
   assert.equal(cross.nodes['candidate-cards'].children.length,25);
-  assert.match(cross.nodes['candidate-info'].textContent,new RegExp(`^${crossRaw.pages.filter(page=>page.orphan).length} orfane`));
+  assert.match(cross.nodes['candidate-info'].textContent,new RegExp(`^${crossRaw.pages.filter(page=>page.orphan&&(crossRaw.link_candidates[page.page_id]?.candidate_count??0)>0).length} orfane`));
   assert.match(cross.nodes['profile-status'].textContent,/2 modifiche.*2.*EN, VEC/);
   assert(cross.requests.some(request=>request.url==='data/en-observations.json'));
   assert(!cross.requests.some(request=>/en-old|en-demo|all\.json|all-observations|en-new\.json/.test(request.url)));
@@ -2500,7 +2581,165 @@ async function checkPersonalization() {
     assert.equal(invalid.nodes['profile-sort-option'].disabled,true);
     assert.match(invalid.nodes['profile-status'].textContent,/Personalizzazione non disponibile/);
   }
-  console.log('Personalization: explicit identity lookup, cross-language topics, latest manifest census, coverage, validation and topic-first ranking passed.');
+  console.log('Personalization: 135 attached wikis restricted to real platform editions, demo/aggregate/uncollected exclusions, cross-language topics, coverage, translations and topic-first ranking passed.');
+}
+async function checkPersonalizationRecovery() {
+  const raw=fixture();raw.metadata.demo=false;raw.metadata.topics={status:'predicted'};
+  const target=required(raw.pages.find(page=>page.orphan));
+  for(const page of raw.pages){page.topic_status='predicted';page.topic_labels=['Culture.Media.Music'];}
+  const entries=[{language:'vec',file:'fixture.json',date:raw.metadata.finished_at,observations_file:'topics.json'}];
+  const files={'fixture.json':raw,'topics.json':{format:'observations_v1',metadata:raw.metadata,
+    columns:['page_id','topic_labels','topic_status'],rows:[[target.page_id,['Culture.Media.Music'],'predicted']]}};
+  const ok=(payload: unknown): MockResponse=>({ok:true,status:200,headers:{get:()=>null},json:async()=>payload});
+  const global=(languages: string[],id=1)=>({query:{globaluserinfo:{id,name:'Editor',merged:languages.map((language,i)=>({
+    wiki:language+'wiki',url:'https://'+language+'.wikipedia.org',id:i+11,editcount:0}))}}});
+  const edits=(id: number)=>({query:{usercontribs:[{userid:id,pageid:target.page_id,ns:0,timestamp:'2026-10-01T00:00:00Z'}]}});
+  const flush=async()=>{await new Promise<void>(resolve=>setImmediate(resolve));};
+  const clock=(context: vm.Context)=>{
+    evaluate(`globalThis.profileNow=Date.now();Date.now=()=>profileNow;
+      globalThis.profileTimers=new Map();globalThis.profileTimerId=0;
+      setTimeout=(callback,delay)=>{const id=++profileTimerId;profileTimers.set(id,{callback,due:profileNow+delay});return id;};
+      clearTimeout=id=>profileTimers.delete(id);`,context);
+    return async(milliseconds: number)=>{
+      evaluate(`profileNow+=${milliseconds};for(const [id,timer] of [...profileTimers])if(timer.due<=profileNow){profileTimers.delete(id);timer.callback();}`,context);
+      await flush();
+    };
+  };
+  const apiRequests=(result: Awaited<ReturnType<typeof harness>>)=>result.requests.filter(request=>request.url.startsWith('https://'));
+  const contributionRequests=(result: Awaited<ReturnType<typeof harness>>)=>apiRequests(result).filter(request=>new URL(request.url).searchParams.get('list')==='usercontribs');
+
+  // A failed wiki keeps successful snapshots without publishing an incomplete ranking.
+  let available=false,globalId=1;
+  const cacheEntries=[...entries,...['en','fr'].map(language=>({language,file:language+'.json',date:raw.metadata.finished_at}))];
+  const cached=await harness('deorphanize',raw,'?dataset=fixture.json',cacheEntries,{apiHTTP:url=>{
+    if(url.hostname==='meta.wikimedia.org')return ok(global(['vec','en','fr'],globalId));
+    if(url.hostname==='fr.wikipedia.org'&&!available)return {ok:false,status:403,headers:{get:()=>null},json:async()=>({})};
+    return ok(edits(Number(url.searchParams.get('ucuserids'))));
+  }},files);
+  const advanceCached=clock(cached.context);cached.nodes['profile-username'].value='Editor';
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.match(cached.nodes['profile-status'].textContent,/2\/3.*fr.wikipedia.org, HTTP 403.*cinque minuti/);
+  assert.equal(cached.nodes['profile-sort-option'].disabled,true);
+  assert.equal(evaluate('recentProfileCache.edits.length',cached.context),2);
+  assert.equal(cached.requests.filter(request=>request.url==='data/topics.json').length,0);
+  const snapshot=new URL(required(contributionRequests(cached)[0]).url).searchParams.get('ucstart');
+  const offset=cached.requests.length;available=true;
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.equal(cached.nodes['candidate-sort'].value,'personalized');
+  assert.match(cached.nodes['profile-status'].textContent,/3 modifiche.*1/);
+  const resumed=cached.requests.slice(offset).filter(request=>request.url.startsWith('https://'));
+  assert.equal(resumed.length,2);assert.equal(new URL(resumed[1].url).hostname,'fr.wikipedia.org');
+  assert.equal(new URL(resumed[1].url).searchParams.get('ucstart'),snapshot);
+  const warm=cached.requests.length;
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.equal(cached.requests.length-warm,1); // Reverify identity, reuse edits and requested topics.
+  await advanceCached(300_001);
+  const expired=contributionRequests(cached).length;
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.equal(contributionRequests(cached).length-expired,3);
+  globalId=2;
+  const changed=contributionRequests(cached).length;
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.equal(contributionRequests(cached).length-changed,3);
+  // Removing an edition changes the cache identity and excludes its previous edits.
+  evaluate("datasetEntries=datasetEntries.filter(entry=>entry.language!=='fr')",cached.context);
+  available=false;
+  const rescoped=contributionRequests(cached).length;
+  await evaluateAsync('applyProfile()',cached.context);
+  assert.equal(contributionRequests(cached).length-rescoped,2);
+  assert(contributionRequests(cached).slice(rescoped).every(request=>new URL(request.url).hostname!=='fr.wikipedia.org'));
+  assert.equal(evaluate('recentProfileCache.edits.length',cached.context),2);
+  assert.equal(evaluate('recentProfileCache.completed.size',cached.context),2);
+  assert.equal(cached.nodes['candidate-sort'].value,'personalized');
+  evaluate('clearProfile()',cached.context);
+  assert.equal(evaluate('recentProfileCache',cached.context),null);
+
+  // Retry-After seconds and HTTP dates are respected without real sleeps.
+  let attempts=0;
+  const retry=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:url=>{
+    if(url.hostname==='meta.wikimedia.org')return ok(global(['vec']));
+    attempts++;
+    if(attempts<=2)return {ok:false,status:attempts===1?429:503,
+      headers:{get:()=>attempts===1?'7':new Date(Number(evaluate('Date.now()',retry.context))+9000).toUTCString()},json:async()=>({})};
+    return ok(edits(11));
+  }},files);
+  const advanceRetry=clock(retry.context);retry.nodes['profile-username'].value='Editor';
+  const retryRun=evaluateAsync('applyProfile()',retry.context);await flush();
+  assert.equal(attempts,1);assert.match(retry.nodes['profile-status'].textContent,/0\/1.*7 s.*vec.wikipedia.org/);
+  await advanceRetry(6999);assert.equal(attempts,1);
+  await advanceRetry(1);assert.equal(attempts,2);
+  // HTTP dates have second precision.
+  await advanceRetry(9000);await retryRun;
+  assert.equal(attempts,3);assert.equal(retry.nodes['candidate-sort'].value,'personalized');
+  assert.equal(evaluate('profileTimers.size',retry.context),0);
+
+  const cancelled=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:url=>url.hostname==='meta.wikimedia.org'
+    ?ok(global(['vec'])):{ok:false,status:429,headers:{get:()=> '5'},json:async()=>({})}},files);
+  const advanceCancelled=clock(cancelled.context);cancelled.nodes['profile-username'].value='Editor';
+  const cancelledRun=evaluateAsync('applyProfile()',cancelled.context);await flush();
+  evaluate('clearProfile()',cancelled.context);await cancelledRun;
+  const cancelledCount=apiRequests(cancelled).length;
+  await advanceCancelled(60_000);
+  assert.equal(apiRequests(cancelled).length,cancelledCount);
+  assert.equal(evaluate('profileTimers.size',cancelled.context),0);
+  assert.equal(cancelled.nodes['profile-status'].textContent,'');
+
+  // Slow requests time out, retry a bounded number of times, and identify the host in English.
+  const timeout=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:(url,options)=>{
+    if(url.hostname==='meta.wikimedia.org')return ok(global(['vec']));
+    return new Promise<MockResponse>((_resolve,reject)=>required(options.signal).addEventListener('abort',()=>reject(required(options.signal).reason),{once:true}));
+  }},files);
+  timeout.nodes['ui-language-toggle'].listeners.click();
+  const advanceTimeout=clock(timeout.context);timeout.nodes['profile-username'].value='Editor';
+  const timeoutRun=evaluateAsync('applyProfile()',timeout.context);await flush();
+  for(const duration of [15_000,5000,15_000,10_000,15_000])await advanceTimeout(duration);
+  await timeoutRun;
+  assert.equal(contributionRequests(timeout).length,3);
+  assert.match(timeout.nodes['profile-status'].textContent,/Personalization unavailable.*vec.wikipedia.org, request timed out/);
+  assert.equal(evaluate('profileTimers.size',timeout.context),0);
+
+  // An API error inside HTTP 200 also retries, and a long Retry-After is reported without retrying early.
+  let ratelimited=true;
+  const apiError=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:url=>url.hostname==='meta.wikimedia.org'
+    ?ok(global(['vec'])):ratelimited?{...ok({error:{code:'ratelimited'}}),headers:{get:()=> '8'}}:ok(edits(11))},files);
+  const advanceAPIError=clock(apiError.context);apiError.nodes['profile-username'].value='Editor';
+  const apiErrorRun=evaluateAsync('applyProfile()',apiError.context);await flush();ratelimited=false;
+  await advanceAPIError(7999);assert.equal(contributionRequests(apiError).length,1);
+  await advanceAPIError(1);await apiErrorRun;
+  assert.equal(apiError.nodes['candidate-sort'].value,'personalized');
+  const longWait=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:url=>url.hostname==='meta.wikimedia.org'
+    ?ok(global(['vec'])):{ok:false,status:429,headers:{get:()=> '120'},json:async()=>({})}},files);
+  clock(longWait.context);longWait.nodes['profile-username'].value='Editor';
+  await evaluateAsync('applyProfile()',longWait.context);
+  assert.equal(contributionRequests(longWait).length,1);
+  assert.match(longWait.nodes['profile-status'].textContent,/HTTP 429.*riprova tra 120 s/);
+
+  // Reject a whole malformed response before merging any of its otherwise valid rows.
+  for(const bad of [null,{userid:99,pageid:target.page_id,ns:0,timestamp:'2026-10-01T00:00:00Z'}]) {
+    const invalid=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{apiHTTP:url=>url.hostname==='meta.wikimedia.org'
+      ?ok(global(['vec'])):ok({query:{usercontribs:[edits(11).query.usercontribs[0],bad]}})},files);
+    invalid.nodes['profile-username'].value='Editor';await evaluateAsync('applyProfile()',invalid.context);
+    assert.match(invalid.nodes['profile-status'].textContent,/Modifiche Wikimedia non verificabili: vec.wikipedia.org/);
+    assert.equal(evaluate('recentProfileCache.edits.length',invalid.context),0);
+    assert.equal(evaluate('recentProfileCache.completed.size',invalid.context),0);
+    assert.equal(contributionRequests(invalid).length,1);
+  }
+
+  // The shared rolling budget includes the global identity call and never skips zero counters.
+  const languages=Array.from({length:180},(_,i)=>'a'+i);
+  const budgetEntries=[...entries,...languages.map(language=>({language,file:language+'.json',date:raw.metadata.finished_at}))];
+  const budget=await harness('deorphanize',raw,'?dataset=fixture.json',budgetEntries,{apiHTTP:url=>url.hostname==='meta.wikimedia.org'
+    ?ok(global(languages)):ok({query:{usercontribs:[]}})},files);
+  const advanceBudget=clock(budget.context);
+  let finished=false;
+  const budgetRun=evaluateAsync("recentWikipediaEdits('Editor',profileController.signal)",budget.context).then(value=>{finished=true;return value;});
+  await flush();assert.equal(apiRequests(budget).length,180);assert.equal(finished,false);
+  await advanceBudget(59_999);assert.equal(apiRequests(budget).length,180);
+  await advanceBudget(1);assert.deepEqual(structuredClone(await budgetRun),[]);
+  assert.equal(apiRequests(budget).length,181);assert.equal(contributionRequests(budget).length,180);
+  assert.equal(evaluate('profileAPIStarts.length',budget.context),1);
+  assert.equal(evaluate('profileTimers.size',budget.context),0);
+  console.log('Personalization resilience: bounded retries/timeouts, Retry-After/cooldowns, 180/min budget, cancellation, snapshot cache recovery/expiry/identity and translated errors passed.');
 }
 async function checkProfileTopicShards() {
   const raw=fixture();raw.metadata.demo=false;raw.metadata.topics={status:'predicted'};
@@ -2651,7 +2890,8 @@ async function benchmarkPersonalization() {
   const wikiLanguages=Array.from({length:24},(_,i)=>'a'+String.fromCharCode(97+i));
   const pending: (()=>void)[]=[],contributions=wikiLanguages.flatMap((language,index)=>Array.from({length:100},(_,i)=>({
     language,page_id:1000+i,namespace:0,timestamp:new Date(Date.UTC(2026,9,1,0,Math.floor(index/2),Math.floor(i/2))).toISOString(),topic_labels:null})));
-  const scheduled=await harness('deorphanize',raw,'?dataset=fixture.json',entries,{
+  const scopedEntries=[...entries,...wikiLanguages.map(language=>({language,file:language+'.json',date:raw.metadata.finished_at}))];
+  const scheduled=await harness('deorphanize',raw,'?dataset=fixture.json',scopedEntries,{
     beforeFetch:(url,options)=>String(url).includes('list=usercontribs')?new Promise<void>((resolve,reject)=>{
       pending.push(resolve);required(options.signal).addEventListener('abort',()=>reject(required(options.signal).reason),{once:true});
     }):undefined,
@@ -2674,16 +2914,16 @@ async function benchmarkPersonalization() {
       maxConcurrent=Math.max(maxConcurrent,pending.length);rounds++;
       for(const release of pending.splice(0).reverse())release();
     }
-    assert(rounds<=3);
+    assert(rounds<=8);
   }
   const actual=await recent;
   contributions.sort((a,b)=>b.timestamp.localeCompare(a.timestamp)||a.language.localeCompare(b.language)||a.page_id-b.page_id);
   assert.deepEqual(structuredClone(actual),contributions.slice(0,100));
-  assert.equal(rounds,3);assert.equal(maxConcurrent,8);
+  assert.equal(rounds,8);assert.equal(maxConcurrent,3);
   const retainedPeak=evaluate('Math.max(...retainedEditPeaks)',scheduled.context);
   assert.equal(retainedPeak,200);
   console.log('Personalization deterministic contribution benchmark: '+JSON.stringify({wikipedias:24,edits:100,
-    baseline_rounds:6,optimized_rounds:rounds,max_concurrent:maxConcurrent,previous_retained_peak:2400,retained_peak:retainedPeak}));
+    previous_rounds:3,current_rounds:rounds,max_concurrent:maxConcurrent,previous_retained_peak:2400,retained_peak:retainedPeak}));
 }
 async function checkCreatorHistory() {
   const raw=fixture();
@@ -2912,4 +3152,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkSpecialOrphanFilter();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
