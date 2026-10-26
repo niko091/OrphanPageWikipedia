@@ -1184,18 +1184,22 @@ async function checkHiddenPages() {
     category:i===0?null:i===1?'Disambiguazione linguistica':'Musica'}));
   // Titles and model topics must never substitute for the displayed category.
   visible[2].title='Disambigua';visible[3].title='Insiemi di caratteri';
-  visible[4].topic_labels=['STEM.Computing'];
+  visible[4].topic_labels=['STEM.Computing'];visible[5].title='Redirect';
   const hidden=excluded.map((category,i)=>({...template,page_id:100+i,title:`Excluded ${i+1}`,category}));
+  const redirects=['  REDIRECT  ','Redirects','Pagine_di_redirect','Redirezioni','Redireccions','Redirecionamentos','Redirections']
+    .map((category,i)=>({...template,page_id:300+i,title:`Redirect category ${i+1}`,category}));
   const unavailable=[
     {...template,page_id:201,title:'No connections',category:'Musica'},
     {...template,page_id:202,title:'Unknown connections',category:'Musica'},
     {...template,page_id:203,title:'Absent connections',category:'Musica'}];
   const both={...template,page_id:204,title:'Both hidden',category:'Disambigua'};
-  raw.pages=[...visible,...hidden,...unavailable,both,{...template,page_id:200,title:'Not orphan',orphan:false,category:'Musica'}];
-  raw.link_candidates=Object.fromEntries([...visible,...hidden].map(page=>[page.page_id,{status:'compared',candidate_count:1,candidates:[]}]));
+  const redirectWithoutConnections={...template,page_id:400,title:'Redirect without connections',category:'Redirect'};
+  raw.pages=[...visible,...hidden,...redirects,...unavailable,both,redirectWithoutConnections,{...template,page_id:200,title:'Not orphan',orphan:false,category:'Musica'}];
+  raw.link_candidates=Object.fromEntries([...visible,...hidden,...redirects].map(page=>[page.page_id,{status:'compared',candidate_count:1,candidates:[]}]));
   raw.link_candidates[201]={status:'compared',candidate_count:0,candidates:[]};
   raw.link_candidates[202]={status:'missing_item',candidate_count:null,candidates:[]};
   raw.link_candidates[204]={status:'compared',candidate_count:0,candidates:[]};
+  raw.link_candidates[400]={status:'compared',candidate_count:0,candidates:[]};
   const original=JSON.stringify(raw),columns=['page_id','title','orphan','category','topic_status','topic_labels','length_bytes','created_at','in_degree'];
   const index: CardIndexFixture={format:'orphan_cards_v2',metadata:raw.metadata,census_page_count:raw.pages.length,
     card_identity:'a'.repeat(64),columns,rows:raw.pages.filter(page=>page.orphan).map(page=>columns.map(key=>page[key]??null)),
@@ -1209,33 +1213,42 @@ async function checkHiddenPages() {
     const result=await harness('deorphanize',raw,'?dataset=fixture.json',[transport],{},files),{nodes,html}=result;
     const toggle=nodes['candidate-hidden'],options=nodes['candidate-hidden-options'];
     const disambiguation=nodes['candidate-show-disambiguation'],connections=nodes['candidate-show-without-connections'];
+    const showRedirects=nodes['candidate-show-redirects'];
     const titles=()=>nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
     assert.match(html,/<div class="list-controls">[\s\S]*?id="candidate-sort"[\s\S]*?id="candidate-hidden"[^>]*aria-expanded="false"[^>]*aria-controls="candidate-hidden-options"/);
     assert(!html.includes('Gli interessi usano'));
     assert.equal(nodes['review-service-status'].textContent,'');
     assert.equal(toggle.getAttribute('aria-expanded'),'false');assert.equal(options.hidden,true);
     assert.equal(disambiguation.checked,false);assert.equal(connections.checked,false);
+    assert.equal(showRedirects.checked,false);
     assert.match(nodes['candidate-info'].textContent,/30 orfane/);
     assert.equal(titles().length,25);assert(!titles().some(title=>title.startsWith('Excluded')));
     nodes['candidate-more'].listeners.click();assert.equal(titles().length,30);
-    assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));
+    assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));assert(titles().includes('Redirect'));
     const beforeOpen=titles(),fetches=result.getFetchCount();
     toggle.listeners.click();assert.equal(toggle.getAttribute('aria-expanded'),'true');assert.equal(options.hidden,false);
     assert.deepEqual(titles(),beforeOpen);assert.equal(result.getFetchCount(),fetches);
     toggle.listeners.click();assert.equal(options.hidden,true);assert.deepEqual(titles(),beforeOpen);
     toggle.listeners.click();
     // Independent controls: the overlap requires both; checkbox changes keep the list open.
-    for(const [showDisambiguation,showWithoutConnections,total] of [
-      [true,false,40],[false,true,33],[true,true,44],[false,false,30]
+    for(const [showDisambiguation,redirectsVisible,showWithoutConnections,total] of [
+      [true,false,false,40],[false,false,true,33],[true,false,true,44],
+      [false,true,false,37],[true,true,false,47],[false,true,true,41],[true,true,true,52],
+      [false,false,false,30]
     ] as const) {
       changeCheckbox(nodes,'candidate-show-disambiguation',showDisambiguation);
+      changeCheckbox(nodes,'candidate-show-redirects',redirectsVisible);
       changeCheckbox(nodes,'candidate-show-without-connections',showWithoutConnections);
       assert.equal(options.hidden,false);assert.equal(titles().length,25);
       assert.match(nodes['candidate-info'].textContent,new RegExp('^'+total+' orfane'));
-      nodes['candidate-more'].listeners.click();assert.equal(titles().length,total);
+      nodes['candidate-more'].listeners.click();assert.equal(titles().length,Math.min(50,total));
+      if(total>50)nodes['candidate-more'].listeners.click();
+      assert.equal(titles().length,total);
       assert.equal(titles().includes('Excluded 1'),showDisambiguation);
       for(const page of unavailable)assert.equal(titles().includes(page.title),showWithoutConnections);
       assert.equal(titles().includes(both.title),showDisambiguation&&showWithoutConnections);
+      for(const page of redirects)assert.equal(titles().includes(page.title),redirectsVisible);
+      assert.equal(titles().includes(redirectWithoutConnections.title),redirectsVisible&&showWithoutConnections);
     }
     changeCheckbox(nodes,'candidate-show-disambiguation',true);
     changeCheckbox(nodes,'candidate-show-without-connections',true);
@@ -1249,18 +1262,22 @@ async function checkHiddenPages() {
     changeCheckbox(nodes,'candidate-show-disambiguation',true);assert.deepEqual(titles(),['Excluded 4']);
     nodes['candidate-sort'].value='candidates-asc';nodes['candidate-sort'].listeners.input();
     assert.equal(toggle.getAttribute('aria-expanded'),'true');assert.deepEqual(titles(),['Excluded 4']);
+    changeCheckbox(nodes,'candidate-show-redirects',true);
     nodes['ui-language-toggle'].listeners.click();
     assert.equal(toggle.textContent,'Hidden pages');
     assert.equal(toggle.title,'Choose which hidden pages to show.');
     assert(result.staticNodes.some(node=>node.textContent==='Show disambiguation pages'));
+    assert(result.staticNodes.some(node=>node.textContent==='Show redirect pages'));
     assert(result.staticNodes.some(node=>node.textContent==='Show pages without possible connections'));
     assert.equal(disambiguation.checked,true);assert.equal(connections.checked,true);
+    assert.equal(showRedirects.checked,true);
     let prevented=false;
     nodes['candidate-hidden-control'].listeners.keydown({key:'Escape',preventDefault(){prevented=true;}});
     assert(prevented);assert.equal(options.hidden,true);assert.equal(toggle.getAttribute('aria-expanded'),'false');
     assert.equal(toggle.focused,true);assert.deepEqual(titles(),['Excluded 4']);
     toggle.listeners.click();assert.equal(options.hidden,false);
     assert.equal(disambiguation.checked,true);assert.equal(connections.checked,true);
+    assert.equal(showRedirects.checked,true);
     assert(!result.requests.some(request=>request.url.startsWith('https://')||request.url.startsWith('data/card-records/')));
   }
   const articles=await harness('articles',raw);

@@ -167,6 +167,7 @@ interface UIElements {
   'candidate-hidden-control': HTMLElement;
   'candidate-hidden-options': HTMLElement;
   'candidate-show-disambiguation': HTMLInputElement;
+  'candidate-show-redirects': HTMLInputElement;
   'candidate-show-without-connections': HTMLInputElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;
@@ -435,6 +436,7 @@ const translations: Record<string, string> = {
   "Pagine nascoste": "Hidden pages",
   "Scegli quali pagine nascoste mostrare.": "Choose which hidden pages to show.",
   "Mostra pagine di disambiguazione": "Show disambiguation pages",
+  "Mostra pagine di redirect": "Show redirect pages",
   "Mostra pagine senza collegamenti possibili": "Show pages without possible connections",
   "Include anche le voci con dato non disponibile.": "Also includes articles with unavailable data.",
   "Caricamento dei collegamenti possibili…": "Loading possible connections…",
@@ -1755,9 +1757,11 @@ const specialOrphanCategories=new Set([
   'insiemi di caratteri','set di caratteri','character sets','jeux de caracteres',
   'conjunts de caracters','conjuntos de caracteres'
 ]);
-function specialOrphanCategory(page: PageObservation): boolean {
-  const category=(page.category??'').normalize('NFD').replace(/\p{M}/gu,'').toLowerCase().replace(/[_\s]+/g,' ').trim();
-  return specialOrphanCategories.has(category);
+const redirectOrphanCategories=new Set([
+  'redirect','redirects','pagine di redirect','redirezioni','redireccions','redirecionamentos','redirections'
+]);
+function orphanCategoryName(page: PageObservation): string {
+  return (page.category??'').normalize('NFD').replace(/\p{M}/gu,'').toLowerCase().replace(/[_\s]+/g,' ').trim();
 }
 function candidateCards() {
   if(!deorphanizePage||$('dataset')!.value==='')return;
@@ -1766,10 +1770,13 @@ function candidateCards() {
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
   const orphans=data.pages.filter(p=>p.orphan);
   const showDisambiguation=$('candidate-show-disambiguation')!.checked;
+  const showRedirects=$('candidate-show-redirects')!.checked;
   const showWithoutConnections=$('candidate-show-without-connections')!.checked;
   const sorted=orphans.filter(p=>{
     const count=records[pageKey(p)]?.candidate_count;
-    return (showDisambiguation||!specialOrphanCategory(p))&&
+    const categoryName=orphanCategoryName(p);
+    return (showDisambiguation||!specialOrphanCategories.has(categoryName))&&
+      (showRedirects||!redirectOrphanCategories.has(categoryName))&&
       (showWithoutConnections||(typeof count==='number'&&Number.isSafeInteger(count)&&count>0))&&
       p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category);
   });
@@ -2292,7 +2299,7 @@ if(deorphanizePage) {
     if(event.key==='Escape'&&!options.hidden){event.preventDefault();open(false);button.focus();}
   });
 }
-for(const id of ['candidate-show-disambiguation','candidate-show-without-connections'] as const)$(id)?.addEventListener('change',()=>{
+for(const id of ['candidate-show-disambiguation','candidate-show-redirects','candidate-show-without-connections'] as const)$(id)?.addEventListener('change',()=>{
   candidateLimit=25;if(data)candidateCards();
 });
 $('auth-menu')?.addEventListener('keydown',event=>{
