@@ -256,6 +256,9 @@ const creatorsPage = document.body.dataset.page === 'creators';
 const connectionsPage = document.body.dataset.page === 'connections';
 const deorphanizePage = document.body.dataset.page === 'deorphanize';
 const translations: Record<string, string> = {
+  "Informazioni sul progetto": "Project information",
+  "Repository GitHub": "GitHub repository",
+  "Licenza MIT": "MIT license",
   "Chi crea le pagine orfane": "Who creates the Orphan pages",
   "studio di riferimento": "reference study",
   "De-orfanizzare le pagine": "De-orphan articles",

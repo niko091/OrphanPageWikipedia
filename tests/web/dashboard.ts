@@ -673,7 +673,7 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
 }
 async function checkFreshResources() {
   const pages=['index.html','creators.html','deorphanize.html','connections.html'];
-  assert.deepEqual(fs.readdirSync('web').filter(name=>name.endsWith('.html')).sort(), [...pages].sort());
+  assert.deepEqual(fs.readdirSync('web').filter(name=>name.endsWith('.html')).sort(), [...pages,'about.html'].sort());
   const bindings=fs.readFileSync('web/assets/native/dashboard.js');
   assert.equal(nativePath,`./native/dashboard.js?v=${createHash('sha256').update(bindings).digest('hex').slice(0,12)}`);
   const wasmFile=fs.readdirSync('web/assets/native').find(name=>name.endsWith('.wasm'));
@@ -709,6 +709,35 @@ async function checkFreshResources() {
     assert(result.nodes[id].children.some(node=>node.className==='bar-row'));
   }
   console.log('Fresh resources: content-versioned assets on all pages, uncached manifest/data and populated new charts passed.');
+}
+async function checkProjectFooter() {
+  for(const page of ['articles','creators','deorphanize','connections']) {
+    const raw=fixture();
+    const orphan=required(raw.pages.find(record=>record.orphan));
+    const {html,nodes,staticNodes}=await harness(page,raw,`?dataset=fixture.json&page=${orphan.page_id}`);
+    const footers=[...html.matchAll(/<footer\b[^>]*>([\s\S]*?)<\/footer>/g)];
+    assert.equal(footers.length,1,`${page}: one project footer`);
+    assert(html.indexOf('<footer>')>html.indexOf('</main>'),`${page}: footer outside the main content`);
+    const footer=footers[0][1];
+    if(page==='connections')assert(footer.includes('Verifica il contenuto prima di aggiungere il collegamento.'));
+    assert.match(footer,/<nav\b[^>]*aria-label="Informazioni sul progetto"/);
+    const navigation=required(staticNodes.find(node=>node.getAttribute('data-i18n-aria-label')==='Informazioni sul progetto'));
+    assert.equal(navigation.getAttribute('aria-label'),'Informazioni sul progetto');
+    const links=[...footer.matchAll(/<a\b[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/g)];
+    assert.deepEqual(links.map(link=>[link[1],link[2]]),[
+      ['https://github.com/niko091/OrphanPageWikipedia','Repository GitHub'],
+      ['https://github.com/niko091/OrphanPageWikipedia/blob/main/LICENSE','Licenza MIT'],
+      ['about.html','About'],
+    ]);
+    const labels=()=>['footer-repository','footer-license','footer-about'].map(id=>nodes[id].textContent);
+    assert.deepEqual(labels(),['Repository GitHub','Licenza MIT','About']);
+    nodes['ui-language-toggle'].listeners.click();
+    assert.deepEqual(labels(),['GitHub repository','MIT license','About']);
+    assert.equal(navigation.getAttribute('aria-label'),'Project information');
+    nodes['ui-language-toggle'].listeners.click();
+    assert.deepEqual(labels(),['Repository GitHub','Licenza MIT','About']);
+  }
+  console.log('Project footer: repository, MIT license, blank About destination and Italian/English labels on all four pages passed.');
 }
 async function checkPage(creatorsPage: boolean) {
   const creatorFields=['creator_prior_edits_main','creator_prior_edits_other','creator_prior_articles','creator_tenure_days','creator_articles_created_total','creator_orphans_current'];
@@ -3152,4 +3181,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkProjectFooter();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

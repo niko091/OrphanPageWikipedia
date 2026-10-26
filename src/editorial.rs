@@ -1183,7 +1183,7 @@ async fn serve_file(root: &Path, request: Request) -> ReviewResult<Response> {
     };
     let allowed = matches!(
         relative,
-        "index.html" | "creators.html" | "deorphanize.html" | "connections.html"
+        "index.html" | "creators.html" | "deorphanize.html" | "connections.html" | "about.html"
     ) || relative.starts_with("assets/")
         || relative.starts_with("data/");
     if !allowed
