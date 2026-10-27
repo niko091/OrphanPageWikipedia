@@ -32,7 +32,7 @@ impl Invocation {
             .get_one::<String>("work-dir")
             .map(|p| self.root.join(p))
             .unwrap_or_else(|| dump_root.join("staging"));
-        return orphanwiki::pipeline::run(orphanwiki::pipeline::PipelineOptions {
+        orphanwiki::pipeline::run(orphanwiki::pipeline::PipelineOptions {
             root: self.root.clone(),
             languages_file: self.path("languages-file")?,
             selected: self.editions.clone(),
@@ -65,7 +65,7 @@ impl Invocation {
             force: self.args.get_flag("force"),
             plan: self.args.get_flag("plan"),
         })
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())
     }
     pub(crate) fn benchmark(&self) -> Result<u8, String> {
         let integer = |name| {

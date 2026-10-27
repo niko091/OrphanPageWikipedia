@@ -23,7 +23,7 @@ impl Invocation {
         } else {
             client.fetch_content(&self.editions, release("content-release")?, &root, plan)?;
         }
-        return Ok(());
+        Ok(())
     }
     pub(super) fn run_import(&self) -> Result<(), String> {
         use orphanwiki::dumps::{import_dumps, import_history, HistoryOptions};
@@ -95,7 +95,7 @@ impl Invocation {
                 import_history(&path, &output, &work, options).map_err(|e| e.to_string())?;
             }
         }
-        return Ok(());
+        Ok(())
     }
     pub(super) fn run_quality(&self) -> Result<(), String> {
         let release = self
@@ -117,6 +117,6 @@ impl Invocation {
             )
             .map_err(|e| e.to_string())?;
         }
-        return Ok(());
+        Ok(())
     }
 }

@@ -15,7 +15,7 @@ impl Invocation {
             .map_err(|e| e.to_string())?;
         }
         orphanwiki::dumps::publish_available_aggregate(&output).map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
     pub(super) fn run_compare(&self) -> Result<(), String> {
         let mut paths = if let Some(inputs) = self.args.get_many::<String>("inputs") {
@@ -85,7 +85,7 @@ impl Invocation {
             index["members"].as_array().map_or(0, Vec::len),
             output.display()
         );
-        return Ok(());
+        Ok(())
     }
     pub(super) fn run_analyze(&self) -> Result<(), String> {
         let raw = self.path("input")?;
@@ -137,7 +137,7 @@ impl Invocation {
             },
         )
         .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
     pub(super) fn run_topics(&self) -> Result<(), String> {
         let work = self
@@ -167,6 +167,6 @@ impl Invocation {
             },
         )
         .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
 }

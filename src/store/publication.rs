@@ -610,7 +610,7 @@ fn import_member(
                 .remove("evidence")
                 .ok_or("Evidenze mancanti")?;
             let title = intern(
-                &tx,
+                tx,
                 candidate["title"]
                     .as_str()
                     .ok_or("Titolo candidata mancante")?,
@@ -636,13 +636,13 @@ fn import_member(
                     .filter(|s| *s != language)
                     .ok_or("Lingua di riferimento non valida")?;
                 let source_title = intern(
-                    &tx,
+                    tx,
                     edge["source_title"]
                         .as_str()
                         .ok_or("Titolo riferimento mancante")?,
                 )?;
                 let target_title = intern(
-                    &tx,
+                    tx,
                     edge["target_title"]
                         .as_str()
                         .ok_or("Titolo riferimento mancante")?,
@@ -687,5 +687,5 @@ fn import_member(
         }
     }
     signatures.push((path, source.signature));
-    return Ok(approved);
+    Ok(approved)
 }

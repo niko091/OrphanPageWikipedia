@@ -1,6 +1,6 @@
+use super::interests::{InterestCandidate, InterestEdit, InterestInput};
 #[cfg(not(feature = "cli"))]
 use super::summary::summary_bridge_float;
-use super::interests::{InterestCandidate, InterestEdit, InterestInput};
 use super::*;
 #[test]
 fn chart_float_ingestion_preserves_the_frozen_bridge_without_mutating_observations() {

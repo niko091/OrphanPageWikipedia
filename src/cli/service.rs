@@ -19,14 +19,14 @@ impl Invocation {
             orphanwiki::store::Census::open(&self.root.join(path)).map_err(|e| e.to_string())?;
             app = app.with_collection_database(self.root.join(path));
         }
-        return orphanwiki::editorial::serve(
+        orphanwiki::editorial::serve(
             app,
             self.args
                 .get_one::<String>("bind")
                 .ok_or("Indirizzo mancante")?,
             *self.args.get_one::<u16>("port").ok_or("Porta mancante")?,
         )
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())
     }
     pub(super) fn run_dashboard(&self) -> Result<(), String> {
         let database = self.path("data-dir")?.join("collection.sqlite");
@@ -44,6 +44,6 @@ impl Invocation {
             )
             .map_err(|e| e.to_string())?;
         }
-        return Ok(());
+        Ok(())
     }
 }
