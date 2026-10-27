@@ -11,7 +11,7 @@ fn pages() -> Vec<Value> {
         .map(|id| {
             json!({"page_id":id,"title":format!("È {id} 🌙"),"revision_id":id+100,
         "wikibase_item":format!("Q{id}"),"length_bytes":if id==1 {Some(0)} else {None},
-        "created_at":"2001-01-01T00:00:00Z","page_created_at":null,
+        "created_at":"2001-01-01T00:00:00Z","first_public_revision_at":"2001-01-01T00:00:00Z","page_created_at":null,
         "categories":["Specific","General","Specific"]})
         })
         .collect()
@@ -41,7 +41,7 @@ fn observations() -> Vec<Value> {
     pages
         .iter()
         .zip(&choices)
-        .map(|(page, choice)| observation_row(page, choice, 0, 1, false).unwrap())
+        .map(|(page, choice)| observation_row(page, choice, 0, 1).unwrap())
         .collect()
 }
 fn histories() -> HashMap<i64, Value> {
@@ -79,13 +79,13 @@ fn native_observations_keep_category_evidence_zero_length_and_explicit_nulls() {
     let mut page = pages().remove(0);
     page["first_public_revision_at"] = Value::Null;
     let manual = (Some("Specific".into()), vec![], true);
-    let actual = observation_row(&page, &manual, 2, 0, true).unwrap();
+    let actual = observation_row(&page, &manual, 2, 0).unwrap();
     assert!(actual["first_public_revision_at"].is_null());
     assert!(actual["created_at"].is_null());
     assert_eq!(actual["category_status"], "reviewed");
     assert_eq!(actual["category_reason"], "Scelta manuale verificata");
     assert_eq!(actual["orphan"], false);
-    let empty = observation_row(&page, &(None, vec![], false), 0, 0, false).unwrap();
+    let empty = observation_row(&page, &(None, vec![], false), 0, 0).unwrap();
     assert!(empty["category"].is_null());
     assert_eq!(empty["category_status"], "no_eligible_category");
 }
@@ -101,7 +101,7 @@ fn history_preserves_reconstruction_first_revision_attribution_and_missing_exper
         join_history_rows(&mut rows, &histories(), "missing_page").unwrap(),
         3
     );
-    observation_ages(&mut rows, "2026-10-01T00:00:00Z", true).unwrap();
+    observation_ages(&mut rows, "2026-10-01T00:00:00Z").unwrap();
     let known = &rows[0];
     assert_eq!(known["age_days"], 0.5);
     assert!(known["history_first_revision_age_days"].as_f64().unwrap() > 9000.0);
@@ -173,7 +173,7 @@ fn history_and_ages_have_identical_results_across_bounded_batches() {
                 .map(|row| (row["page_id"].as_i64().unwrap(), row))
                 .collect();
             matched += join_history_rows(batch, &records, "missing_page").unwrap();
-            observation_ages(batch, "2026-10-01T00:00:00Z", true).unwrap();
+            observation_ages(batch, "2026-10-01T00:00:00Z").unwrap();
         }
         (rows, matched)
     };
@@ -181,14 +181,14 @@ fn history_and_ages_have_identical_results_across_bounded_batches() {
     for size in 1..=7 {
         assert_eq!(run(size), expected);
     }
-    let mut legacy = source.clone();
-    initialize_creator_rows(&mut legacy).unwrap();
-    join_history_rows(&mut legacy, &HashMap::new(), "not_collected").unwrap();
-    observation_ages(&mut legacy, "2026-10-01T00:00:00Z", false).unwrap();
-    assert!(legacy[0]["age_days"].as_f64().unwrap() > 9000.0);
-    assert_eq!(legacy[0]["history_data_status"], "not_collected");
-    observation_ages(&mut legacy, "2026-10-01T00:00:00Z", true).unwrap();
-    assert!(legacy.iter().all(|row| row["age_days"].is_null()));
+    let mut without_history = source.clone();
+    initialize_creator_rows(&mut without_history).unwrap();
+    join_history_rows(&mut without_history, &HashMap::new(), "not_collected").unwrap();
+    observation_ages(&mut without_history, "2026-10-01T00:00:00Z").unwrap();
+    assert!(without_history[0]["age_days"].is_null());
+    assert_eq!(without_history[0]["history_data_status"], "not_collected");
+    observation_ages(&mut without_history, "2026-10-01T00:00:00Z").unwrap();
+    assert!(without_history.iter().all(|row| row["age_days"].is_null()));
 }
 
 fn quality() -> HashMap<i64, Value> {
@@ -263,10 +263,10 @@ fn imported_json_quality_keeps_the_exact_source_float_through_the_join() {
 #[test]
 fn invalid_observations_and_dates_are_errors_and_future_first_revision_is_independent() {
     let choice = (None, vec![], false);
-    assert!(observation_row(&json!({}), &choice, 0, 0, false).is_err());
+    assert!(observation_row(&json!({}), &choice, 0, 0).is_err());
     let mut invalid = choice.clone();
     invalid.1.push(("X".into(), f64::NAN, 1, 1.0));
-    assert!(observation_row(&pages()[0], &invalid, 0, 0, false).is_err());
+    assert!(observation_row(&pages()[0], &invalid, 0, 0).is_err());
     assert!(initialize_creator_rows(&mut [Value::Null]).is_err());
     let mut history = histories();
     history.get_mut(&1).unwrap()["page_id"] = json!(2);
@@ -274,14 +274,14 @@ fn invalid_observations_and_dates_are_errors_and_future_first_revision_is_indepe
     let mut rows = observations();
     rows[0]["history_first_revision_at"] = json!("invalid");
     let before = rows.clone();
-    assert!(observation_ages(&mut rows, "2026-10-01T00:00:00Z", true).is_err());
+    assert!(observation_ages(&mut rows, "2026-10-01T00:00:00Z").is_err());
     assert_eq!(rows, before);
     rows[0]["history_first_revision_at"] = json!("2040-01-01T00:00:00Z");
     rows[0]["page_created_at"] = json!("2026-09-30T23:59:59.500Z");
-    observation_ages(&mut rows, "2026-10-01T00:00:00Z", true).unwrap();
+    observation_ages(&mut rows, "2026-10-01T00:00:00Z").unwrap();
     assert_eq!(rows[0]["age_days"], json!(0.5 / 86400.0));
     assert!(rows[0]["history_first_revision_age_days"].is_null());
-    assert_eq!(rows[0]["creation_date_status"], "not_collected");
+    assert!(rows[0]["creation_date_status"].is_null());
 }
 
 #[test]
@@ -329,4 +329,16 @@ fn topic_row_join_keeps_known_negatives_separate_from_missing_and_checks_all_ide
     missing.remove(&3);
     assert!(join_topic_rows(&mut observations(), &missing, &taxonomy).is_err());
     assert!(join_topic_rows(&mut observations(), &missing, &Default::default()).is_err());
+}
+
+#[test]
+fn obsolete_date_fields_never_substitute_missing_creation_or_revision_evidence() {
+    let page = json!({"page_id":1,"title":"A","created_at":"2000-01-01T00:00:00Z"});
+    let row = observation_row(&page, &(None, vec![], false), 0, 0).unwrap();
+    assert!(row["created_at"].is_null());
+    assert!(row["first_public_revision_at"].is_null());
+    let mut rows = vec![row];
+    observation_ages(&mut rows, "2026-10-01T00:00:00Z").unwrap();
+    assert!(rows[0]["age_days"].is_null());
+    assert!(rows[0]["history_first_revision_age_days"].is_null());
 }

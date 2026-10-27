@@ -2,7 +2,7 @@ use super::benchmark::{
     benchmark_outputs, benchmark_summary, canonical_fingerprint, local_output, BenchmarkOutput,
 };
 use super::checkpoints::signature;
-use super::workflow::{path_text, remove_downloads, workflow};
+use super::workflow::{remove_downloads, workflow};
 use super::*;
 
 struct Fixture {
@@ -673,32 +673,6 @@ fn changed_category_rules_recompute_observations_and_missing_transports_are_repa
             .collect::<Vec<_>>(),
         ["refresh-measures"]
     );
-}
-
-#[test]
-fn legacy_combined_download_checkpoints_seed_per_edition_reuse() {
-    let mut f = Fixture::new();
-    f.run().unwrap();
-    let edition = f.options.selected[0].clone();
-    let (manifest, meta) = manifest_for(&f.options, &edition.0, &edition.1).unwrap();
-    let outputs = fetched_outputs(&manifest, &meta).unwrap();
-    let mut state = StepState::open(f.options.dump_root.join("pipeline-state.json")).unwrap();
-    state.steps.remove("fetch:vec");
-    state.save("fetch",json!({"languages":[edition],"sql_release":f.options.sql_release,"history_release":f.options.history_release,"dump_root":path_text(&f.options.dump_root)}),&outputs).unwrap();
-    f.options.selected.push(("lmo".into(), "lmowiki".into()));
-    f.reset();
-    f.run().unwrap();
-    let downloads = f
-        .steps
-        .calls
-        .iter()
-        .filter(|c| c[0] == "fetch-dumps")
-        .collect::<Vec<_>>();
-    assert_eq!(downloads.len(), 1);
-    assert_eq!(downloads[0].last().unwrap(), "lmo");
-    let updated = StepState::open(f.options.dump_root.join("pipeline-state.json")).unwrap();
-    assert!(updated.steps.contains_key("fetch:vec"));
-    assert!(updated.steps.contains_key("fetch:lmo"));
 }
 
 #[test]

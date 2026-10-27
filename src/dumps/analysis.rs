@@ -102,7 +102,6 @@ pub fn analyze_memory_graph(
             &serde_json::from_value(raw.get("category_parents").cloned().unwrap_or(json!({})))?,
             analysis_rules(rules)?,
         )?;
-        let creation_events = meta["creation_date_rule"] == "creation_event_v1";
         let mut rows = pages
             .iter()
             .zip(choices)
@@ -110,7 +109,7 @@ pub fn analyze_memory_graph(
             .zip(outgoing)
             .map(|(((p, c), i), o)| {
                 crate::runtime::check_cancelled()?;
-                crate::observation_row(p, &c, i, o, creation_events)
+                crate::observation_row(p, &c, i, o)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let creators = crate::initialize_creator_rows(&mut rows)?;
@@ -182,7 +181,6 @@ pub fn analyze_memory_graph(
             meta["finished_at"]
                 .as_str()
                 .ok_or("Fine del censimento mancante")?,
-            creation_events || reconstructed,
         )?;
         let raw_checksum = canonical_json_sha256(raw)?;
         if let Some(supplement) = topics {
@@ -237,15 +235,8 @@ pub fn analyze_memory_graph(
                 "age_rule",
                 json!(if reconstructed {
                     HISTORY_RULE
-                } else if creation_events {
-                    "page_creation_event"
-                } else if meta["source"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("Wikimedia SQL dumps / "))
-                {
-                    "unavailable_no_approved_creation_event"
                 } else {
-                    "first_public_revision_legacy"
+                    "unavailable_no_approved_creation_event"
                 }),
             ),
             (
@@ -439,7 +430,6 @@ pub fn analyze_imported_graph(
                     &choice,
                     incoming[position],
                     outgoing[position],
-                    false,
                 )?);
                 position += 1;
             }
@@ -494,7 +484,6 @@ pub fn analyze_imported_graph(
                 graph_metadata["finished_at"]
                     .as_str()
                     .ok_or("Data SQL mancante")?,
-                true,
             )?;
             for row in rows {
                 serde_json::to_writer(&mut writer, &row)?;

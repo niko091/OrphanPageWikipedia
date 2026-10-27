@@ -56,9 +56,8 @@ pub fn observation_row(
     choice: &CategoryChoice,
     incoming: u64,
     outgoing: u64,
-    creation_events: bool,
 ) -> Result<serde_json::Value, String> {
-    use serde_json::{json, Value};
+    use serde_json::json;
     if page["page_id"].as_i64().is_none()
         || !page["title"].is_string()
         || choice
@@ -68,21 +67,17 @@ pub fn observation_row(
     {
         return Err("Identità della pagina o ranking delle categorie non validi".into());
     }
-    let created = &page[if creation_events {
-        "page_created_at"
-    } else {
-        "created_at"
-    }];
+    let created = &page["page_created_at"];
     let candidates = choice.1.iter().map(|(category,score,support,priority)|json!({"category":category,"score":score,"support":support,"priority":priority})).collect::<Vec<_>>();
     Ok(
         json!({"page_id":page["page_id"],"title":page["title"],"revision_id":page["revision_id"],
         "wikibase_item":page["wikibase_item"],"category":choice.0,"category_candidates":candidates,
         "category_status":if choice.2 {"reviewed"} else if choice.0.is_some() {"heuristic_review_needed"} else {"no_eligible_category"},
         "category_reason":if choice.2 {"Scelta manuale verificata"} else {"Categorie visibili; esclusioni configurate; rimozione dei sovratemi; specificità e numerosità. Non è una classificazione semantica validata."},
-        "categories":page.get("categories").cloned().unwrap_or_else(||json!([])),"created_at":created,
-        "length_bytes":page["length_bytes"],"first_public_revision_at":page.get("first_public_revision_at").unwrap_or(&page["created_at"]),
+        "categories":page["categories"],"created_at":created,
+        "length_bytes":page["length_bytes"],"first_public_revision_at":page["first_public_revision_at"],
         "page_created_at":page["page_created_at"],"creation_date_source":page["creation_date_source"],
-        "creation_date_status":page.get("creation_date_status").cloned().unwrap_or(Value::String("not_collected".into())),
+        "creation_date_status":page["creation_date_status"],
         "in_degree":incoming,"out_degree":outgoing,"orphan":incoming==0}),
     )
 }
@@ -374,11 +369,7 @@ pub(crate) fn validate_topic_record(
 
 /// Compute both ages independently. A reconstructed or observed creation event
 /// never falls back to the historical first revision when its date is missing.
-pub fn observation_ages(
-    rows: &mut [serde_json::Value],
-    reference: &str,
-    use_page_creation: bool,
-) -> Result<(), String> {
+pub fn observation_ages(rows: &mut [serde_json::Value], reference: &str) -> Result<(), String> {
     let collect_dates = |field: &str| {
         rows.iter()
             .map(|row| match &row[field] {
@@ -388,11 +379,7 @@ pub fn observation_ages(
             })
             .collect::<Result<Vec<_>, _>>()
     };
-    let dates = collect_dates(if use_page_creation {
-        "page_created_at"
-    } else {
-        "created_at"
-    })?;
+    let dates = collect_dates("page_created_at")?;
     let history_dates = collect_dates("history_first_revision_at")?;
     let ages = article_ages(reference, &dates)?;
     let historical = article_ages(reference, &history_dates)?;

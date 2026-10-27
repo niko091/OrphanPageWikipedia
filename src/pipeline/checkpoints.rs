@@ -98,32 +98,6 @@ impl StepState {
         )?;
         Ok(())
     }
-
-    pub(super) fn inherit(
-        &self,
-        key: &str,
-        required: &Value,
-        edition: &(String, String),
-        outputs: &[PathBuf],
-    ) -> bool {
-        let Some(saved) = self.steps.get(key) else {
-            return false;
-        };
-        let matches = required.as_object().is_some_and(|fields| {
-            fields
-                .iter()
-                .all(|(key, value)| saved["inputs"][key] == *value)
-        });
-        matches
-            && saved["inputs"]["languages"]
-                .as_array()
-                .is_some_and(|pairs| pairs.contains(&json!(edition)))
-            && !outputs.is_empty()
-            && outputs.iter().all(|path| {
-                signature(path)
-                    .is_some_and(|value| saved["outputs"][path.to_string_lossy().as_ref()] == value)
-            })
-    }
 }
 
 pub(super) fn fetched_outputs(path: &Path, metadata: &Value) -> PipelineResult<Vec<PathBuf>> {

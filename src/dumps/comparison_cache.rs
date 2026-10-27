@@ -102,7 +102,7 @@ pub(super) fn comparison_source(
     }
     let graph = canonical_json_sha256(&json!({"rule":COMPARISON_CACHE_RULE,"raw":digests["raw"]}))?;
     let analysis = canonical_json_sha256(
-        &json!({"rule":COMPARISON_CACHE_RULE,"inputs":digests,"categories":rules,"measures":"creation_quality_creators_v3","quality_revision":"selected_official_xml_revision_v1"}),
+        &json!({"rule":COMPARISON_CACHE_RULE,"inputs":digests,"categories":rules,"measures":"creation_quality_creators_v3","quality_revision":"selected_official_xml_revision_v1","observation_rule":"independent_creation_and_revision_dates_v1"}),
     )?;
     Ok((
         language,

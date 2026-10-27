@@ -198,20 +198,13 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             let outputs = manifest_for(options, language, database)
                 .and_then(|(path, meta)| fetched_outputs(&path, &meta).ok())
                 .unwrap_or_default();
-            let inherited=state.inherit("fetch",&json!({"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)}),edition,&outputs);
             let key = format!("fetch:{language}");
             let reason = state.reason(&key, &inputs, &outputs);
             steps.log(&format!(
                 "CHECKPOINT download {language}: {}",
-                if options.force {
-                    "forced"
-                } else if inherited {
-                    "verified_reuse"
-                } else {
-                    reason
-                }
+                if options.force { "forced" } else { reason }
             ))?;
-            if !options.force && !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
+            if !options.force && !outputs.is_empty() && reason == "verified_reuse" {
                 steps.log(&format!(
                     "SALTA download {language}: file verificati e invariati"
                 ))?;
@@ -415,14 +408,8 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                 .unwrap_or_default();
             let inputs = json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)});
             let key = format!("content-fetch:{language}");
-            let inherited = state.inherit(
-                "content-fetch",
-                &json!({"release":options.content_release}),
-                edition,
-                &outputs,
-            );
             let reason = state.reason(&key, &inputs, &outputs);
-            if !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
+            if !outputs.is_empty() && reason == "verified_reuse" {
                 state.save(&key, inputs, &outputs)?;
                 steps.log(&format!(
                     "SALTA contenuto XML {language}: file verificati e invariati"
