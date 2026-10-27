@@ -762,15 +762,15 @@ async function checkPage(creatorsPage: boolean) {
   assert.equal(nodes['articles-link'].href,'index.html?dataset=fixture.json');
   assert.equal(nodes['deorphanize-link'].href,'deorphanize.html?dataset=fixture.json');
   if(!creatorsPage) {
-    assert.equal(nodes['article-rows'].children.length,25);
+    assert.equal(nodes['article-rows'].children.length,20);
     assert(nodes['article-rows'].children.every(row=>row.children[2].textContent==='Sì'));
     nodes['article-group'].value='all';nodes['article-group'].listeners.input();
-    nodes['article-more'].listeners.click();assert.equal(nodes['article-rows'].children.length,50);
+    nodes['article-more'].listeners.click();assert.equal(nodes['article-rows'].children.length,20);
     for(const [order,field,direction] of [['length-desc','length_bytes',-1],['length-asc','length_bytes',1],['date-desc','created_at',-1],['date-asc','created_at',1]] as const) {
       nodes['article-sort'].value=order;nodes['article-sort'].listeners.input();
       const expected=raw.pages.filter(p=>p[field]!=null).sort((a,b)=>(field==='created_at'?Date.parse(required(a.created_at))-Date.parse(required(b.created_at)):required(a.length_bytes)-required(b.length_bytes))*direction||a.title.localeCompare(b.title));
       assert.equal(nodes['article-rows'].children[0].children[0].children[0].textContent,expected[0].title);
-      assert.equal(nodes['article-rows'].children.length,25);
+      assert.equal(nodes['article-rows'].children.length,20);
     }
     nodes['article-search'].value='<img';nodes['article-search'].listeners.input();
     assert.equal(nodes['article-rows'].children.length,0);
@@ -981,18 +981,18 @@ async function checkDeorphanize() {
   assert(html.includes('<h1 data-i18n="De-orfanizzare le pagine">De-orfanizzare le pagine</h1>'));
   assert(!html.includes('candidate-coverage'));
   assert(!html.includes('chart-type'));
-  assert.equal(nodes['candidate-cards'].children.length,25);
+  assert.equal(nodes['candidate-cards'].children.length,20);
   const card=nodes['candidate-cards'].children[0],footer=findClass(card,'candidate-footer');
   assert.equal(footer.children[0].tag,'span'); // synthetic titles never open Wikipedia
   assert.equal(footer.children[1].textContent,'Connetti');
   assert.match(footer.children[1].href,/^connections\.html\?dataset=fixture\.json&page=\d+$/);
-  nodes['candidate-more'].listeners.click();assert.equal(nodes['candidate-cards'].children.length,Math.min(50,eligible.length));
+  nodes['candidate-more'].listeners.click();assert.equal(nodes['candidate-cards'].children.length,Math.min(20,eligible.length-20));
   assert(nodes['candidate-cards'].children.every(card=>eligible.some(page=>page.title===titleLink(card).textContent)));
   nodes['candidate-search'].value='none';nodes['candidate-search'].listeners.input();
   assert.equal(nodes['candidate-cards'].children[0].textContent,'Nessuna voce orfana corrispondente.');
   nodes['candidate-search'].value='';nodes['candidate-category'].value='scri';nodes['candidate-category'].listeners.input();
   assert(nodes['candidate-cards'].children.every(card=>findClass(card,'candidate-category').textContent==='Scritori'));
-  console.log('De-orfanizzare le pagine: card navigation, filters and 25-card pagination passed.');
+  console.log('De-orfanizzare le pagine: card navigation, filters and 20-card pagination passed.');
 }
 async function checkDatasetSelection() {
   const raw=fixture();raw.metadata.demo=false;
@@ -1050,7 +1050,7 @@ async function checkProgressiveCandidates() {
   assert.equal(document.body.dataset.loading,'false');assert.equal(cards().length,0);
   assert.match(nodes['candidate-info'].textContent,/Caricamento dei collegamenti possibili/);
   changeCheckbox(nodes,'candidate-show-without-connections',true);
-  assert.equal(cards().length,25);assert.match(nodes['candidate-info'].textContent,/Anteprima: 25/);
+  assert.equal(cards().length,20);assert.match(nodes['candidate-info'].textContent,/Anteprima: 20/);
   assert.match(nodes.status.textContent,/Caricamento dell’elenco completo/);
   assert.equal(nodes['candidate-more'].hidden,true);
   assert(cards().every(card=>findClass(card,'candidate-badge').textContent==='…'));
@@ -1072,7 +1072,7 @@ async function checkProgressiveCandidates() {
   await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(cards().length,0);
   changeCheckbox(nodes,'candidate-show-without-connections',true);
-  assert.equal(cards().length,25);assert.equal(evaluate('data.metadata.language',context),'lmo');
+  assert.equal(cards().length,20);assert.equal(evaluate('data.metadata.language',context),'lmo');
   assert(cards().every(card=>findClass(card,'connect-button').href.includes('dataset=lmo.json')));
   changeCheckbox(nodes,'candidate-show-without-connections',false);assert.equal(cards().length,0);
   const previous=required(pending.get('data/lmo.json'));
@@ -1100,14 +1100,17 @@ async function checkCompactLists() {
   raw.pages=Array.from({length:32},(_,i)=>({...template,page_id:i+1,title:`Title ${i}`,creator_key:`local:actor:${i}`,orphan:i%2===0,creator_articles_created_total:i===0?null:i}));
   raw.pages[0].title='<img src=x onerror=alert(1)>';
   let {nodes}=await harness('creators',raw);
-  assert.equal(nodes['creator-rows'].children.length,25);
-  nodes['creator-more'].listeners.click();assert.equal(nodes['creator-rows'].children.length,32);
+  assert.equal(nodes['creator-rows'].children.length,20);
+  nodes['creator-more'].listeners.click();assert.equal(nodes['creator-rows'].children.length,12);
   for(const order of ['articles-asc','articles-desc']) {
     nodes['creator-sort'].value=order;nodes['creator-sort'].listeners.input();
+    assert.equal(nodes['creator-rows'].children[0].children[2].textContent,order.endsWith('asc')?'1':'31');
     nodes['creator-more'].listeners.click();
     const rows=nodes['creator-rows'].children;
+    assert.equal(rows.length,12);
     assert.equal(required(rows.at(-1)).children[2].textContent,'—');
-    assert.equal(rows[0].children[2].textContent,order.endsWith('asc')?'1':'31');
+    nodes['creator-previous'].listeners.click();
+    assert.equal(nodes['creator-rows'].children[0].children[2].textContent,order.endsWith('asc')?'1':'31');
   }
   ({nodes}=await harness('articles',raw));
   nodes['article-search'].value='<img';nodes['article-search'].listeners.input();
@@ -1224,9 +1227,11 @@ async function checkHiddenPages() {
     assert.equal(disambiguation.checked,false);assert.equal(connections.checked,false);
     assert.equal(showRedirects.checked,false);
     assert.match(nodes['candidate-info'].textContent,/30 orfane/);
-    assert.equal(titles().length,25);assert(!titles().some(title=>title.startsWith('Excluded')));
-    nodes['candidate-more'].listeners.click();assert.equal(titles().length,30);
-    assert(titles().includes('Disambigua'));assert(titles().includes('Insiemi di caratteri'));assert(titles().includes('Redirect'));
+    assert.equal(titles().length,20);assert(!titles().some(title=>title.startsWith('Excluded')));
+    const firstTitles=titles();
+    nodes['candidate-more'].listeners.click();assert.equal(titles().length,10);
+    const defaultTitles=[...firstTitles,...titles()];
+    assert(defaultTitles.includes('Disambigua'));assert(defaultTitles.includes('Insiemi di caratteri'));assert(defaultTitles.includes('Redirect'));
     const beforeOpen=titles(),fetches=result.getFetchCount();
     toggle.listeners.click();assert.equal(toggle.getAttribute('aria-expanded'),'true');assert.equal(options.hidden,false);
     assert.deepEqual(titles(),beforeOpen);assert.equal(result.getFetchCount(),fetches);
@@ -1241,16 +1246,18 @@ async function checkHiddenPages() {
       changeCheckbox(nodes,'candidate-show-disambiguation',showDisambiguation);
       changeCheckbox(nodes,'candidate-show-redirects',redirectsVisible);
       changeCheckbox(nodes,'candidate-show-without-connections',showWithoutConnections);
-      assert.equal(options.hidden,false);assert.equal(titles().length,25);
+      assert.equal(options.hidden,false);assert.equal(titles().length,20);
       assert.match(nodes['candidate-info'].textContent,new RegExp('^'+total+' orfane'));
-      nodes['candidate-more'].listeners.click();assert.equal(titles().length,Math.min(50,total));
-      if(total>50)nodes['candidate-more'].listeners.click();
-      assert.equal(titles().length,total);
-      assert.equal(titles().includes('Excluded 1'),showDisambiguation);
-      for(const page of unavailable)assert.equal(titles().includes(page.title),showWithoutConnections);
-      assert.equal(titles().includes(both.title),showDisambiguation&&showWithoutConnections);
-      for(const page of redirects)assert.equal(titles().includes(page.title),redirectsVisible);
-      assert.equal(titles().includes(redirectWithoutConnections.title),redirectsVisible&&showWithoutConnections);
+      const allTitles=[...titles()];
+      while(!nodes['candidate-more'].disabled) {
+        nodes['candidate-more'].listeners.click();assert(titles().length<=20);allTitles.push(...titles());
+      }
+      assert.equal(allTitles.length,total);assert.equal(new Set(allTitles).size,total);
+      assert.equal(allTitles.includes('Excluded 1'),showDisambiguation);
+      for(const page of unavailable)assert.equal(allTitles.includes(page.title),showWithoutConnections);
+      assert.equal(allTitles.includes(both.title),showDisambiguation&&showWithoutConnections);
+      for(const page of redirects)assert.equal(allTitles.includes(page.title),redirectsVisible);
+      assert.equal(allTitles.includes(redirectWithoutConnections.title),redirectsVisible&&showWithoutConnections);
     }
     changeCheckbox(nodes,'candidate-show-disambiguation',true);
     changeCheckbox(nodes,'candidate-show-without-connections',true);
@@ -1287,6 +1294,46 @@ async function checkHiddenPages() {
   assert.equal(articles.nodes['article-rows'].children.length,excluded.length);
   assert.equal(JSON.stringify(raw),original);
   console.log('Hidden pages: disclosure without filtering, independent checkboxes/overlap, unchecked defaults, Escape/focus, canonical/legacy/index parity, pagination, translations and unchanged data passed.');
+}
+async function checkEditorialVisibilityFilters() {
+  const raw=fixture(),template=required(raw.pages.find(page=>page.orphan));raw.metadata.demo=false;
+  raw.pages=['Musica','Cognomi','Lists_of_lists','Temporary maintenance holdings','Soft redirects'].map((category,index)=>({...template,page_id:index+1,title:`Target ${index+1}`,category}));
+  raw.link_candidates=Object.fromEntries(raw.pages.map(page=>[page.page_id,{status:'compared',candidate_count:4,candidates:[
+    {page_id:101,title:'Normal source',dead_end:true,evidence:[{language:'lmo',source_title:'Reference normal',target_title:'Reference target'}]},
+    {page_id:102,title:'Disambiguation source',category:'Disambigua',evidence:[{language:'lmo',source_title:'Reference disambiguation',target_title:'Reference target'}]},
+    {page_id:103,title:'Name source',category:'Cognomi',evidence:[{language:'lmo',source_title:'Reference name',target_title:'Reference target'}]},
+    {page_id:104,title:'Redirect source',category:'Soft redirects',evidence:[{language:'lmo',source_title:'Reference redirect',target_title:'Reference target'}]}
+  ]}]));
+  const original=JSON.stringify(raw),overview=await harness('deorphanize',raw);
+  const titles=()=>overview.nodes['candidate-cards'].children.filter(card=>card.className==='candidate-card').map(card=>titleLink(card).textContent);
+  assert.deepEqual(titles(),['Target 1']);
+  for(const id of ['candidate-show-names','candidate-show-indexes','candidate-show-maintenance','candidate-show-redirects'])changeCheckbox(overview.nodes,id,true);
+  assert.equal(titles().length,5);
+  assert.match(overview.html,/<fieldset><legend data-i18n="Pagine da deorfanizzare"/);
+  assert.match(overview.html,/<fieldset><legend data-i18n="Collegamenti consigliati"/);
+  changeCheckbox(overview.nodes,'candidate-hide-link-names',true);
+  const prompt=await preparePrompt(overview,findClass(overview.nodes['candidate-cards'].children[0],'fix-link'));
+  assert(!prompt.includes('LOCAL_X = "Name source"'));assert(prompt.includes('LOCAL_X = "Normal source"'));
+  const detail=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{storage:overview.storage});
+  const sourceTitles=()=>detail.nodes['connection-candidates'].children.map(card=>titleLink(card).textContent);
+  assert.equal(detail.nodes['candidate-hide-link-names'].checked,true);
+  assert(!sourceTitles().includes('Name source'));assert.equal(sourceTitles().length,3);
+  assert.match(detail.nodes['connection-info'].textContent,/4 pagine candidate/);
+  assert.match(detail.nodes['connection-info'].textContent,/1 collegamenti nascosti/);
+  for(const id of ['candidate-hide-link-disambiguation','candidate-hide-link-redirects'])changeCheckbox(detail.nodes,id,true);
+  assert.deepEqual(sourceTitles(),['Normal source']);
+  const detailPrompt=await preparePrompt(detail,detail.nodes['connection-copy-prompt']);
+  assert.equal((detailPrompt.match(/^\d+\. LOCAL_X/gm)||[]).length,1);
+  assert(!detailPrompt.includes('LOCAL_X = "Redirect source"'));
+  for(const id of ['candidate-hide-link-names','candidate-hide-link-disambiguation','candidate-hide-link-redirects'])changeCheckbox(detail.nodes,id,false);
+  assert.equal(sourceTitles().length,4);
+  detail.nodes['ui-language-toggle'].listeners.click();
+  assert(detail.staticNodes.some(node=>node.textContent==='Suggested links'));
+  assert.equal(sourceTitles().length,4);
+  // Unknown source categories stay visible; no source text is acquired by filtering.
+  assert.equal(detail.requests.filter(request=>request.url.startsWith('https://')).length,4);
+  assert.equal(JSON.stringify(raw),original);
+  console.log('Editorial visibility: separate target/source sections, category filters, unchanged counts, prompt exclusion, navigation preferences and unchanged inputs passed.');
 }
 async function checkConnections() {
   const raw=fixture();
@@ -1508,11 +1555,11 @@ async function checkLlmSelection() {
   const result=await harness('deorphanize',raw),{nodes,storage}=result;
   assert.deepEqual(nodes['llm-provider'].children.map(option=>option.textContent),['ChatGPT','Gemini','Claude','Qwen','Kimi','GLM','Mistral','Altro']);
   nodes['candidate-search'].value='Target';nodes['candidate-search'].listeners.input();nodes['candidate-more'].listeners.click();
-  assert.equal(nodes['candidate-cards'].children.length,30);
+  assert.equal(nodes['candidate-cards'].children.length,10);
   const fetches=result.getFetchCount();
   for(const provider of ['kimi','mistral','glm']) {
     nodes['llm-provider'].value=provider;nodes['llm-provider'].listeners.change();
-    assert.equal(nodes['candidate-cards'].children.length,30);assert.equal(nodes['candidate-search'].value,'Target');
+    assert.equal(nodes['candidate-cards'].children.length,10);assert.equal(nodes['candidate-search'].value,'Target');
     assert.equal(storage.get('orphanwiki-llm'),provider);assert.equal(result.getFetchCount(),fetches);assert.equal(result.copied.length,0);
   }
   let next=await harness('connections',raw,'?dataset=fixture.json&page=1',null,{storage});
@@ -1717,7 +1764,7 @@ async function checkPreferences() {
       nodes['article-group'].value='all';nodes['article-group'].listeners.input();
       nodes['article-more'].listeners.click();
       nodes['ui-language-toggle'].listeners.click();
-      assert.equal(nodes['article-rows'].children.length,50);
+      assert.equal(nodes['article-rows'].children.length,20);
       assert.equal(nodes['article-group'].value,'all');
       assert.deepEqual(nodes.age.children[0].children.filter(node=>node.tag==='rect').map(node=>node.height),heights);
       assert.equal(evaluate('number(1234.5)',context),new Intl.NumberFormat('it-IT',{maximumFractionDigits:1}).format(1234.5));
@@ -1733,7 +1780,7 @@ async function checkPreferences() {
       assert(nodes['candidate-cards'].children.every(card=>raw.pages.some(p=>p.title===titleLink(card).textContent)));
       nodes['candidate-more'].listeners.click();
       nodes['ui-language-toggle'].listeners.click();
-      assert.equal(nodes['candidate-cards'].children.length,Math.min(50,raw.pages.filter(p=>p.orphan&&(raw.link_candidates[p.page_id]?.candidate_count??0)>0).length));
+      assert.equal(nodes['candidate-cards'].children.length,Math.min(20,raw.pages.filter(p=>p.orphan&&(raw.link_candidates[p.page_id]?.candidate_count??0)>0).length-20));
     } else {
       assert.equal(nodes['connection-title'].textContent,'Titolo originale');
       const card=nodes['connection-candidates'].children[0];
@@ -1899,11 +1946,11 @@ async function checkTopicExplorer() {
   raw.pages=Array.from({length:34},(_,i)=>({...template,page_id:i+1,title:`Article ${String(i).padStart(2,'0')}`,orphan:true,
     category:'Music category',topic_status:i===32?'not_collected':'predicted',topic_labels:i===33?[]:i%2?['STEM.Physics']:['Culture.Media.Music','Culture.Media.Films']}));
   const before=JSON.stringify(raw),{nodes,context}=await harness('articles',raw);
-  assert.equal(nodes['article-rows'].children.length,25);
-  nodes['article-more'].listeners.click();assert.equal(nodes['article-rows'].children.length,34);
+  assert.equal(nodes['article-rows'].children.length,20);
+  nodes['article-more'].listeners.click();assert.equal(nodes['article-rows'].children.length,14);
   nodes['article-sort'].value='category-asc';nodes['article-sort'].listeners.input();
   nodes['article-classification'].value='macro';nodes['article-classification'].listeners.change();
-  assert.equal(nodes['article-rows'].children.length,25);
+  assert.equal(nodes['article-rows'].children.length,20);
   assert.equal(nodes['article-categories'].children.length,4);
   assert.equal(nodes['article-category-label'].textContent,'Macrotema');
   assert.equal(nodes['article-category-control'].hidden,true);
@@ -2150,8 +2197,8 @@ async function checkCardIndex() {
   assert.equal(findClass(cards(unavailable)[0],'fix-link').getAttribute('aria-disabled'),undefined);
   assert(!unavailable.requests.some(request=>request.url.startsWith('https://')));
   const firstRequests=next.requests.filter(request=>request.url.startsWith('data/card-records/'));
-  assert.equal(firstRequests.length,25);
-  assert.deepEqual(firstRequests.map(request=>Number(required(request.url.match(/(\d+)\.json$/))[1])).sort((a,b)=>a-b),Array.from({length:25},(_,i)=>i+2));
+  assert.equal(firstRequests.length,20);
+  assert.deepEqual(firstRequests.map(request=>Number(required(request.url.match(/(\d+)\.json$/))[1])).sort((a,b)=>a-b),Array.from({length:20},(_,i)=>i+2));
   assert(!next.requests.some(request=>request.url.startsWith('https://')||request.url==='data/fixture.json'));
   const bytes=(document: unknown)=>Buffer.byteLength(JSON.stringify(document));
   const transferred=bytes(index)+firstRequests.reduce((sum,request)=>sum+bytes(files[request.url.slice(5)]),0);
@@ -2176,7 +2223,7 @@ async function checkCardIndex() {
   for(const order of ['title-asc','category-asc','length-desc','length-asc','date-desc','date-asc','candidates-asc','candidates-desc'])await change('candidate-sort',order);
   await change('candidate-category','scri');await change('candidate-category','');
   for(const result of [old,next])result.nodes['candidate-more'].listeners.click();
-  await evaluate('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));assert.equal(cards(next).length,50);
+  await evaluate('cardHydration',next.context);assert.deepEqual(snapshot(next),snapshot(old));assert.equal(cards(next).length,20);
   await change('candidate-search','Target 001');
   assert.equal(required(cards(next)[0].children[0].children.filter(node=>node.className==='candidate-hint').at(-1)).textContent,
     required(cards(old)[0].children[0].children.filter(node=>node.className==='candidate-hint').at(-1)).textContent);
@@ -2186,7 +2233,7 @@ async function checkCardIndex() {
   hold=false;await change('candidate-search','Target 2');
   assert(held.every(request=>request.signal.aborted));assert(maximum<=4);
   assert(cards(next).every(card=>titleLink(card).textContent.startsWith('Target 2')));
-  assert.equal(evaluate('Object.values(data.link_candidates).filter(record=>record.candidates).length',next.context),25);
+  assert.equal(evaluate('Object.values(data.link_candidates).filter(record=>record.candidates).length',next.context),20);
   for(const [search,badge] of [['Target 299','0'],['Target 300','—']]) {
     const before=next.requests.length;await change('candidate-search',search);
     assert.equal(cards(next).length,0);assert.equal(next.requests.length,before);
@@ -2216,7 +2263,7 @@ async function checkCardIndex() {
   const oldAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,legacyEntry,lmoLegacyEntry],{reviewStore:reviews,chooseLanguage:'all'},files);
   const newAll=await harness('deorphanize',aggregate,'?dataset=all.json',[allEntry,entry,lmoEntry],{reviewStore:reviews,beforeFetch,chooseLanguage:'all'},files);
   assert.deepEqual(snapshot(newAll),snapshot(oldAll));
-  assert.equal(newAll.requests.filter(request=>/^data\/(?:lmo-)?card-records\//.test(request.url)).length,25);assert(maximum<=4);
+  assert.equal(newAll.requests.filter(request=>/^data\/(?:lmo-)?card-records\//.test(request.url)).length,20);assert(maximum<=4);
   assert(!newAll.requests.some(request=>request.url==='data/fixture.json'||request.url==='data/lmo.json'));
   hold=true;next.nodes['candidate-search'].value='Target 1';next.nodes['candidate-search'].listeners.input();
   await new Promise<void>(resolve=>setImmediate(resolve));const switched=held.slice(-4);assert(switched.every(request=>!request.signal.aborted));
@@ -2244,8 +2291,8 @@ async function checkCardIndex() {
   const empty=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{}, {...files,'card-index.json':{...index,rows:[],link_candidates:{}}});
   assert.equal(empty.document.body.dataset.loading,'false');assert.equal(cards(empty).length,0);
   assert(!empty.requests.some(request=>request.url.startsWith('data/card-records/')));
-  console.log('Editorial card index: '+JSON.stringify({orphans:targets.length,visible:25,legacy_bytes:bytes(legacy),index_and_visible_bytes:transferred,
-    maximum_concurrent:maximum,retained_rich_records:25,global_order_and_prompt_parity:true}));
+  console.log('Editorial card index: '+JSON.stringify({orphans:targets.length,visible:20,legacy_bytes:bytes(legacy),index_and_visible_bytes:transferred,
+    maximum_concurrent:maximum,retained_rich_records:20,global_order_and_prompt_parity:true}));
 }
 async function checkConnectionCopy() {
   const raw=fixture();raw.metadata.demo=false;
@@ -2607,7 +2654,7 @@ async function checkPersonalization() {
   await apply(cross);
   assert.equal(cross.nodes['candidate-sort'].value,'personalized');
   assert.equal(titleLink(cross.nodes['candidate-cards'].children[0]).textContent,required(crossTarget).title);
-  assert.equal(cross.nodes['candidate-cards'].children.length,25);
+  assert.equal(cross.nodes['candidate-cards'].children.length,20);
   assert.match(cross.nodes['candidate-info'].textContent,new RegExp(`^${crossRaw.pages.filter(page=>page.orphan&&(crossRaw.link_candidates[page.page_id]?.candidate_count??0)>0).length} orfane`));
   assert.match(cross.nodes['profile-status'].textContent,/2 modifiche.*2.*EN, VEC/);
   assert(cross.requests.some(request=>request.url==='data/en-observations.json'));
@@ -3000,11 +3047,11 @@ async function checkPreparedSummaries() {
   assert.deepEqual(articles.requests.map(request=>request.url),['data/manifest.json','data/fixture-summary.json']);
   assert.equal(articles.nodes['article-load'],undefined);
   assert(articles.nodes['topics-full'].children.some(row=>row.className==='bar-row'));
-  assert.equal(articles.nodes['article-rows'].children.length,25);
-  assert.match(articles.nodes['article-info'].textContent,/Anteprima: 25 di/);
+  assert.equal(articles.nodes['article-rows'].children.length,20);
+  assert.match(articles.nodes['article-info'].textContent,/Anteprima: 20 di/);
   articles.nodes['article-more'].listeners.click();
   await new Promise<void>(resolve=>setImmediate(resolve));
-  assert.equal(articles.nodes['article-rows'].children.length,50);
+  assert.equal(articles.nodes['article-rows'].children.length,20);
   assert(articles.requests.some(request=>request.url==='data/fixture.json'));
   const stale=structuredClone(summary);required(stale.article_preview).pop();
   const rejected=await harness('articles',raw,'?dataset=fixture.json',[entry],{}, {...files,'fixture-summary.json':stale});
@@ -3019,7 +3066,7 @@ async function checkPreparedSummaries() {
     ['data/manifest.json','data/fixture-summary.json','data/fixture-creators.json']);
   assert.equal(creators.nodes['creator-section'].hidden,false);
   assert.equal(creators.nodes['creator-rows'].children.length,15);
-  console.log('Prepared Rust summaries: the first 25 articles render from the summary without a full transport or load button.');
+  console.log('Prepared Rust summaries: the first 20 articles render from the summary without a full transport or load button.');
   await checkArticleIndex();
 }
 async function checkRelationalDashboard() {
@@ -3028,34 +3075,89 @@ async function checkRelationalDashboard() {
   const entry: ManifestEntry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,storage:'relational_census_v1',summary_file:'fixture-summary.json',creator_index_file:'fixture-creators.json'};
   const files={'fixture-summary.json':summary};
   const requests: Record<string,unknown>[]=[];
+  const creatorRows=Array.from({length:63},(_,i)=>({...creators.creators[i%creators.creators.length],key:`creator:${i}`}));
+  let failNext=false;
   let releaseSlow: (()=>void) | undefined,slowSignal: AbortSignal | undefined;
   const pagesAPI=async(options: FetchOptions): Promise<MockResponse>=>{
     const query: unknown=JSON.parse(options.body??'{}');assert(isRecord(query));requests.push(query);
+    if(failNext){failNext=false;throw new Error('synthetic connection failure');}
     if(query.search==='slow') {slowSignal=options.signal;await new Promise<void>(resolve=>{releaseSlow=resolve;});}
     const offset=Number(query.offset);
-    const available=query.kind==='creators'?creators.creators:query.kind==='cards'?raw.pages.filter(page=>page.orphan):raw.pages;
-    const rows=query.search?[available[query.search==='fast'?1:0]]:available;
-    const selected=rows.slice(offset,offset+25);
+    const available=query.kind==='creators'?creatorRows:query.kind==='cards'?raw.pages.filter(page=>page.orphan):raw.pages;
+    const rows=query.search==='empty'?[]:query.search?[available[query.search==='fast'?1:0]]:available;
+    const selected=rows.slice(offset,offset+20);
+    const records: Record<string,FixtureCandidateRecord>={};
+    for(const row of selected)if('page_id' in row) {
+      const record=raw.link_candidates[String(row.page_id)];
+      if(record)records[String(row.page_id)]=record;
+    }
     return {ok:true,json:async()=>query.kind==='creators'?{format:'creator_results_v1',dataset:query.dataset,offset,total:rows.length,creators:selected}:
       {format:'page_results_v1',dataset:query.dataset,offset,total:rows.length,metadata:summary.metadata,census_page_count:summary.census_page_count,
-        pages:selected,link_candidates:raw.link_candidates,card_transports:{}}};
+        pages:selected,link_candidates:records,card_transports:{}}};
   };
   const articles=await harness('articles',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
-  assert.equal(articles.nodes['article-rows'].children.length,25);
+  assert.equal(articles.nodes['article-rows'].children.length,20);
   assert.equal(requests[0].offset,0);
+  assert.equal(articles.nodes['article-previous'].disabled,true);
   assert(articles.requests.every(request=>!['data/fixture.json','data/fixture-creators.json'].includes(request.url)));
   articles.nodes['article-more'].listeners.click();await evaluateAsync('listHydration',articles.context);
-  assert.equal(articles.nodes['article-rows'].children.length,50);assert.equal(requests[1].offset,25);
+  assert.equal(articles.nodes['article-rows'].children.length,20);assert.equal(requests[1].offset,20);
+  assert.equal(evaluate('data.pages.length',articles.context),20);
+  assert.match(articles.nodes['article-info'].textContent,/Risultati 21–40 · Pagina 2/);
+  assert.equal(articles.nodes['article-rows'].children[0].children[0].children[0].textContent,raw.pages[20].title);
+  articles.nodes['article-previous'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.at(-1)?.offset,0);
+  const lastPage=Math.ceil(raw.pages.length/20);
+  required(articles.nodes['article-pages'].children.find(node=>node.textContent===String(lastPage))).listeners.click();
+  await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.at(-1)?.offset,(lastPage-1)*20);
+  assert.equal(articles.nodes['article-rows'].children.length,raw.pages.length-(lastPage-1)*20);
+  assert.equal(articles.nodes['article-more'].disabled,true);
+  assert.equal(articles.nodes['article-pages'].children.find(node=>node.getAttribute('aria-current')==='page')?.focused,true);
+  articles.nodes['ui-language-toggle'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.at(-1)?.offset,(lastPage-1)*20);
+  assert.match(articles.nodes['article-info'].textContent,/Results .*Page/);
+  articles.nodes['ui-language-toggle'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  articles.nodes['article-previous'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  failNext=true;
+  articles.nodes['article-more'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  assert.equal(articles.nodes['article-more'].textContent,'Riprova');
+  const failedOffset=requests.at(-1)?.offset;
+  articles.nodes['article-more'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.at(-1)?.offset,failedOffset);
+  assert.equal(articles.nodes['article-more'].disabled,true);
   articles.nodes['article-search'].value='slow';articles.nodes['article-search'].listeners.input();
   await new Promise<void>(resolve=>setImmediate(resolve));
   articles.nodes['article-search'].value='fast';articles.nodes['article-search'].listeners.input();await evaluateAsync('listHydration',articles.context);
   assert(slowSignal?.aborted);required(releaseSlow)();await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(articles.nodes['article-rows'].children.length,1);
   assert.equal(articles.nodes['article-rows'].children[0].children[0].children[0].textContent,raw.pages[1].title);
+  articles.nodes['article-search'].value='slow';articles.nodes['article-search'].listeners.input();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const beforeCached=requests.length;
+  articles.nodes['article-search'].value='fast';articles.nodes['article-search'].listeners.input();await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.length,beforeCached);assert(slowSignal?.aborted);
+  required(releaseSlow)();await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(articles.nodes['article-rows'].children[0].children[0].children[0].textContent,raw.pages[1].title);
   articles.nodes['article-classification'].value='topics';articles.nodes['article-classification'].listeners.change();await evaluateAsync('listHydration',articles.context);
   assert.equal(requests.at(-1)?.classification,'topics');assert.equal(requests.at(-1)?.offset,0);
+  articles.nodes['article-search'].value='empty';articles.nodes['article-search'].listeners.input();await evaluateAsync('listHydration',articles.context);
+  assert.equal(articles.nodes['article-rows'].children.length,0);
+  assert.equal(articles.nodes['article-pages'].hidden,true);assert.equal(articles.nodes['article-more'].hidden,true);
   const authors=await harness('creators',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
-  assert.equal(authors.nodes['creator-rows'].children.length,Math.min(25,creators.creators.length));
+  assert.equal(authors.nodes['creator-rows'].children.length,20);
+  authors.nodes['creator-more'].listeners.click();await evaluateAsync('listHydration',authors.context);
+  assert.equal(authors.nodes['creator-rows'].children.length,20);
+  assert.equal(evaluate('creatorRows.length',authors.context),20);
+  assert.match(authors.nodes['creator-info'].textContent,/63 creatori · 20 visualizzati/);
+  authors.nodes['creator-more'].listeners.click();await evaluateAsync('listHydration',authors.context);
+  assert.equal(authors.nodes['creator-rows'].children.length,20);
+  authors.nodes['creator-more'].listeners.click();await evaluateAsync('listHydration',authors.context);
+  assert.equal(authors.nodes['creator-rows'].children.length,3);assert.equal(authors.nodes['creator-more'].disabled,true);
+  authors.nodes['creator-previous'].listeners.click();await evaluateAsync('listHydration',authors.context);
+  assert.equal(requests.at(-1)?.offset,40);
+  authors.nodes['creator-search'].value='fast';authors.nodes['creator-search'].listeners.input();await evaluateAsync('listHydration',authors.context);
+  assert.equal(requests.at(-1)?.offset,0);assert.equal(authors.nodes['creator-rows'].children.length,1);
   assert(!authors.requests.some(request=>request.url==='data/fixture-creators.json'));
   const pooled=structuredClone(summary);pooled.metadata={...pooled.metadata,language:'all',kind:'aggregate',languages:['vec','lmo']};
   pooled.census_page_count*=2;pooled.reports.overview.total*=2;
@@ -3064,15 +3166,29 @@ async function checkRelationalDashboard() {
   const combined=await harness('articles',raw,'?dataset=all.json',[aggregate,entry],{pagesAPI:async options=>{
     const query:unknown=JSON.parse(options.body??'{}');assert(isRecord(query));
     return {ok:true,json:async()=>({format:'page_results_v1',dataset:'all.json',offset:query.offset,total:pooled.census_page_count,
-      metadata:pooled.metadata,census_page_count:pooled.census_page_count,pages:raw.pages.slice(0,25).map(page=>({...page,language:'vec'})),link_candidates:{},card_transports:{}})};
+      metadata:pooled.metadata,census_page_count:pooled.census_page_count,pages:raw.pages.slice(0,20).map(page=>({...page,language:'vec'})),link_candidates:{},card_transports:{}})};
   }},{'all-summary.json':pooled});
-  assert.equal(combined.nodes['article-rows'].children.length,25);
+  assert.equal(combined.nodes['article-rows'].children.length,20);
   assert(!combined.nodes['article-info'].textContent.includes('non valido'));
   const cards=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
-  assert.equal(cards.nodes['candidate-cards'].children.filter(node=>node.className==='candidate-card').length,25);
+  assert.equal(cards.nodes['candidate-cards'].children.filter(node=>node.className==='candidate-card').length,20);
+  cards.nodes['candidate-more'].listeners.click();await evaluateAsync('listHydration',cards.context);
+  assert.equal(cards.nodes['candidate-cards'].children.filter(node=>node.className==='candidate-card').length,20);
+  assert.equal(evaluate('data.pages.length',cards.context),20);
+  assert.equal(evaluate('Object.keys(data.link_candidates).length',cards.context),20);
+  assert.equal(requests.at(-1)?.offset,20);
+  cards.nodes['candidate-previous'].listeners.click();await evaluateAsync('listHydration',cards.context);
+  assert.equal(requests.at(-1)?.offset,0);
+  cards.nodes['candidate-more'].listeners.click();await evaluateAsync('listHydration',cards.context);
   changeCheckbox(cards.nodes,'candidate-show-without-connections',true);await evaluateAsync('listHydration',cards.context);
   assert.equal(requests.at(-1)?.show_without_connections,true);
+  assert.equal(requests.at(-1)?.offset,0);
   assert(!cards.requests.some(request=>request.url==='data/fixture.json'));
+  failNext=true;
+  const retry=await harness('articles',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
+  assert.equal(retry.nodes['article-more'].textContent,'Riprova');assert.equal(retry.nodes['article-more'].disabled,false);
+  retry.nodes['article-more'].listeners.click();await evaluateAsync('listHydration',retry.context);
+  assert.equal(retry.nodes['article-rows'].children.length,20);assert.equal(requests.at(-1)?.offset,0);
   console.log('Relational dashboard: server pagination, filter parameters, cancellation, creators, cards and CSV routes passed.');
 }
 
@@ -3099,7 +3215,7 @@ async function checkArticleIndex() {
   const indexed=await harness('articles',raw,'?dataset=fixture.json',[entry],{},files);
   for(const result of [legacy,indexed])result.nodes['article-more'].listeners.click();
   await new Promise<void>(resolve=>setImmediate(resolve));
-  assert.equal(indexed.nodes['article-rows'].children.length,50);
+  assert.equal(indexed.nodes['article-rows'].children.length,20);
   assert(indexed.requests.some(request=>request.url==='data/fixture-articles.json'));
   assert(!indexed.requests.some(request=>['data/fixture.json','data/fixture-observations.json'].includes(request.url)));
   assert(legacy.requests.some(request=>request.url==='data/fixture-observations.json'));
@@ -3124,7 +3240,7 @@ async function checkArticleIndex() {
   change('article-classification','topics');change('article-category','Music');
   change('article-classification','categories');change('article-category','');change('article-group','all');
   for(const result of [legacy,indexed])result.nodes['article-more'].listeners.click();
-  parity();assert.equal(indexed.nodes['article-rows'].children.length,50);
+  parity();assert.equal(indexed.nodes['article-rows'].children.length,20);
   for(const id of ['theme-toggle','ui-language-toggle']) {
     for(const result of [legacy,indexed])result.nodes[id].listeners.click();
     parity();
@@ -3254,4 +3370,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkProjectFooter();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkRelationalDashboard();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkProjectFooter();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkEditorialVisibilityFilters();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkRelationalDashboard();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

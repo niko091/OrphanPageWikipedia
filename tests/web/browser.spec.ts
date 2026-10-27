@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {test as base, expect} from '@playwright/test';
-import type {Page} from '@playwright/test';
+import type {Page, TestInfo} from '@playwright/test';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const executable = path.join(root, 'target/debug/orphanwiki');
@@ -163,27 +163,54 @@ async function open(page: Page, site: string, filename: string): Promise<void> {
   await page.goto(`${site}/${filename}?dataset=fixture.json${filename === 'connections.html' ? '&page=1' : ''}`);
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
   // Cards hydrate after the index: inspect layout only when their controls are ready.
-  if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(25);
+  if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(20);
 }
 
-test('four pages load real assets, charts and prepared records', async ({page, site, traffic}) => {
+async function inspectPagination(page: Page,testInfo: TestInfo,prefix: string) {
+  for(const width of [1280,390]) {
+    await page.setViewportSize({width,height:844});
+    const pagination=page.locator('nav.list-pagination');
+    await pagination.scrollIntoViewIfNeeded();
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
+    const bounds=await pagination.boundingBox();assert(bounds);
+    const controls=await pagination.locator(':scope > :not([hidden])').evaluateAll(nodes=>nodes.map(node=>{
+      const rect=node.getBoundingClientRect();return {left:rect.left,right:rect.right};
+    }));
+    const center=(Math.min(...controls.map(rect=>rect.left))+Math.max(...controls.map(rect=>rect.right)))/2;
+    expect(Math.abs(center-(bounds.x+bounds.width/2))).toBeLessThanOrEqual(1);
+    await pagination.screenshot({path:testInfo.outputPath(`${prefix}-pagination-${width}.png`)});
+  }
+}
+
+test('four pages load real assets, charts and prepared records', async ({page, site, traffic},testInfo) => {
   const wasm = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('.wasm') && response.ok());
   await open(page, site, 'index.html');
   expect((await wasm).headers()['content-type']).toContain('application/wasm');
   await expect(page.locator('#length svg')).toBeVisible();
+  await page.locator('#article-pages').getByRole('button',{name:'Pagina 2',exact:true}).click();
+  await expect(page.locator('#article-rows tr')).toHaveCount(12);
+  await expect(page.locator('#article-info')).toContainText('Pagina 2 di 2');
+  await expect(page.locator('#article-more')).toBeDisabled();
+  await inspectPagination(page,testInfo,'article');
   await page.locator('#creators-link').click();
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
-  await expect(page.locator('#creator-rows tr')).toHaveCount(25);
+  await expect(page.locator('#creator-rows tr')).toHaveCount(20);
   await page.locator('#creator-more').click();
-  await expect(page.locator('#creator-rows tr')).toHaveCount(32);
+  await expect(page.locator('#creator-rows tr')).toHaveCount(12);
+  await expect(page.locator('#creator-info')).toContainText('Pagina 2 di 2');
+  await inspectPagination(page,testInfo,'creator');
+  await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
   await page.locator('#creator-search').fill('creator:31');
   await expect(page.locator('#creator-rows tr')).toHaveCount(1);
   await page.locator('#deorphanize-link').click();
-  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
-  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(25);
+  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(20);
   await page.locator('#candidate-more').click();
-  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(32);
-  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(32);
+  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(12);
+  await expect(page.locator('#candidate-info')).toContainText('Pagina 2 di 2');
+  await inspectPagination(page,testInfo,'candidate');
+  await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
   await page.locator('#candidate-search').fill(title(1));
   await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(1);
   await page.locator('#candidate-cards a[href*="connections.html"]').click();
@@ -192,7 +219,7 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   expect(traffic.editorial).toEqual([]);
 });
 
-test('hidden pages opens independent options with keyboard and mobile support', async ({page, site, traffic}) => {
+test('hidden pages opens independent options with keyboard and mobile support', async ({page, site, traffic}, testInfo) => {
   for (const width of [1280, 390]) {
     await page.setViewportSize({width, height: 844});
     await open(page, site, 'deorphanize.html');
@@ -205,16 +232,24 @@ test('hidden pages opens independent options with keyboard and mobile support', 
     await expect(button).toHaveAttribute('aria-expanded', 'false');
     await button.click();
     await expect(options).toBeVisible();
+    await expect(options.getByRole('group', {name:'Pagine da deorfanizzare', exact:true})).toBeVisible();
+    await expect(options.getByRole('group', {name:'Collegamenti consigliati', exact:true})).toBeVisible();
     await expect(button).toHaveAttribute('aria-expanded', 'true');
     await expect(disambiguation).not.toBeChecked();
     await expect(redirects).not.toBeChecked();
     await expect(connections).not.toBeChecked();
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
     const bounds = await options.boundingBox();
     expect(bounds).not.toBeNull();
     assert(bounds);
     expect(bounds.x).toBeGreaterThanOrEqual(0);
     expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+    expect(bounds.y).toBeGreaterThanOrEqual(0);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(844);
+    for(const theme of ['light','dark']) {
+      await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+      await page.screenshot({path:testInfo.outputPath(`hidden-${width}-${theme}.png`)});
+    }
     await disambiguation.check();
     await expect(redirects).not.toBeChecked();
     await expect(connections).not.toBeChecked();
@@ -233,9 +268,13 @@ test('hidden pages opens independent options with keyboard and mobile support', 
     await expect(redirects).toBeChecked();
     await connections.uncheck();
     await redirects.uncheck();
+    const sourceFilter=page.getByRole('checkbox',{name:'Nascondi collegamenti da disambigue',exact:true});
+    await sourceFilter.check();
+    await expect(disambiguation).not.toBeChecked();
+    await sourceFilter.uncheck();
     await button.click();
     await expect(options).toBeHidden();
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
   }
   expect(traffic.editorial).toEqual([]);
 });
@@ -243,9 +282,14 @@ test('hidden pages opens independent options with keyboard and mobile support', 
 test('article search, filtering, sorting and pagination', async ({page, site}) => {
   await open(page, site, 'index.html');
   await page.locator('#article-group').selectOption('all');
-  await expect(page.locator('#article-rows tr')).toHaveCount(25);
+  await expect(page.locator('#article-rows tr')).toHaveCount(20);
   await page.locator('#article-more').click();
-  await expect(page.locator('#article-rows tr')).toHaveCount(50);
+  await expect(page.locator('#article-rows tr')).toHaveCount(20);
+  await expect(page.locator('#article-rows tr').first()).toContainText(title(21));
+  await page.locator('#article-pages').getByRole('button',{name:'Pagina 4',exact:true}).click();
+  await expect(page.locator('#article-rows tr')).toHaveCount(4);
+  await expect(page.locator('#article-info')).toContainText('Risultati 61–64 · Pagina 4 di 4');
+  await expect(page.locator('#article-more')).toBeDisabled();
   await page.locator('#article-search').fill(title(64));
   await expect(page.locator('#article-rows tr')).toHaveCount(1);
   await expect(page.locator('#article-rows')).toContainText(title(64));
@@ -324,17 +368,36 @@ databaseTest('database alone serves paginated articles, creators and cards on de
       if(request.url().endsWith('/api/pages'))queries.push(request.postDataJSON());
     });
     await open(page,site,'index.html');
-    await expect(page.locator('#article-rows tr')).toHaveCount(25);
+    await expect(page.locator('#article-rows tr')).toHaveCount(20);
     await page.locator('#article-group').selectOption('all');
     await expect(page.locator('#article-info')).toContainText('64');
-    await page.locator('#article-more').click();await expect(page.locator('#article-rows tr')).toHaveCount(50);
+    await expect(page.locator('#article-previous')).toBeDisabled();
+    await page.locator('#article-more').click();await expect(page.locator('#article-rows tr')).toHaveCount(20);
+    await expect(page.locator('#article-info')).toContainText('Risultati 21–40 · Pagina 2 di 4');
+    await expect(page.locator('#article-rows tr').first()).toContainText(title(21));
+    await page.locator('#article-pages').getByRole('button',{name:'Pagina 4',exact:true}).click();
+    await expect(page.locator('#article-rows tr')).toHaveCount(4);
+    await expect(page.locator('#article-more')).toBeDisabled();
+    await expect(page.locator('#article-pages [aria-current="page"]')).toBeFocused();
+    await page.locator('#article-previous').click();await expect(page.locator('#article-rows tr')).toHaveCount(20);
+    await inspectPagination(page,testInfo,'article');
     await page.locator('#article-search').fill(title(64));await expect(page.locator('#article-rows tr')).toHaveCount(1);
     await expect(page.locator('#article-rows')).toContainText(title(64));
-    await page.locator('#creators-link').click();await expect(page.locator('#creator-rows tr')).toHaveCount(25);
-    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(32);
+    await page.locator('#creators-link').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
+    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(12);
+    await inspectPagination(page,testInfo,'creator');
+    await expect(page.locator('#creator-info')).toContainText('Pagina 2 di 2');
+    await expect(page.locator('#creator-more')).toBeDisabled();
+    await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
+    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(12);
     await page.locator('#creator-search').fill('creator:31');await expect(page.locator('#creator-rows tr')).toHaveCount(1);
-    await page.locator('#deorphanize-link').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
-    await page.locator('#candidate-more').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(32);
+    await page.locator('#deorphanize-link').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+    await page.locator('#candidate-more').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await expect(page.locator('#candidate-more')).toBeDisabled();
+    await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+    await page.locator('#candidate-more').focus();await page.keyboard.press('Enter');
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await inspectPagination(page,testInfo,'candidate');
     for(const width of [1280,390]) {
       await page.setViewportSize({width,height:844});
       await page.getByRole('button',{name:'Pagine nascoste',exact:true}).click();
@@ -345,9 +408,12 @@ databaseTest('database alone serves paginated articles, creators and cards on de
     }
     await page.locator('#ui-language-toggle').click();await expect(page.locator('html')).toHaveAttribute('lang','en');
     await page.locator('#theme-toggle').click();await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(32);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await expect(page.locator('#candidate-info')).toContainText('Page 2 of 2');
+    await expect(page.locator('#candidate-more')).toHaveText('Next');
+    await page.locator('nav.list-pagination').scrollIntoViewIfNeeded();
     await page.screenshot({path:testInfo.outputPath('database-mobile-dark.png')});
     expect(resources.some(url=>url.endsWith('/data/fixture.json')||url.includes('-articles.json')||url.includes('-cards-v2.json')||url.includes('-creators.json'))).toBe(false);
-    expect(queries.some(value=>record(value)&&value.offset===25)).toBe(true);
+    expect(queries.some(value=>record(value)&&value.offset===20)).toBe(true);
     expect(traffic.editorial).toEqual([]);
 });

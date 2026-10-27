@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs::File, io::BufReader, path::Path};
 
 pub const RULE: &str = "relational_census_v1";
+const PAGE_SIZE: i64 = 20;
 
 fn read(path: &Path) -> DumpResult<Value> {
     Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
@@ -923,9 +924,9 @@ impl Census {
         };
         let mut record: Value = serde_json::from_str(&stored)?;
         let sql = if short {
-            "SELECT c.source,c.data,t.value FROM candidates c JOIN texts t ON t.id=c.title_id JOIN shortlists s ON s.language=c.language AND s.target=c.target AND s.source=c.source WHERE c.language=? AND c.target=? ORDER BY s.position"
+            "SELECT c.source,c.data,t.value,p.category FROM candidates c JOIN texts t ON t.id=c.title_id LEFT JOIN pages p ON p.language=c.language AND p.id=c.source JOIN shortlists s ON s.language=c.language AND s.target=c.target AND s.source=c.source WHERE c.language=? AND c.target=? ORDER BY s.position"
         } else {
-            "SELECT c.source,c.data,t.value FROM candidates c JOIN texts t ON t.id=c.title_id WHERE c.language=? AND c.target=? ORDER BY c.position"
+            "SELECT c.source,c.data,t.value,p.category FROM candidates c JOIN texts t ON t.id=c.title_id LEFT JOIN pages p ON p.language=c.language AND p.id=c.source WHERE c.language=? AND c.target=? ORDER BY c.position"
         };
         let mut query = self.db.prepare(sql)?;
         let mut rows = query.query(params![language, id])?;
@@ -935,6 +936,8 @@ impl Census {
             let mut candidate: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
             candidate["page_id"] = json!(source);
             candidate["title"] = json!(row.get::<_, String>(2)?);
+            // Read existing census metadata for UI filters; never rewrite the collection.
+            candidate["category"] = json!(row.get::<_, Option<String>>(3)?);
             let join = if short {
                 " JOIN shortlists s ON s.language=e.language AND s.target=e.target AND s.source=e.source AND s.evidence_position=e.position"
             } else {
@@ -1123,6 +1126,13 @@ impl Census {
             if !request.show_without_connections {
                 conditions.push("t.count>0".into());
             }
+            if !request.hidden_categories.is_empty() {
+                let placeholders = vec!["?"; request.hidden_categories.len()].join(",");
+                conditions.push(format!(
+                    "coalesce(replace(trim(p.category_fold),'_',' '),'') NOT IN ({placeholders})"
+                ));
+                values.extend(request.hidden_categories.iter().cloned().map(Into::into));
+            }
         }
         if !request.search.is_empty() {
             conditions.push("instr(p.title_fold,?)>0".into());
@@ -1225,11 +1235,11 @@ impl Census {
         if request.kind == "cards" {
             order = format!("reviewed,{order}");
         }
-        bindings.push(25i64.into());
+        bindings.push(PAGE_SIZE.into());
         bindings.push(request.offset.into());
         let mut query=self.db.prepare(&format!("{prefix} SELECT language,id,data,title,orphan FROM listed{filter} ORDER BY {order}title_fold,title,id,language LIMIT ? OFFSET ?"))?;
         let mut rows = query.query(rusqlite::params_from_iter(bindings))?;
-        let mut pages = Vec::with_capacity(25);
+        let mut pages = Vec::with_capacity(PAGE_SIZE as usize);
         let mut records = serde_json::Map::new();
         let mut transports = serde_json::Map::new();
         while let Some(row) = rows.next()? {
@@ -1298,7 +1308,7 @@ impl Census {
             params![request.dataset, request.search.to_lowercase()],
             |r| r.get(0),
         )?;
-        let mut query=self.db.prepare(&format!("SELECT data FROM creators WHERE dataset=? AND instr(key_fold,?)>0 ORDER BY {field} IS NULL,{field} {direction},key LIMIT 25 OFFSET ?"))?;
+        let mut query=self.db.prepare(&format!("SELECT data FROM creators WHERE dataset=? AND instr(key_fold,?)>0 ORDER BY {field} IS NULL,{field} {direction},key LIMIT {PAGE_SIZE} OFFSET ?"))?;
         let rows = query
             .query_map(
                 params![
@@ -1339,6 +1349,8 @@ pub struct PageQuery {
     pub show_redirects: bool,
     #[serde(default)]
     pub show_without_connections: bool,
+    #[serde(default)]
+    pub hidden_categories: Vec<String>,
     #[serde(default)]
     pub edits: Vec<Value>,
     #[serde(default)]
@@ -1384,9 +1396,14 @@ impl PageQuery {
                     | "personalized"
             )
             || self.offset < 0
-            || self.offset % 25 != 0
+            || self.offset % PAGE_SIZE != 0
             || self.edits.len() > 100
             || self.closed_pairs.len() > 100000
+            || self.hidden_categories.len() > 128
+            || self
+                .hidden_categories
+                .iter()
+                .any(|category| category.len() > 256)
             || self.closed_pairs.iter().any(|(language, target, source)| {
                 crate::wiki_database(language, None).is_err()
                     || *target == 0

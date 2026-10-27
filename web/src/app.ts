@@ -35,6 +35,7 @@ interface ReferenceEdge {
   target_page_id?: number | null; target_title: string;
 }
 interface Candidate {
+  category?: string | null;
   page_id: number; title: string; out_degree?: number | null;
   dead_end?: boolean | null; evidence?: ReferenceEdge[];
 }
@@ -151,6 +152,8 @@ interface UIElements {
   'article-group': HTMLSelectElement;
   'article-info': HTMLElement;
   'article-more': HTMLButtonElement;
+  'article-previous': HTMLButtonElement;
+  'article-pages': HTMLElement;
   'article-rows': HTMLElement;
   'article-search': HTMLInputElement;
   'article-sort': HTMLSelectElement;
@@ -161,6 +164,8 @@ interface UIElements {
   'candidate-heading': HTMLElement;
   'candidate-info': HTMLElement;
   'candidate-more': HTMLButtonElement;
+  'candidate-previous': HTMLButtonElement;
+  'candidate-pages': HTMLElement;
   'candidate-search': HTMLInputElement;
   'candidate-section': HTMLElement;
   'candidate-sort': HTMLSelectElement;
@@ -170,6 +175,12 @@ interface UIElements {
   'candidate-show-disambiguation': HTMLInputElement;
   'candidate-show-redirects': HTMLInputElement;
   'candidate-show-without-connections': HTMLInputElement;
+  'candidate-show-names': HTMLInputElement;
+  'candidate-show-indexes': HTMLInputElement;
+  'candidate-show-maintenance': HTMLInputElement;
+  'candidate-hide-link-disambiguation': HTMLInputElement;
+  'candidate-hide-link-names': HTMLInputElement;
+  'candidate-hide-link-redirects': HTMLInputElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;
   'auth-login': HTMLButtonElement;
@@ -198,6 +209,8 @@ interface UIElements {
   'creator_continuity_months_before_creation-note': HTMLElement;
   'creator-info': HTMLElement;
   'creator-more': HTMLButtonElement;
+  'creator-previous': HTMLButtonElement;
+  'creator-pages': HTMLElement;
   'creator-rows': HTMLElement;
   'creator-search': HTMLInputElement;
   'creator-section': HTMLElement;
@@ -386,9 +399,8 @@ const translations: Record<string, string> = {
   "Creazione": "Created",
   "Link entranti": "Incoming links",
   "Collegamenti possibili": "Possible links",
-  "Mostra altre 25 voci": "Show 25 more articles",
   "Anteprima: {shown} di {total} voci orfane.": "Preview: {shown} of {total} orphan articles.",
-  "Anteprima non disponibile per questa raccolta. Mostra altre 25 voci per caricare l’elenco.": "Preview unavailable for this collection. Show 25 more articles to load the list.",
+  "Anteprima non disponibile per questa raccolta. Seleziona una pagina per caricare l’elenco.": "Preview unavailable for this collection. Select a page to load the list.",
   "Caricamento dell’elenco completo delle voci…": "Loading the complete article list…",
   "Analisi descrittiva": "Descriptive analysis",
   "Provenienza delle voci ed esperienza dei loro creatori.": "Article origins and creator experience.",
@@ -428,20 +440,28 @@ const translations: Record<string, string> = {
   "Orfane attuali": "Current orphans",
   "Quota orfane": "Orphan share",
   "Lingue osservate": "Observed languages",
-  "Mostra altri 25 creatori": "Show 25 more creators",
   "Pagine orfane e possibili collegamenti dal confronto tra lingue.": "Orphan pages and possible links from cross-language comparison.",
   "Da quali pagine possiamo collegare le orfane?": "Which pages could link to orphans?",
   "Seleziona Connetti per vedere le pagine candidate e i collegamenti già presenti nelle altre lingue. Ogni proposta richiede una verifica del contenuto.": "Select Connect to see candidate pages and existing links in other languages. Each proposal requires a content review.",
   "Cerca una voce orfana": "Search orphan articles",
   "Cerca una categoria…": "Search categories…",
   "Pagine nascoste": "Hidden pages",
+  "Pagine da deorfanizzare": "Pages to deorphan",
+  "Collegamenti consigliati": "Suggested links",
+  "Mostra categorie di nomi e cognomi": "Show given-name and surname categories",
+  "Mostra indici di insiemi e liste di liste": "Show set indexes and lists of lists",
+  "Mostra pagine di deposito temporaneo": "Show temporary maintenance holdings",
+  "Nascondi collegamenti da disambigue": "Hide links from disambiguation pages",
+  "Nascondi collegamenti da categorie di nomi e cognomi": "Hide links from given-name and surname categories",
+  "Nascondi collegamenti da redirect e soft redirect": "Hide links from redirects and soft redirects",
+  "Filtri sulle categorie disponibili, non una classificazione completa. Tipi sconosciuti e hatnote non sono identificabili. I conteggi totali restano invariati.": "Filters use available categories, not a complete classification. Unknown types and hatnotes cannot be identified. Total counts remain unchanged.",
+  "{n} collegamenti nascosti dai filtri.": "{n} links hidden by filters.",
   "Scegli quali pagine nascoste mostrare.": "Choose which hidden pages to show.",
   "Mostra pagine di disambiguazione": "Show disambiguation pages",
   "Mostra pagine di redirect": "Show redirect pages",
   "Mostra pagine senza collegamenti possibili": "Show pages without possible connections",
   "Include anche le voci con dato non disponibile.": "Also includes articles with unavailable data.",
   "Caricamento dei collegamenti possibili…": "Loading possible connections…",
-  "Mostra altre 25 schede": "Show 25 more cards",
   "Valuta le coppie di pagine": "Review candidate page pairs",
   "Fixato": "Fixed",
   "Non fixato": "Not fixed",
@@ -567,6 +587,14 @@ const translations: Record<string, string> = {
   "{title}. {coverage}; ogni voce è un’osservazione. Disponibile per {n}/{total} voci. {scope}": "{title}. {coverage}; each article is an observation. Available for {n}/{total} articles. {scope}",
   "{unit} (scala logaritmica)": "{unit} (logarithmic scale)",
   "{n} voci · {shown} visualizzate": "{n} articles · {shown} displayed",
+  "Precedente": "Prev",
+  "Successiva": "Next",
+  "Riprova": "Retry",
+  "Paginazione delle voci": "Article pagination",
+  "Paginazione dei creatori": "Creator pagination",
+  "Paginazione delle schede": "Card pagination",
+  "Pagina {page}": "Page {page}",
+  "Risultati {from}–{to} · Pagina {page} di {pages}": "Results {from}–{to} · Page {page} of {pages}",
   "{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.": "{n} creators · {shown} displayed. Local identifiers; languages limited to scanned wikis.",
   "{n} orfane corrispondenti · {shown} schede visualizzate": "{n} matching orphans · {shown} cards displayed",
   "{n} pagine candidate": "{n} candidate pages",
@@ -646,22 +674,96 @@ const attributedCreatorKey = (row: PageObservation) => {
   return key?(data.metadata.kind==='aggregate'?`${pageLanguage(row)}:${key}`:key):null;
 };
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
-let data: Dataset, datasetFile: string, loadVersion = 0, candidateLimit = 25, connectionLimit = 50, articleLimit = 25, creatorLimit = 25, creatorRows: CreatorRow[] = [];
+let data: Dataset, datasetFile: string, loadVersion = 0, connectionLimit = 50, creatorRows: CreatorRow[] = [];
 let candidatePreview = false;
 let datasetController = new AbortController();
 const candidatePreviews = new Map<string, Promise<Dataset | null>>();
 let precomputed: DashboardSummaryData | null = null, precomputedCreators: CreatorRow[] | null = null;
 let summaryOnly = false, articleListLoading = false;
 type RemoteKind='articles'|'cards'|'creators';
+const listPageSize=20;
+const localOffsets: Record<RemoteKind,number>={articles:0,creators:0,cards:0};
+const localTotals: Record<RemoteKind,number>={articles:0,creators:0,cards:0};
 interface RemoteList {
-  key: string; total: number; pages: PageObservation[]; creators: CreatorRow[];
+  key: string; offset: number; total: number; pages: PageObservation[]; creators: CreatorRow[];
   records: Record<string,CandidateRecord>; transports: Record<string,CardTransport>;
 }
 let remoteRendering=false,remoteController=new AbortController(),remoteVersion=0;
 let remoteList: RemoteList | null=null,listHydration: Promise<void>=Promise.resolve();
+let remoteQueryKey='',remoteOffset=0,paginationFocus=false;
 let remoteProfileEdits: RecentEdit[]=[];
 function databaseMode(): boolean {return datasetEntries.some(entry=>entry.file===datasetFile&&entry.storage==='relational_census_v1');}
-function resetRemoteList() {++remoteVersion;remoteController.abort();remoteList=null;remoteProfileEdits=[];}
+function resetRemoteList() {
+  ++remoteVersion;remoteController.abort();remoteList=null;remoteProfileEdits=[];
+  remoteQueryKey='';remoteOffset=0;paginationFocus=false;
+  for(const prefix of ['article','creator','candidate'] as const) {
+    const previous=$(prefix+'-previous'),pages=$(prefix+'-pages'),more=$(prefix+'-more') as HTMLButtonElement | null;
+    if(previous)previous.hidden=true;
+    if(pages){pages.hidden=true;pages.replaceChildren();}
+    if(more) {
+      more.dataset.i18n='Successiva';
+      more.textContent=t(more.dataset.i18n);more.disabled=false;
+    }
+  }
+}
+function changeListPage(kind: RemoteKind,offset: number,focusPage=false) {
+  if(databaseMode()) {
+    if(!remoteList||offset<0||offset>=remoteList.total||offset===remoteList.offset)return;
+    remoteOffset=offset;
+  } else {
+    if(offset<0||offset>=localTotals[kind]||(offset===localOffsets[kind]&&!(kind==='articles'&&summaryOnly)))return;
+    localOffsets[kind]=offset;
+    if(kind==='articles'&&summaryOnly) {
+      paginationFocus=focusPage;listHydration=loadFullArticles();return;
+    }
+  }
+  paginationFocus=focusPage;
+  (kind==='articles'?articleList:kind==='creators'?creatorList:candidateCards)();
+}
+function stepListPage(kind: RemoteKind,direction: number) {
+  if(!databaseMode()) {
+    const offset=localOffsets[kind];
+    if(kind==='articles'&&summaryOnly&&(offset>0||!precomputed?.article_preview)) {
+      paginationFocus=true;listHydration=loadFullArticles();
+    } else changeListPage(kind,offset+direction*listPageSize,true);
+    return;
+  }
+  if(direction>0&&remoteOffset!==remoteList?.offset) {
+    (kind==='articles'?articleList:kind==='creators'?creatorList:candidateCards)();
+  } else if(remoteList)changeListPage(kind,remoteList.offset+direction*listPageSize,true);
+}
+function listPagination(kind: RemoteKind,list: {offset: number; total: number},busy=false) {
+  const prefix=kind==='cards'?'candidate':kind==='creators'?'creator':'article';
+  const previous=$(prefix+'-previous') as HTMLButtonElement,more=$(prefix+'-more') as HTMLButtonElement,numbers=$(prefix+'-pages')!;
+  const current=Math.floor(list.offset/listPageSize)+1,total=Math.ceil(list.total/listPageSize);
+  previous.hidden=more.hidden=numbers.hidden=total<=1;
+  previous.disabled=busy||list.offset===0;more.disabled=busy||current>=total;
+  more.dataset.i18n='Successiva';more.textContent=t('Successiva');
+  numbers.replaceChildren();
+  // Bound the controls even for a complete edition with millions of rows.
+  const start=Math.max(1,Math.min(current-2,total-4)),end=Math.min(total,start+4);
+  const pages=[...new Set([1,...Array.from({length:Math.max(0,end-start+1)},(_,i)=>start+i),total])].filter(page=>page>0);
+  let last=0;
+  for(const page of pages) {
+    if(last&&page-last>1)numbers.append(element('span','…'));
+    const button=element('button',number(page));button.type='button';button.disabled=busy;
+    button.setAttribute('aria-label',t('Pagina {page}',{page:number(page)}));
+    if(page===current)button.setAttribute('aria-current','page');
+    button.addEventListener('click',()=>changeListPage(kind,(page-1)*listPageSize,true));
+    numbers.append(button);last=page;
+    if(page===current&&paginationFocus&&!busy){button.focus();paginationFocus=false;}
+  }
+}
+function localListOffset(kind: RemoteKind,total: number): number {
+  if(remoteRendering)return 0;
+  localTotals[kind]=total;
+  localOffsets[kind]=Math.min(localOffsets[kind],Math.max(0,Math.ceil(total/listPageSize)-1)*listPageSize);
+  return localOffsets[kind];
+}
+function listRange(total: number,offset: number,shown: number): string {
+  return total?' · '+t('Risultati {from}–{to} · Pagina {page} di {pages}',
+    {from:number(offset+1),to:number(offset+shown),page:number(offset/listPageSize+1),pages:number(Math.ceil(total/listPageSize))}):'';
+}
 
 function databaseList(kind: RemoteKind,render: ()=>void): boolean {
   if(!databaseMode()||remoteRendering)return false;
@@ -678,12 +780,14 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     show_disambiguation:kind==='cards'&&Boolean($('candidate-show-disambiguation')?.checked),
     show_redirects:kind==='cards'&&Boolean($('candidate-show-redirects')?.checked),
     show_without_connections:kind==='cards'&&Boolean($('candidate-show-without-connections')?.checked),
+    hidden_categories:kind==='cards'?hiddenTargetCategories():[],
     missing_category:t('Senza categoria idonea'),missing_topics:t('Temi non disponibili'),empty_topics:t('Nessun tema sopra soglia'),
     closed_pairs:kind==='cards'?[...editorialReviews.values()].filter(review=>review.status==='fixed'||review.status==='bad_link').map(review=>[review.language,review.target_id,review.source_id]):[],
     edits:kind==='cards'&&field('candidate-sort')==='personalized'?remoteProfileEdits:[]};
-  const key=canonicalJSON([request,kind==='cards'?[...editorialReviews.values()]:[],uiLanguage]);
-  const limit=kind==='cards'?candidateLimit:kind==='creators'?creatorLimit:articleLimit;
-  const count=remoteList?(kind==='creators'?remoteList.creators.length:remoteList.pages.length):0;
+  const queryKey=canonicalJSON([{...request,missing_category:'',missing_topics:'',empty_topics:''},kind==='cards'?[...editorialReviews.values()]:[]]);
+  const key=canonicalJSON([queryKey,uiLanguage]);
+  if(queryKey!==remoteQueryKey){remoteQueryKey=queryKey;remoteOffset=0;paginationFocus=false;}
+  const offset=remoteOffset;
   const more=$(prefix+'-more' as keyof UIElements) as HTMLButtonElement;
   const info=$(prefix+'-info' as keyof UIElements)!;
   function display(list: RemoteList) {
@@ -693,16 +797,18 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     try {render();} finally {remoteRendering=false;}
     const shown=kind==='creators'?list.creators.length:list.pages.length;
     if(kind!=='creators')info.textContent=t(kind==='cards'?'{n} orfane corrispondenti · {shown} schede visualizzate':'{n} voci · {shown} visualizzate',{n:number(list.total),shown:number(shown)});
-    else info.textContent=info.textContent.replace(number(list.creators.length),number(list.total));
-    more.hidden=shown>=list.total;more.disabled=false;
+    else info.textContent=creatorListInfo(list.total,shown);
+    info.textContent+=listRange(list.total,list.offset,shown);
+    listPagination(kind,list);
   }
-  if(remoteList?.key===key&&(count>=limit||count>=remoteList.total)){display(remoteList);return;}
-  const previous=remoteList?.key===key?remoteList:null;
-  const offset=previous?(kind==='creators'?previous.creators.length:previous.pages.length):0;
+  if(remoteList?.key===key&&remoteList.offset===offset) {
+    ++remoteVersion;remoteController.abort();display(remoteList);return;
+  }
   const version=++remoteVersion,load=loadVersion;
   remoteController.abort();remoteController=new AbortController();
   const signal=remoteController.signal;
   ++cardRequestVersion;cardController.abort();
+  if(remoteList)listPagination(kind,remoteList,true);
   more.disabled=true;info.textContent=t('Caricamento…');
   try {
     const response=await fetch('api/pages',{method:'POST',cache:'no-store',credentials:'omit',signal,
@@ -710,15 +816,15 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     const payload: unknown=await response.json();
     if(signal.aborted||version!==remoteVersion||load!==loadVersion)return;
     if(!response.ok||!isRecord(payload)||payload.dataset!==datasetFile||payload.offset!==offset||
-      !Number.isSafeInteger(payload.total)||Number(payload.total)<offset)throw new Error('Indice degli articoli non valido');
-    const next: RemoteList=previous?{...previous,pages:[...previous.pages],creators:[...previous.creators],records:{...previous.records},transports:{...previous.transports}}:{key,total:0,pages:[],creators:[],records:{},transports:{}};
+      !Number.isSafeInteger(payload.total)||Number(payload.total)<0)throw new Error('Indice degli articoli non valido');
+    const next: RemoteList={key,offset,total:0,pages:[],creators:[],records:{},transports:{}};
     next.total=Number(payload.total);
     if(kind==='creators') {
-      if(payload.format!=='creator_results_v1'||!Array.isArray(payload.creators)||payload.creators.length>25||
+      if(payload.format!=='creator_results_v1'||!Array.isArray(payload.creators)||payload.creators.length>listPageSize||
         payload.creators.some(row=>!isRecord(row)||typeof row.key!=='string'||!Number.isSafeInteger(row.total)||!Number.isSafeInteger(row.orphans)||!Array.isArray(row.languages)))throw new Error('Indice dei creatori non valido');
       next.creators.push(...payload.creators as CreatorRow[]);
     } else {
-      if(payload.format!=='page_results_v1'||!Array.isArray(payload.pages)||payload.pages.length>25||
+      if(payload.format!=='page_results_v1'||!Array.isArray(payload.pages)||payload.pages.length>listPageSize||
         canonicalJSON(payload.metadata)!==canonicalJSON(data.metadata)||payload.census_page_count!==precomputed?.census_page_count||
         !isRecord(payload.link_candidates)||!isRecord(payload.card_transports))throw new Error('Indice degli articoli non valido');
       if(payload.pages.some(page=>!isRecord(page)||!Number.isSafeInteger(page.page_id)||Number(page.page_id)<=0||typeof page.title!=='string'||typeof page.orphan!=='boolean'))throw new Error('Indice degli articoli non valido');
@@ -733,12 +839,19 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
       if(new Set(next.pages.map(pageKey)).size!==next.pages.length)throw new Error('Indice degli articoli non valido');
     }
     const loaded=kind==='creators'?next.creators.length:next.pages.length;
-    if(loaded!==Math.min(next.total,offset+25))throw new Error('Indice degli articoli non valido');
+    if(loaded!==Math.min(listPageSize,Math.max(0,next.total-offset)))throw new Error('Indice degli articoli non valido');
+    if(offset>0&&offset>=next.total) {
+      remoteOffset=Math.max(0,Math.floor((next.total-1)/listPageSize)*listPageSize);
+      await loadDatabaseList(kind,render);return;
+    }
     remoteList=next;display(next);
-    if(loaded<limit&&loaded<next.total)await loadDatabaseList(kind,render);
   } catch(error) {
-    if(!signal.aborted&&version===remoteVersion&&load===loadVersion)info.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',{error:t(error instanceof Error?error.message:String(error))});
-  } finally {if(version===remoteVersion)more.disabled=false;}
+    if(!signal.aborted&&version===remoteVersion&&load===loadVersion) {
+      info.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',{error:t(error instanceof Error?error.message:String(error))});
+      if(remoteList)listPagination(kind,remoteList);
+      more.hidden=false;more.disabled=false;more.dataset.i18n='Riprova';more.textContent=t('Riprova');
+    }
+  }
 }
 let profileRequestVersion = 0;
 let profileController = new AbortController();
@@ -1122,7 +1235,7 @@ async function scoreProfile(edits: RecentEdit[], version: number) {
   if(databaseMode())remoteProfileEdits=enriched;
   profileScores=new Map(report.scores.map(row=>[row.key,{topic:row.topic,language:row.language}]));
   $('profile-sort-option')!.disabled=false;
-  $('candidate-sort')!.value='personalized';candidateLimit=25;candidateCards();
+  $('candidate-sort')!.value='personalized';localOffsets.cards=0;candidateCards();
   const languages=[...new Set(enriched.filter(edit=>edit.topic_labels?.length).map(edit=>edit.language))].sort();
   $('profile-status')!.textContent=t('Profilo: {edits} modifiche nelle Wikipedie analizzate; temi utilizzabili per {known}, nelle lingue {languages}. Le altre modifiche restano senza temi utilizzabili. Fonti: ultime raccolte disponibili per lingua.',
     {edits:number(report.total_edits),known:number(report.known_topic_edits),languages:languages.map(language=>language.toUpperCase()).join(', ')});
@@ -1577,7 +1690,7 @@ function fixRequest(page: PageObservation, record?: CandidateRecord, focusedCand
   // Keep only the first five ranked candidates without sorting the full list.
   for(const candidate of focusedCandidate?[focusedCandidate]:record.candidates||[]) {
     if(!Number.isSafeInteger(candidate?.page_id)||candidate.page_id<=0||candidate.page_id===page.page_id||typeof candidate.title!=='string'||!candidate.title.trim()||selected.some(row=>row.page_id===candidate.page_id))continue;
-    if(closedEdge(page,candidate.page_id))continue;
+    if(closedEdge(page,candidate.page_id)||hiddenSuggestedLink(page,candidate))continue;
     const evidence=Array.isArray(candidate.evidence)?candidate.evidence:[];
     const references=single?evidence.filter(validReference):[evidence.find(validReference)].filter(validReference);
     if(!references.length)continue;
@@ -1744,19 +1857,30 @@ function articleList() {
   const search=$('article-search')!.value.toLocaleLowerCase();
   const category=($('article-classification')!.value==='macro'?$('article-macro')!.value:$('article-category')!.value).toLocaleLowerCase();
   const group=$('article-group')!.value||'orphans';
+  const order=$('article-sort')!.value||'title-asc';
+  if(!remoteRendering&&summaryOnly&&(search||category||group!=='orphans'||order!=='title-asc')) {
+    if(!articleListLoading)listHydration=loadFullArticles();
+    return;
+  }
   const pages=remoteRendering?data.pages:(summaryOnly?precomputed!.article_preview??[]:data.pages).filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
-  if(!remoteRendering)sortArticles(pages,$('article-sort')!.value||'title-asc');
+  if(!remoteRendering)sortArticles(pages,order);
+  const total=summaryOnly&&!remoteRendering?precomputed!.reports.overview.orphans:pages.length;
+  const offset=localListOffset('articles',total),visible=pages.slice(offset,offset+listPageSize);
   const box=$('article-rows')!;box.replaceChildren();
-  for(const page of pages.slice(0,articleLimit)) {
+  for(const page of visible) {
     const row=element('tr'),title=element('td');title.append(wikiLink(page.title,pageLanguage(page)));
     row.append(title,...[articleLabels(page).join(' · '),page.orphan?t('Sì'):t('No'),number(page.length_bytes),page.created_at?new Date(page.created_at).toISOString().slice(0,10):'—',number(page.in_degree),number(data.link_candidates?.[pageKey(page)]?.candidate_count)].map(value=>element('td',value)));
     box.append(row);
   }
-  $('article-info')!.textContent=summaryOnly&&!precomputed!.article_preview?t('Anteprima non disponibile per questa raccolta. Mostra altre 25 voci per caricare l’elenco.'):
+  $('article-info')!.textContent=summaryOnly&&!precomputed!.article_preview?t('Anteprima non disponibile per questa raccolta. Seleziona una pagina per caricare l’elenco.'):
     summaryOnly?t('Anteprima: {shown} di {total} voci orfane.',
-    {shown:number(Math.min(articleLimit,pages.length)),total:number(precomputed!.reports.overview.orphans)}):
-    t('{n} voci · {shown} visualizzate',{n:number(pages.length),shown:number(Math.min(articleLimit,pages.length))});
-  $('article-more')!.hidden=summaryOnly?precomputed!.reports.overview.orphans<=(precomputed!.article_preview?.length??0):articleLimit>=pages.length;
+    {shown:number(visible.length),total:number(total)}):
+    t('{n} voci · {shown} visualizzate',{n:number(total),shown:number(visible.length)});
+  if(!remoteRendering) {
+    if(visible.length)$('article-info')!.textContent+=listRange(total,offset,visible.length);
+    listPagination('articles',{offset,total});
+    if(summaryOnly&&!precomputed!.article_preview&&total)$('article-pages')!.hidden=false;
+  }
 }
 function prepareCreators() {
   if(!creatorsAvailable()) {creatorRows=[];return;}
@@ -1768,6 +1892,12 @@ function prepareCreators() {
     historical?[pageLanguage(page)]:page.creator_languages_created??[]
   ]));
 }
+function creatorListInfo(total: number,shown: number): string {
+  return creatorsAvailable()?t(creatorMode()==='history'?
+    '{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo account alla data del dump; conteggi limitati alle voci attribuite nel censimento.':
+    '{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.',
+    {n:number(total),shown:number(shown)}):t('Dati sui creatori non disponibili per questa raccolta.');
+}
 function creatorList() {
   if(!$('creator-rows')!)return;
   if(databaseList('creators',creatorList))return;
@@ -1777,18 +1907,19 @@ function creatorList() {
   if(!remoteRendering)rows.sort((a,b)=>numericOrder(a[field],b[field],order.endsWith('asc')?1:-1)||a.key.localeCompare(b.key));
   const articlesHeading=document.getElementById('creator-articles-heading');
   if(articlesHeading)articlesHeading.hidden=creatorMode()==='history';
+  const offset=localListOffset('creators',rows.length),visible=rows.slice(offset,offset+listPageSize);
   const box=$('creator-rows')!;box.replaceChildren();
   const types: Record<string, string> = {registered:'Registrato',bot:'Bot',temporary:'Temporaneo',no_bot_flag:'Senza flag bot'};
-  for(const creator of rows.slice(0,creatorLimit)) {
+  for(const creator of visible) {
     const row=element('tr');
     row.append(...[creator.key,t(types[creator.type ?? '']||'—'),...(creatorMode()==='history'?[]:[number(creator.articles)]),number(creator.total),number(creator.orphans),number(creator.percent)+'%',[...creator.languages].sort().join(', ').toUpperCase()||'—'].map(value=>element('td',value)));
     box.append(row);
   }
-  $('creator-info')!.textContent=creatorsAvailable()?t(creatorMode()==='history'?
-    '{n} creatori ricostruiti · {shown} visualizzati. ID storici locali; attribuzione dalla prima revisione osservata. Tipo account alla data del dump; conteggi limitati alle voci attribuite nel censimento.':
-    '{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.',
-    {n:number(rows.length),shown:number(Math.min(creatorLimit,rows.length))}):t('Dati sui creatori non disponibili per questa raccolta.');
-  $('creator-more')!.hidden=creatorLimit>=rows.length;
+  $('creator-info')!.textContent=creatorListInfo(rows.length,visible.length);
+  if(!remoteRendering) {
+    $('creator-info')!.textContent+=listRange(rows.length,offset,visible.length);
+    listPagination('creators',{offset,total:rows.length});
+  }
 }
 interface VisibleCardRequest { page: PageObservation; record: CandidateRecord; footer: HTMLElement; connect: HTMLAnchorElement; }
 async function readVisibleCard(filename: string,signal: AbortSignal): Promise<unknown> {
@@ -1855,6 +1986,31 @@ const redirectOrphanCategories=new Set([
 function orphanCategoryName(page: PageObservation): string {
   return (page.category??'').normalize('NFD').replace(/\p{M}/gu,'').toLowerCase().replace(/[_\s]+/g,' ').trim();
 }
+// Exact category labels only; these UI filters do not infer article types.
+const nameIndexCategories=['nomi','prenomi','cognomi','given names','surnames','prénoms','patronymes','cognoms','prenoms','sobrenomes','prenomes'];
+const setIndexCategories=['set index articles','lists of lists','liste di liste','listes de listes','listas de listas','llistes de llistes'];
+const maintenanceCategories=['temporary maintenance holdings','temporary maintenance holdings/rfd'];
+const softRedirectCategories=['soft redirect','soft redirects','redirect interwiki','interwiki soft redirects'];
+function filterCategoryName(category: string): string {return category.toLowerCase().replaceAll('_',' ').trim();}
+function hiddenTargetCategories(): string[] {
+  return [
+    ...(!$('candidate-show-names')?.checked?nameIndexCategories:[]),
+    ...(!$('candidate-show-indexes')?.checked?setIndexCategories:[]),
+    ...(!$('candidate-show-maintenance')?.checked?maintenanceCategories:[]),
+    ...(!$('candidate-show-redirects')?.checked?softRedirectCategories:[])
+  ];
+}
+const linkFilterIds=['candidate-hide-link-disambiguation','candidate-hide-link-names','candidate-hide-link-redirects'] as const;
+function hiddenSuggestedLink(page: PageObservation,candidate: Candidate): boolean {
+  if(!linkFilterIds.some(id=>$(id)?.checked))return false;
+  const category=candidate.category??data.pages.find(source=>source.page_id===candidate.page_id&&pageLanguage(source)===pageLanguage(page))?.category;
+  if(typeof category!=='string')return false;
+  const normalized=filterCategoryName(category),folded=orphanCategoryName({...page,category});
+  return Boolean($('candidate-hide-link-disambiguation')?.checked&&specialOrphanCategories.has(folded)&&
+      !['insiemi di caratteri','set di caratteri','character sets','jeux de caracteres','conjunts de caracters','conjuntos de caracteres'].includes(folded)||
+    $('candidate-hide-link-names')?.checked&&nameIndexCategories.includes(normalized)||
+    $('candidate-hide-link-redirects')?.checked&&(redirectOrphanCategories.has(folded)||softRedirectCategories.includes(normalized)));
+}
 function candidateCards() {
   if(!deorphanizePage||$('dataset')!.value==='')return;
   if(databaseList('cards',candidateCards))return;
@@ -1865,11 +2021,13 @@ function candidateCards() {
   const showDisambiguation=$('candidate-show-disambiguation')!.checked;
   const showRedirects=$('candidate-show-redirects')!.checked;
   const showWithoutConnections=$('candidate-show-without-connections')!.checked;
+  const hiddenCategories=hiddenTargetCategories();
   const sorted=remoteRendering?orphans:orphans.filter(p=>{
     const count=records[pageKey(p)]?.candidate_count;
     const categoryName=orphanCategoryName(p);
     return (showDisambiguation||!specialOrphanCategories.has(categoryName))&&
       (showRedirects||!redirectOrphanCategories.has(categoryName))&&
+      !hiddenCategories.includes(filterCategoryName(p.category??''))&&
       (showWithoutConnections||(typeof count==='number'&&Number.isSafeInteger(count)&&count>0))&&
       p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category);
   });
@@ -1883,11 +2041,12 @@ function candidateCards() {
     });
   } else if(!remoteRendering)sortArticles(sorted,order==='personalized'?'candidates-desc':order);
   if(!remoteRendering)sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
+  const offset=localListOffset('cards',sorted.length),visible=sorted.slice(offset,offset+listPageSize);
   $('candidate-info')!.textContent=candidatePreview&&!showWithoutConnections?t('Caricamento dei collegamenti possibili…'):candidatePreview?
-    t('Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.',{shown:number(Math.min(candidateLimit,sorted.length))}):
-    t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
+    t('Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.',{shown:number(visible.length)}):
+    t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(visible.length)});
   const box=$('candidate-cards')!;box.replaceChildren();
-  const visible=sorted.slice(0,candidateLimit),keys=new Set(visible.map(pageKey)),pending: VisibleCardRequest[]=[];
+  const keys=new Set(visible.map(pageKey)),pending: VisibleCardRequest[]=[];
   for(const [key,record] of Object.entries(records))if(record?.candidate_ids&&!keys.has(key))delete record.candidates;
   for(const page of visible) {
     const record=records[pageKey(page)],count=record?.candidate_count;
@@ -1908,7 +2067,10 @@ function candidateCards() {
     }
   }
   if(!sorted.length)box.append(element('p',t(candidatePreview?'Caricamento dell’elenco completo delle voci orfane…':'Nessuna voce orfana corrispondente.')));
-  $('candidate-more')!.hidden=candidatePreview||candidateLimit>=sorted.length;
+  if(!remoteRendering) {
+    if(!candidatePreview)$('candidate-info')!.textContent+=listRange(sorted.length,offset,visible.length);
+    listPagination('cards',{offset,total:candidatePreview?0:sorted.length});
+  }
   cardHydration=hydrateVisibleCards(pending,request,cardController.signal);
 }
 function renderConnections() {
@@ -1926,10 +2088,12 @@ function renderConnections() {
   copyButton.disabled=!connectionCopyRequest;
   copyButton.textContent=t('Prepara prompt e fonti');
   copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
-  const candidates=[...(record?.candidates||[])].sort((a,b)=>Number(closedEdge(page,a.page_id))-Number(closedEdge(page,b.page_id))||candidateOrder(a,b));
+  const candidates=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate)).sort((a,b)=>Number(closedEdge(page,a.page_id))-Number(closedEdge(page,b.page_id))||candidateOrder(a,b));
   const box=$('connection-candidates')!;box.replaceChildren();
   $('connection-info')!.textContent=count==null?(t(candidateReasons[record?.status ?? '']||'Confronto tra lingue non ancora disponibile.'))
     :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.',{n:number(count),shown:number(Math.min(connectionLimit,candidates.length))});
+  const hidden=(record?.candidates?.length??0)-candidates.length;
+  if(hidden)$('connection-info')!.textContent+=' '+t('{n} collegamenti nascosti dai filtri.',{n:number(hidden)});
   for(const candidate of candidates.slice(0,connectionLimit)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
@@ -2207,7 +2371,7 @@ async function load(entry: ManifestEntry) {
   document.body.dataset.loading='true';
   $('status')!.hidden=false;
   $('status')!.textContent=t('Caricamento…');
-  candidateLimit=25;
+  localOffsets.cards=0;
   for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
   if(deorphanizePage&&!entry.storage)void readCandidatePreview(entry).then(preview=>{
     if(!preview||fullReady||version!==loadVersion)return;
@@ -2239,7 +2403,7 @@ async function load(entry: ManifestEntry) {
     return;
   } finally {fullReady=true;}
   if(!next)return;
-  data=next; datasetFile=entry.file; connectionLimit=50; articleLimit=25; creatorLimit=25;
+  data=next; datasetFile=entry.file; connectionLimit=50; localOffsets.articles=0; localOffsets.creators=0;
   datasetLinks(entry);
   if(deorphanizePage||connectionsPage) {
     editorialReviews=new Map();reviewsAvailable=false;
@@ -2266,6 +2430,7 @@ async function loadFullArticles() {
   const version=loadVersion,entry=datasetEntries.find(item=>item.file===datasetFile);
   if(!entry)return;
   articleListLoading=true;$('article-more')!.disabled=true;
+  listPagination('articles',{offset:localOffsets.articles,total:localTotals.articles},true);
   $('article-info')!.textContent=t('Caricamento dell’elenco completo delle voci…');
   try {
     let full=await readDataset(entry,true);
@@ -2280,9 +2445,14 @@ async function loadFullArticles() {
     data=full;summaryOnly=false;
     refreshCategoryChoices();articleList();
   } catch(error) {
-    if(version===loadVersion)$('article-info')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',
-      {error:t(error instanceof Error?error.message:String(error))});
-  } finally {if(version===loadVersion){articleListLoading=false;$('article-more')!.disabled=false;}}
+    if(version===loadVersion) {
+      $('article-info')!.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',
+        {error:t(error instanceof Error?error.message:String(error))});
+      listPagination('articles',{offset:localOffsets.articles,total:localTotals.articles});
+      $('article-more')!.hidden=false;$('article-more')!.disabled=false;
+      $('article-more')!.dataset.i18n='Riprova';$('article-more')!.textContent=t('Riprova');
+    }
+  } finally {if(version===loadVersion)articleListLoading=false;}
 }
 function refreshCategoryChoices() {
   for(const prefix of ['candidate','article'])if($(prefix+'-categories')!) {
@@ -2386,33 +2556,57 @@ $('llm-prompt')?.addEventListener('cancel',event=>{event.preventDefault();closeP
 $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.loading!=='true')renderCharts();});
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
-for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{candidateLimit=25;if(data)candidateCards();});
-if(deorphanizePage) {
+for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{localOffsets.cards=0;if(data)candidateCards();});
+if(deorphanizePage||connectionsPage) {
   const button=$('candidate-hidden')!,options=$('candidate-hidden-options')!;
-  const open=(visible: boolean)=>{options.hidden=!visible;button.setAttribute('aria-expanded',String(visible));};
+  const open=(visible: boolean)=>{
+    options.hidden=!visible;button.setAttribute('aria-expanded',String(visible));
+    const anchor=button.getBoundingClientRect?.(),origin=options.offsetParent?.getBoundingClientRect();
+    if(!visible||!anchor||!origin)return;
+    const above=anchor.top-12,below=window.innerHeight-anchor.bottom-12;
+    const upwards=below<320&&above>below;
+    options.style.maxHeight=Math.max(120,Math.min(620,upwards?above:below))+'px';
+    options.style.top=upwards?'auto':(anchor.bottom-origin.top+6)+'px';
+    options.style.bottom=upwards?(origin.bottom-anchor.top+6)+'px':'auto';
+    const width=options.getBoundingClientRect().width;
+    options.style.left=(Math.max(12,Math.min(anchor.right-width,window.innerWidth-width-12))-origin.left)+'px';
+    options.style.right='auto';
+  };
   open(false);
   button.addEventListener('click',()=>open(Boolean(options.hidden)));
   $('candidate-hidden-control')!.addEventListener('keydown',event=>{
     if(event.key==='Escape'&&!options.hidden){event.preventDefault();open(false);button.focus();}
   });
 }
-for(const id of ['candidate-show-disambiguation','candidate-show-redirects','candidate-show-without-connections'] as const)$(id)?.addEventListener('change',()=>{
-  candidateLimit=25;if(data)candidateCards();
+for(const id of ['candidate-show-disambiguation','candidate-show-redirects','candidate-show-without-connections','candidate-show-names','candidate-show-indexes','candidate-show-maintenance'] as const)$(id)?.addEventListener('change',()=>{
+  localOffsets.cards=0;if(data)candidateCards();
 });
+for(const id of linkFilterIds) {
+  const node=$(id);if(!node)continue;
+  node.checked=readPreference('orphanwiki-'+id,'show',['show','hide'])==='hide';
+  node.addEventListener('change',()=>{
+    savePreference('orphanwiki-'+id,node.checked?'hide':'show');
+    closePrompt();connectionLimit=50;
+    if(data){if(deorphanizePage)candidateCards();else if(connectionsPage)renderConnections();}
+  });
+}
 $('auth-menu')?.addEventListener('keydown',event=>{
   if(event.key==='Escape') {event.preventDefault();$('auth-menu')!.open=false;$('auth-toggle')!.focus();}
 });
 $('auth-login')?.addEventListener('click',()=>{void login();});
 $('auth-logout')?.addEventListener('click',()=>{void logout();});
 $('profile-apply')?.addEventListener('click',()=>{if(data)void applyProfile();});
-for(const id of ['article-search','article-category','article-group','article-sort']) $(id)?.addEventListener('input',()=>{articleLimit=25;if(data)articleList();});
-$('article-macro')?.addEventListener('change',()=>{articleLimit=25;if(data)articleList();});
-for(const id of ['creator-search','creator-sort']) $(id)?.addEventListener('input',()=>{creatorLimit=25;if(data)creatorList();});
-$('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';$('article-macro')!.value='';articleLimit=25;refreshCategoryChoices();articleList();}});
-$('article-more')?.addEventListener('click',()=>{articleLimit+=25;if(summaryOnly&&!databaseMode())void loadFullArticles();else articleList();});
-$('creator-more')?.addEventListener('click',()=>{creatorLimit+=25;creatorList();});
+for(const id of ['article-search','article-category','article-group','article-sort']) $(id)?.addEventListener('input',()=>{localOffsets.articles=0;if(data)articleList();});
+$('article-macro')?.addEventListener('change',()=>{localOffsets.articles=0;if(data)articleList();});
+for(const id of ['creator-search','creator-sort']) $(id)?.addEventListener('input',()=>{localOffsets.creators=0;if(data)creatorList();});
+$('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';$('article-macro')!.value='';localOffsets.articles=0;refreshCategoryChoices();articleList();}});
+$('article-more')?.addEventListener('click',()=>stepListPage('articles',1));
+$('creator-more')?.addEventListener('click',()=>stepListPage('creators',1));
+$('article-previous')?.addEventListener('click',()=>stepListPage('articles',-1));
+$('creator-previous')?.addEventListener('click',()=>stepListPage('creators',-1));
+$('candidate-previous')?.addEventListener('click',()=>stepListPage('cards',-1));
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
-$('candidate-more')?.addEventListener('click',()=>{candidateLimit+=25;candidateCards();});
+$('candidate-more')?.addEventListener('click',()=>stepListPage('cards',1));
 const dashboardReady=(async()=>{
   await loadAuth();
   const bindings: DashboardModule = await import(nativeModuleUrl);

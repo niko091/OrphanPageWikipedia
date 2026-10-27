@@ -122,6 +122,33 @@ button {
   color: var(--teal);
 }
 
+.list-pagination,.pagination-pages {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.list-pagination {
+  margin-block-start: 16px;
+  justify-content: center;
+}
+
+.pagination-pages {
+  justify-content: center;
+}
+
+.pagination-pages button {
+  min-inline-size: 44px;
+}
+
+.pagination-pages button[aria-current="page"] {
+  color: var(--text);
+  background: var(--accent-surface);
+  border-color: var(--teal);
+  font-weight: 700;
+}
+
 a {
   color: var(--link);
 }
@@ -583,8 +610,10 @@ body[data-page="connections"] #connection-copy-prompt {
   right: 0;
   top: calc(100% + 6px);
   z-index: 5;
-  width: 300px;
+  width: 360px;
   max-width: calc(100vw - 84px);
+  max-height: min(70vh, 620px);
+  overflow-y: auto;
   padding: 12px;
   display: grid;
   gap: 12px;
@@ -593,6 +622,29 @@ body[data-page="connections"] #connection-copy-prompt {
   background: var(--surface);
   box-shadow: 0 4px 12px var(--shadow);
 }
+
+#candidate-hidden-options fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 10px;
+}
+
+#candidate-hidden-options fieldset + fieldset {
+  border-block-start: 1px solid var(--control-border);
+  padding-block-start: 12px;
+}
+
+#candidate-hidden-options legend {
+  padding: 0;
+  margin-block-end: 8px;
+  font-weight: 700;
+}
+
+#candidate-hidden-options p { margin: 0; font-size: .85rem; }
+body[data-page="connections"] #candidate-hidden-options { inset-inline-start: 0; }
 
 #candidate-hidden-options label {
   flex-direction: row;

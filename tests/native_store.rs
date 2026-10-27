@@ -112,18 +112,22 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
     let mut request = w.request("articles");
     let first = db.query(&request, &[]).unwrap();
     assert_eq!(first["total"], 63);
-    assert_eq!(first["pages"].as_array().unwrap().len(), 25);
+    assert_eq!(first["pages"].as_array().unwrap().len(), 20);
     assert_eq!(first["pages"][0]["length_bytes"], Value::Null);
-    request.offset = 25;
+    request.offset = 20;
     let second = db.query(&request, &[]).unwrap();
-    assert_eq!(second["pages"][0]["page_id"], 26);
+    assert_eq!(second["pages"].as_array().unwrap().len(), 20);
+    assert_eq!(second["pages"][0]["page_id"], 21);
+    request.offset = 25;
+    assert!(db.query(&request, &[]).is_err());
     request.offset = 0;
     request.search = "Page 06".into();
     assert_eq!(db.query(&request, &[]).unwrap()["total"], 2);
     request.search.clear();
     request.order = "length-desc".into();
-    request.offset = 50;
+    request.offset = 60;
     let last = db.query(&request, &[]).unwrap();
+    assert_eq!(last["pages"].as_array().unwrap().len(), 3);
     assert_eq!(
         last["pages"].as_array().unwrap().last().unwrap()["page_id"],
         1
@@ -153,7 +157,7 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
         assert!(![2, 3, 4, 5].contains(&p["page_id"].as_i64().unwrap()));
     }
     let closed = vec![("vec".into(), 1, 101), ("vec".into(), 1, 102)];
-    cards.offset = 50;
+    cards.offset = 40;
     let sorted = db.query(&cards, &closed).unwrap();
     assert_eq!(
         sorted["pages"].as_array().unwrap().last().unwrap()["page_id"],
@@ -164,6 +168,12 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
     cards.show_redirects = true;
     cards.show_without_connections = true;
     assert_eq!(db.query(&cards, &[]).unwrap()["total"], 61);
+    cards.hidden_categories = vec!["musica".into()];
+    assert_eq!(db.query(&cards, &[]).unwrap()["total"], 2);
+    cards.hidden_categories = vec!["musica' OR 1=1 --".into()];
+    assert_eq!(db.query(&cards, &[]).unwrap()["total"], 61);
+    cards.hidden_categories = vec!["x".into(); 129];
+    assert!(db.query(&cards, &[]).is_err());
     let mut personalized = w.request("cards");
     personalized.order = "personalized".into();
     personalized.edits = vec![
@@ -210,6 +220,15 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
         card["candidate_record"]["candidates"][0]["evidence"][0]["source_title"],
         "Page 101"
     );
+    assert_eq!(
+        card["candidate_record"]["candidates"][0]["category"],
+        "Musica"
+    );
+    assert_eq!(
+        detail["link_candidates"]["1"]["candidates"][0]["category"],
+        "Musica"
+    );
+    db.verify().unwrap();
     let shard = db
         .resource(&format!(
             "{}/0.json",
@@ -381,7 +400,7 @@ fn http_dashboard_queries_downloads_and_reviews_work_with_only_the_database() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let result: Value = serde_json::from_slice(&response.bytes().unwrap()).unwrap();
-    assert_eq!(result["pages"].as_array().unwrap().len(), 25);
+    assert_eq!(result["pages"].as_array().unwrap().len(), 20);
     let response = client
         .get(format!(
             "{url}/api/export?dataset={}",
