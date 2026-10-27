@@ -41,6 +41,24 @@ impl Drop for TopicWorker {
 
 #[cfg(feature = "cli")]
 impl TopicWorker {
+    fn spawn(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+        // Another thread can fork while the extracted executable is writable.
+        // Its child may briefly retain that handle even after our close, until
+        // exec closes inherited descriptors. Retry only this transient failure.
+        let mut retries = 20;
+        loop {
+            match command.spawn() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && retries > 0 =>
+                {
+                    retries -= 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn start(model: &std::path::Path) -> DumpResult<Self> {
         use std::io::Write;
         use std::process::{Command, Stdio};
@@ -60,12 +78,12 @@ impl TopicWorker {
         drop(file);
         let mut command = Command::new(&path);
         crate::runtime::configure_child_tracing(&mut command);
-        let mut child = command
+        command
             .arg(model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        let mut child = Self::spawn(&mut command)?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
@@ -131,6 +149,58 @@ impl TopicWorker {
         }
         Ok(())
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn worker_start_recovers_after_a_temporary_executable_write_handle_closes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (directory, _) = export_directory(&std::env::temp_dir()).unwrap();
+    let path = directory.path.join("worker");
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = channel();
+        scope.spawn(move || {
+            sender
+                .send(TopicWorker::spawn(&mut std::process::Command::new(path)))
+                .unwrap();
+        });
+        let early = receiver.recv_timeout(Duration::from_millis(100));
+        drop(writer);
+        assert!(matches!(early, Err(RecvTimeoutError::Timeout)), "{early:?}");
+        let mut child = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn worker_start_returns_persistent_busy_and_missing_executable_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (directory, _) = export_directory(&std::env::temp_dir()).unwrap();
+    let path = directory.path.join("worker");
+    let mut command = std::process::Command::new(&path);
+    assert_eq!(
+        TopicWorker::spawn(&mut command).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    assert_eq!(
+        TopicWorker::spawn(&mut command).unwrap_err().kind(),
+        std::io::ErrorKind::ExecutableFileBusy
+    );
+    drop(writer);
 }
 
 /// Checksum-verified fastText 0.9.3, isolated behind safe bounded I/O.
