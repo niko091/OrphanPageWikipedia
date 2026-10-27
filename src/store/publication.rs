@@ -176,7 +176,10 @@ pub fn publish(folder: &Path, destination: &Path, identity: &Value) -> DumpResul
                     let name = filename(&entry[key])?;
                     let value = read(&folder.join(name))?;
                     if value["metadata"] != metadata || value["census_page_count"] != count {
-                        return Err("Riepilogo non corrispondente alla raccolta".into());
+                        return Err(format!(
+                            "Risorsa {name}: riepilogo non corrispondente alla raccolta"
+                        )
+                        .into());
                     }
                     if key == "summary_file" {
                         if value["format"] != "dashboard_summary_v1"

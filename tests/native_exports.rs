@@ -78,19 +78,31 @@ fn header() -> String {
 #[test]
 fn dashboard_publication_switches_generations_and_keeps_every_previously_approved_file() {
     let w = Workspace::new();
-    let source = w.source(
+    let source = w.canonical(
+        &json!({"language":"vec","complete":true,"started_at":"2026-10-01T00:00:00Z","finished_at":"2026-10-02T00:00:00Z","measures_rule":"creation_quality_creators_v3"}),
         &json!([{"page_id":1,"title":"A","orphan":true},{"page_id":2,"title":"B","orphan":false}]),
         None,
     );
     fs::write(w.0.join("canonical.csv"), "approved csv").unwrap();
-    let aggregate = json!({"file":"all.json","language":"all","kind":"aggregate","date":null});
-    fs::write(w.0.join("all.json"), "approved aggregate").unwrap();
-    fs::write(w.0.join("manifest.json"),json!([{"file":"canonical.json","language":"vec","date":null,"published_at":"old"},aggregate]).to_string()).unwrap();
+    let aggregate = json!({"file":"all.json","language":"all","kind":"aggregate","date":"2026-10-02T00:00:00Z"});
+    let metadata = read_json(&source)["metadata"].clone();
+    let member = json!({"language":"vec","file":"canonical.json","path":source,"page_count":2,"metadata":metadata});
+    let index = orphanwiki::dumps::aggregate_index(&[member]).unwrap();
+    fs::write(w.0.join("all.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    fs::write(w.0.join("manifest.json"),json!([{"file":"canonical.json","language":"vec","date":"2026-10-02T00:00:00Z","published_at":"old"},aggregate]).to_string()).unwrap();
     let canonical = fs::read(&source).unwrap();
     rebuild_dashboard(&w.0).unwrap();
     let first = read_json(w.0.join("manifest.json"));
     let old = snapshot(&w.0);
-    assert_eq!(first[1], aggregate);
+    assert_eq!(first[1]["file"], aggregate["file"]);
+    assert!(w
+        .0
+        .join(first[1]["summary_file"].as_str().unwrap())
+        .exists());
+    assert!(w
+        .0
+        .join(first[1]["creator_index_file"].as_str().unwrap())
+        .exists());
     assert_eq!(first[0]["published_at"], "old");
     assert_eq!(first[0].as_object().unwrap().len(), 13);
     for (key, name) in first[0].as_object().unwrap() {

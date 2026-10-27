@@ -3,7 +3,7 @@ use super::DumpResult;
 use super::{
     analyze_imported_graph, analyze_memory_graph, canonical_json_sha256, export_csv, file_sha256,
     file_signature, first_metadata, prepare_dashboard_exports, resolved_path, topic_time,
-    write_atomic, AnalysisOptions, DumpClient, WikimediaHttp,
+    write_aggregate_summary, write_atomic, AnalysisOptions, DumpClient, WikimediaHttp,
 };
 
 #[cfg(feature = "cli")]
@@ -474,6 +474,34 @@ pub fn rebuild_dashboard(folder: &std::path::Path) -> DumpResult<()> {
                 .as_object_mut()
                 .ok_or("Voce del manifest non valida")?
                 .extend(names.as_object().ok_or("Trasporti non validi")?.clone());
+        }
+        for entry in manifest.iter_mut().filter(|e| e["kind"] == "aggregate") {
+            let name = dataset_filename(&entry["file"])?;
+            let source = folder.join(name);
+            let index: Value = serde_json::from_reader(std::fs::File::open(&source)?)?;
+            sources.push((source.clone(), file_signature(&source)?));
+            let mut members = index["members"]
+                .as_array()
+                .filter(|members| !members.is_empty())
+                .ok_or("Membri aggregati mancanti")?
+                .clone();
+            for member in &mut members {
+                member["path"] = serde_json::json!(folder.join(dataset_filename(&member["file"])?));
+            }
+            let stem = source
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or("Nome aggregato non valido")?;
+            let summary = format!("{stem}-{generation}-summary.json");
+            let creators = format!("{stem}-{generation}-creators.json");
+            write_aggregate_summary(
+                &members,
+                &prepared.path.join(&summary),
+                &index["metadata"],
+                true,
+            )?;
+            entry["summary_file"] = serde_json::json!(summary);
+            entry["creator_index_file"] = serde_json::json!(creators);
         }
         for (source, signature) in sources {
             if file_signature(&source)? != signature {
