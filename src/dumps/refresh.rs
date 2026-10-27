@@ -64,7 +64,7 @@ pub fn refresh_measures(
     raw: &std::path::Path,
     history: &std::path::Path,
     output: &std::path::Path,
-    quality: Option<&std::path::Path>,
+    quality: &std::path::Path,
 ) -> DumpResult<String> {
     crate::runtime::phase("measures.refresh", || {
         crate::runtime::check_cancelled()?;
@@ -111,9 +111,8 @@ pub fn refresh_measures(
         {
             return Err("Export e grafo non corrispondenti; analizzare prima il grafo".into());
         }
-        let inputs = [Some(raw), Some(history), quality]
+        let inputs = [raw, history, quality]
             .into_iter()
-            .flatten()
             .map(|p| Ok((p, comparison_signature(p)?)))
             .collect::<DumpResult<Vec<_>>>()?;
         let raw_checksum = file_sha256(raw)?;
@@ -133,19 +132,15 @@ pub fn refresh_measures(
         if history_meta["creation_rule"] != HISTORY_RULE {
             return Err("Reimportare History con la nuova definizione della creazione".into());
         }
-        let quality_meta = quality
-            .map(|path| {
-                stage_supplement(
-                    path,
-                    &mut staged.database,
-                    SupplementKind::Quality,
-                    &graph,
-                    staged.count,
-                    Some(&raw_checksum),
-                )
-            })
-            .transpose()?;
-        for table in std::iter::once("history").chain(quality.is_some().then_some("quality")) {
+        let quality_meta = stage_supplement(
+            quality,
+            &mut staged.database,
+            SupplementKind::Quality,
+            &graph,
+            staged.count,
+            Some(&raw_checksum),
+        )?;
+        for table in ["history", "quality"] {
             let foreign = staged.database.query_row(
                 &format!(
                 "SELECT COUNT(*) FROM {table} h LEFT JOIN pages p ON p.id=h.id WHERE p.id IS NULL"
@@ -186,11 +181,10 @@ pub fn refresh_measures(
                 .map(|r| serde_json::from_str::<Value>(&r.2))
                 .collect::<Result<Vec<_>, _>>()?;
             crate::initialize_creator_rows(&mut rows)?;
-            for (table, kind) in std::iter::once(("history", SupplementKind::History)).chain(
-                quality
-                    .is_some()
-                    .then_some(("quality", SupplementKind::Quality)),
-            ) {
+            for (table, kind) in [
+                ("history", SupplementKind::History),
+                ("quality", SupplementKind::Quality),
+            ] {
                 let records = staged
                     .database
                     .prepare(&format!("SELECT id,data FROM {table} WHERE id IN ({ids})"))?
@@ -242,22 +236,9 @@ pub fn refresh_measures(
         if processed != staged.count {
             return Err("Aggiornamento misure incompleto".into());
         }
-        let preserve_legacy = quality_meta.is_none()
-            && staged.metadata["quality"].is_object()
-            && staged.metadata["quality"]["quality_revision_rule"]
-                != "selected_official_xml_revision_v1";
-        let measures = if preserve_legacy {
-            staged
-                .metadata
-                .get("measures_rule")
-                .cloned()
-                .unwrap_or(json!("creation_quality_creators_v2"))
-        } else {
-            json!("creation_quality_creators_v3")
-        };
         staged.metadata["history"] = history_meta;
         staged.metadata["age_rule"] = json!(HISTORY_RULE);
-        staged.metadata["measures_rule"] = measures;
+        staged.metadata["measures_rule"] = json!("creation_quality_creators_v3");
         if staged.metadata["article_features"].is_null() {
             staged.metadata["article_features"] = json!({});
         }
@@ -268,12 +249,8 @@ pub fn refresh_measures(
             "age".into(),
             json!("MediaWiki History / page_creation_timestamp"),
         );
-        if quality_meta.is_some() {
-            features.insert("quality".into(), json!("johnson_v2_2022_01"));
-        }
-        if let Some(meta) = quality_meta {
-            staged.metadata["quality"] = meta;
-        }
+        features.insert("quality".into(), json!("johnson_v2_2022_01"));
+        staged.metadata["quality"] = quality_meta;
         let references = staged.metadata["comparison"]["reference_languages"]
             .as_array()
             .map(|a| {

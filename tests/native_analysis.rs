@@ -483,7 +483,7 @@ fn refresh_retains_exact_graph_topics_and_reference_edges_with_bounded_new_measu
         &w.0.join("raw.json"),
         &w.0.join("history.json"),
         &output,
-        Some(&w.0.join("quality.json")),
+        &w.0.join("quality.json"),
     )
     .unwrap();
     let refreshed: Value = serde_json::from_slice(&fs::read(output.join(&name)).unwrap()).unwrap();
@@ -528,7 +528,7 @@ fn refresh_retains_exact_graph_topics_and_reference_edges_with_bounded_new_measu
         &w.0.join("raw.json"),
         &w.0.join("history.json"),
         &output,
-        Some(&w.0.join("quality.json")),
+        &w.0.join("quality.json"),
     )
     .unwrap();
     assert_eq!(next, name);
@@ -540,7 +540,7 @@ fn refresh_retains_exact_graph_topics_and_reference_edges_with_bounded_new_measu
         &w.0.join("raw.json"),
         &w.0.join("history.json"),
         &output,
-        Some(&w.0.join("quality.json"))
+        &w.0.join("quality.json")
     )
     .is_err());
     assert_eq!(fs::read(output.join("manifest.json")).unwrap(), manifest);
@@ -548,63 +548,19 @@ fn refresh_retains_exact_graph_topics_and_reference_edges_with_bounded_new_measu
 }
 
 #[test]
-fn refresh_without_new_quality_retains_its_published_legacy_definition() {
+fn refresh_requires_quality_and_leaves_the_approved_publication_intact() {
     let w = Workspace::new(6);
     w.run(7, true).unwrap();
-    let mut result = w.read("result.json");
-    result["metadata"]["measures_rule"] = json!("creation_quality_creators_v2");
-    result["metadata"]["quality"]
-        .as_object_mut()
-        .unwrap()
-        .remove("quality_revision_rule");
-    for row in result["pages"].as_array_mut().unwrap() {
-        row.as_object_mut().unwrap().remove("content_revision_id");
-        row.as_object_mut()
-            .unwrap()
-            .remove("quality_revision_relation");
-    }
     let output = w.0.join("exports");
     fs::create_dir(&output).unwrap();
-    fs::write(
-        output.join("legacy.json"),
-        format!(
-            "{{\"metadata\":{},\"pages\":{}}}",
-            result["metadata"], result["pages"]
-        ),
-    )
-    .unwrap();
-    fs::write(
-        output.join("manifest.json"),
-        json!([{"language":"vec","file":"legacy.json","date":result["metadata"]["finished_at"]}])
-            .to_string(),
-    )
-    .unwrap();
-    let name = refresh_measures(
-        &w.0.join("raw.json"),
-        &w.0.join("history.json"),
-        &output,
-        None,
-    )
-    .unwrap();
-    let updated: Value = serde_json::from_slice(&fs::read(output.join(name)).unwrap()).unwrap();
-    assert_eq!(
-        updated["metadata"]["measures_rule"],
-        "creation_quality_creators_v2"
-    );
-    assert!(updated["pages"][0].get("content_revision_id").is_none());
-    assert!(updated["pages"][0]
-        .get("quality_revision_relation")
-        .is_none());
-    let manifest = fs::read(output.join("manifest.json")).unwrap();
-    let mut history = w.read("history.json");
-    history["metadata"]["creation_rule"] = json!("legacy");
-    w.write("history.json", &history);
+    fs::write(output.join("manifest.json"), "[]").unwrap();
+    let original = fs::read(output.join("manifest.json")).unwrap();
     assert!(refresh_measures(
         &w.0.join("raw.json"),
         &w.0.join("history.json"),
         &output,
-        None
+        &w.0.join("missing-quality.json")
     )
     .is_err());
-    assert_eq!(fs::read(output.join("manifest.json")).unwrap(), manifest);
+    assert_eq!(fs::read(output.join("manifest.json")).unwrap(), original);
 }
