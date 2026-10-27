@@ -40,8 +40,26 @@ for (const name of await readdir(native)) {
 }
 
 run(process.execPath, ['node_modules/typescript/bin/tsc']);
+// Version the complete module graph so a cached entry point never imports an
+// older validator/controller after a new build.
+const modules = new Map<string, string>();
+async function prepareModule(name: string, ancestors: Set<string> = new Set()): Promise<string> {
+  const cached = modules.get(name);
+  if (cached !== undefined) return cached;
+  if (ancestors.has(name)) throw new Error(`Circular browser module dependency: ${name}`);
+  const source = await readFile(new URL(name, assets), 'utf8');
+  const dependencies = [...source.matchAll(/from '(\.\/([a-z-]+\.js))';/g)];
+  let compiled = source;
+  for (const dependency of dependencies) {
+    const child = await prepareModule(dependency[2], new Set([...ancestors, name]));
+    compiled = compiled.replace(dependency[0], `from '${dependency[1]}?v=${digest(child)}';`);
+  }
+  modules.set(name, compiled);
+  await writeFile(new URL(name, assets), compiled);
+  return compiled;
+}
 const appPath = new URL('app.js', assets);
-const compiled = (await readFile(appPath, 'utf8')).replace(/^['"]use strict['"];\s*/, '');
+const compiled = (await prepareModule('app.js')).replace(/^['"]use strict['"];\s*/, '');
 await writeFile(appPath, `'use strict';\nconst nativeModuleUrl='./native/dashboard.js?v=${digest(bindings)}';\n${compiled}`);
 await copyFile(new URL('web/src/style.css', root), new URL('style.css', assets));
 

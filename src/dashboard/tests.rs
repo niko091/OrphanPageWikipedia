@@ -1,3 +1,5 @@
+#[cfg(not(feature = "cli"))]
+use super::summary::summary_bridge_float;
 use super::interests::{InterestCandidate, InterestEdit, InterestInput};
 use super::*;
 #[test]

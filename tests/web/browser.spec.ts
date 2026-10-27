@@ -1,92 +1,14 @@
 import assert from 'node:assert/strict';
-import {spawn, spawnSync} from 'node:child_process';
+import {spawn} from 'node:child_process';
 import type {ChildProcess} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
 import {test as base, expect} from '@playwright/test';
 import type {Page, TestInfo} from '@playwright/test';
 
-const root = fileURLToPath(new URL('../../', import.meta.url));
-const executable = path.join(root, 'target/debug/orphanwiki');
-const title = (id: number): string => `Voce sintetica ${String(id).padStart(3, '0')}`;
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-// Never inherit editorial credentials, tracing destinations or research settings.
-const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ORPHANWIKI_')));
-
-function native(args: string[]): void {
-  const result = spawnSync(executable, args, {cwd: root, env, encoding: 'utf8', timeout: 60_000});
-  assert.ifError(result.error);
-  assert.equal(result.status, 0, result.stderr);
-}
-
-function prepareSite(directory: string, relational=false): string {
-  const web = path.join(directory, 'web');
-  const data = path.join(web, 'data');
-  fs.mkdirSync(data, {recursive: true});
-  for (const page of ['index', 'creators', 'deorphanize', 'connections']) {
-    fs.copyFileSync(path.join(root, 'web', `${page}.html`), path.join(web, `${page}.html`));
-  }
-  fs.cpSync(path.join(root, 'web/assets'), path.join(web, 'assets'), {recursive: true});
-  const inputs = ['vec', 'lmo'].map(language => {
-    const graph = {
-      metadata: {
-        language, complete: true, demo: true, source: 'Synthetic browser test; no research data',
-        item_mapping: {source: 'page_props.wikibase_item', complete: true},
-        started_at: '2026-09-29T00:00:00Z', finished_at: '2026-09-29T00:00:00Z',
-      },
-      pages: Array.from({length: 64}, (_, index) => {
-        const id = index + 1;
-        return {
-          page_id: id, title: title(id), wikibase_item: `Q${id}`, length_bytes: 100 + id,
-          categories: ['Categoria sintetica'], page_created_at: '2020-01-01T00:00:00Z',
-          links: id <= 32 ? [] : [title(id === 64 ? 33 : id + 1), ...(language === 'lmo' ? [title(id - 32)] : [])],
-        };
-      }),
-    };
-    const file = path.join(directory, `${language}-raw.json`);
-    fs.writeFileSync(file, JSON.stringify(graph));
-    return file;
-  });
-  const comparison = path.join(directory, 'comparison');
-  native(['compare', ...inputs, '--output-dir', comparison, '--work-dir', path.join(directory, 'staging')]);
-  const manifest: unknown = JSON.parse(fs.readFileSync(path.join(comparison, 'manifest.json'), 'utf8'));
-  assert(Array.isArray(manifest));
-  const member: unknown = manifest.find((value: unknown) => record(value) && value.language === 'vec');
-  assert(record(member) && typeof member.file === 'string');
-  const dataset: unknown = JSON.parse(fs.readFileSync(path.join(comparison, member.file), 'utf8'));
-  assert(record(dataset) && record(dataset.metadata) && Array.isArray(dataset.pages));
-  // Exercise editorial controls on private synthetic exports only. Production demo
-  // exports deliberately disable them. All Wikimedia requests are intercepted below.
-  dataset.metadata.demo = false;
-  dataset.metadata.creators = {status: 'collected', language: 'vec', languages_scanned: ['vec']};
-  for (const value of dataset.pages as unknown[]) {
-    assert(record(value) && typeof value.page_id === 'number');
-    Object.assign(value, {
-      creator_key: `synthetic:creator:${(value.page_id - 1) % 32}`, creator_attribution: 'synthetic',
-      creator_account_type: 'registered', creator_articles_created_total: 2, creator_articles_in_census: 2,
-      creator_orphans_current: 1, creator_orphans_current_share: 0.5,
-      creator_prior_articles: 0, creator_prior_edits_main: 0, creator_prior_edits_other: 0,
-      creator_tenure_days: 10, creator_languages_created: ['vec'], creator_data_status: 'matched',
-    });
-  }
-  if(relational&&record(dataset.link_candidates)) {
-    for(const value of Object.values(dataset.link_candidates)) {
-      assert(record(value)&&Array.isArray(value.candidates));
-      for(const candidate of value.candidates) {assert(record(candidate));candidate.evidence=[];}
-    }
-  }
-  fs.writeFileSync(path.join(data, 'fixture.json'), JSON.stringify(dataset));
-  fs.writeFileSync(path.join(data, 'manifest.json'), JSON.stringify([
-    {file: 'fixture.json', language: 'vec', date: dataset.metadata.finished_at, demo: false},
-  ]));
-  native(['dashboard', '--data-dir', data,...(relational?['--collection-database',path.join(data,'collection.sqlite')]:[])]);
-  if(relational)for(const name of fs.readdirSync(data))if(name!=='collection.sqlite')fs.rmSync(path.join(data,name),{recursive:true});
-  return web;
-}
+import {root,executable,title,record,env,prepareSite} from './fixture.ts';
 
 async function stop(server: ChildProcess): Promise<void> {
   if (server.exitCode !== null || server.signalCode !== null) return;
@@ -97,13 +19,14 @@ async function stop(server: ChildProcess): Promise<void> {
   });
 }
 
-const test = base.extend<{traffic: {editorial: string[]}}, {site: string; relational:boolean}>({
-  relational:[false,{option:true,scope:'worker'}],
-  site: [async ({relational}, use) => {
+const test = base.extend<{traffic: {editorial: string[]}}, {site: string}>({
+  site: [async ({}, use) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orphanwiki-browser-'));
     let server: ChildProcess | undefined;
     try {
-      const web = prepareSite(directory,relational);
+      const {web}=prepareSite(directory);
+      const data=path.join(web,'data');
+      for(const name of fs.readdirSync(data))if(name!=='collection.sqlite')fs.rmSync(path.join(data,name),{recursive:true});
       server = spawn(executable, ['serve', '--web-root', web, '--database', path.join(directory, 'reviews.sqlite'),
         '--bind', '127.0.0.1', '--port', '0'], {cwd: root, env, stdio: ['ignore', 'pipe', 'pipe']});
       const process = server;
@@ -163,7 +86,7 @@ async function open(page: Page, site: string, filename: string): Promise<void> {
   await page.goto(`${site}/${filename}?dataset=fixture.json${filename === 'connections.html' ? '&page=1' : ''}`);
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
   // Cards hydrate after the index: inspect layout only when their controls are ready.
-  if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(20);
+  if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(25);
 }
 
 async function inspectPagination(page: Page,testInfo: TestInfo,prefix: string) {
@@ -188,29 +111,29 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   expect((await wasm).headers()['content-type']).toContain('application/wasm');
   await expect(page.locator('#length svg')).toBeVisible();
   await page.locator('#article-pages').getByRole('button',{name:'Pagina 2',exact:true}).click();
-  await expect(page.locator('#article-rows tr')).toHaveCount(12);
+  await expect(page.locator('#article-rows tr')).toHaveCount(7);
   await expect(page.locator('#article-info')).toContainText('Pagina 2 di 2');
   await expect(page.locator('#article-more')).toBeDisabled();
   await inspectPagination(page,testInfo,'article');
   await page.locator('#creators-link').click();
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
-  await expect(page.locator('#creator-rows tr')).toHaveCount(20);
+  await expect(page.locator('#creator-rows tr')).toHaveCount(25);
   await page.locator('#creator-more').click();
-  await expect(page.locator('#creator-rows tr')).toHaveCount(12);
+  await expect(page.locator('#creator-rows tr')).toHaveCount(7);
   await expect(page.locator('#creator-info')).toContainText('Pagina 2 di 2');
   await inspectPagination(page,testInfo,'creator');
-  await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
+  await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(25);
   await page.locator('#creator-search').fill('creator:31');
   await expect(page.locator('#creator-rows tr')).toHaveCount(1);
   await page.locator('#deorphanize-link').click();
-  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
-  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(20);
+  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(25);
   await page.locator('#candidate-more').click();
-  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
-  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(12);
+  await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(7);
+  await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(7);
   await expect(page.locator('#candidate-info')).toContainText('Pagina 2 di 2');
   await inspectPagination(page,testInfo,'candidate');
-  await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+  await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
   await page.locator('#candidate-search').fill(title(1));
   await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(1);
   await page.locator('#candidate-cards a[href*="connections.html"]').click();
@@ -238,7 +161,7 @@ test('hidden pages opens independent options with keyboard and mobile support', 
     await expect(disambiguation).not.toBeChecked();
     await expect(redirects).not.toBeChecked();
     await expect(connections).not.toBeChecked();
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
     const bounds = await options.boundingBox();
     expect(bounds).not.toBeNull();
     assert(bounds);
@@ -274,7 +197,7 @@ test('hidden pages opens independent options with keyboard and mobile support', 
     await sourceFilter.uncheck();
     await button.click();
     await expect(options).toBeHidden();
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
   }
   expect(traffic.editorial).toEqual([]);
 });
@@ -282,13 +205,13 @@ test('hidden pages opens independent options with keyboard and mobile support', 
 test('article search, filtering, sorting and pagination', async ({page, site}) => {
   await open(page, site, 'index.html');
   await page.locator('#article-group').selectOption('all');
-  await expect(page.locator('#article-rows tr')).toHaveCount(20);
+  await expect(page.locator('#article-rows tr')).toHaveCount(25);
   await page.locator('#article-more').click();
-  await expect(page.locator('#article-rows tr')).toHaveCount(20);
-  await expect(page.locator('#article-rows tr').first()).toContainText(title(21));
-  await page.locator('#article-pages').getByRole('button',{name:'Pagina 4',exact:true}).click();
-  await expect(page.locator('#article-rows tr')).toHaveCount(4);
-  await expect(page.locator('#article-info')).toContainText('Risultati 61–64 · Pagina 4 di 4');
+  await expect(page.locator('#article-rows tr')).toHaveCount(25);
+  await expect(page.locator('#article-rows tr').first()).toContainText(title(26));
+  await page.locator('#article-pages').getByRole('button',{name:'Pagina 3',exact:true}).click();
+  await expect(page.locator('#article-rows tr')).toHaveCount(14);
+  await expect(page.locator('#article-info')).toContainText('Risultati 51–64 · Pagina 3 di 3');
   await expect(page.locator('#article-more')).toBeDisabled();
   await page.locator('#article-search').fill(title(64));
   await expect(page.locator('#article-rows tr')).toHaveCount(1);
@@ -360,43 +283,42 @@ test('mobile layout, keyboard controls and Escape cleanup', async ({page, site})
   await expect(fix).toBeFocused();
 });
 
-const databaseTest=test.extend({relational:[true,{scope:'worker'}]});
-databaseTest('database alone serves paginated articles, creators and cards on desktop and mobile',async({page,site,traffic},testInfo)=>{
+test('database alone serves paginated articles, creators and cards on desktop and mobile',async({page,site,traffic},testInfo)=>{
     const resources:string[]=[],queries:unknown[]=[];
     page.on('request',request=>{
       if(request.url().includes('/data/'))resources.push(request.url());
       if(request.url().endsWith('/api/pages'))queries.push(request.postDataJSON());
     });
     await open(page,site,'index.html');
-    await expect(page.locator('#article-rows tr')).toHaveCount(20);
+    await expect(page.locator('#article-rows tr')).toHaveCount(25);
     await page.locator('#article-group').selectOption('all');
     await expect(page.locator('#article-info')).toContainText('64');
     await expect(page.locator('#article-previous')).toBeDisabled();
-    await page.locator('#article-more').click();await expect(page.locator('#article-rows tr')).toHaveCount(20);
-    await expect(page.locator('#article-info')).toContainText('Risultati 21–40 · Pagina 2 di 4');
-    await expect(page.locator('#article-rows tr').first()).toContainText(title(21));
-    await page.locator('#article-pages').getByRole('button',{name:'Pagina 4',exact:true}).click();
-    await expect(page.locator('#article-rows tr')).toHaveCount(4);
+    await page.locator('#article-more').click();await expect(page.locator('#article-rows tr')).toHaveCount(25);
+    await expect(page.locator('#article-info')).toContainText('Risultati 26–50 · Pagina 2 di 3');
+    await expect(page.locator('#article-rows tr').first()).toContainText(title(26));
+    await page.locator('#article-pages').getByRole('button',{name:'Pagina 3',exact:true}).click();
+    await expect(page.locator('#article-rows tr')).toHaveCount(14);
     await expect(page.locator('#article-more')).toBeDisabled();
     await expect(page.locator('#article-pages [aria-current="page"]')).toBeFocused();
-    await page.locator('#article-previous').click();await expect(page.locator('#article-rows tr')).toHaveCount(20);
+    await page.locator('#article-previous').click();await expect(page.locator('#article-rows tr')).toHaveCount(25);
     await inspectPagination(page,testInfo,'article');
     await page.locator('#article-search').fill(title(64));await expect(page.locator('#article-rows tr')).toHaveCount(1);
     await expect(page.locator('#article-rows')).toContainText(title(64));
-    await page.locator('#creators-link').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
-    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(12);
+    await page.locator('#creators-link').click();await expect(page.locator('#creator-rows tr')).toHaveCount(25);
+    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(7);
     await inspectPagination(page,testInfo,'creator');
     await expect(page.locator('#creator-info')).toContainText('Pagina 2 di 2');
     await expect(page.locator('#creator-more')).toBeDisabled();
-    await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(20);
-    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(12);
+    await page.locator('#creator-previous').click();await expect(page.locator('#creator-rows tr')).toHaveCount(25);
+    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(7);
     await page.locator('#creator-search').fill('creator:31');await expect(page.locator('#creator-rows tr')).toHaveCount(1);
-    await page.locator('#deorphanize-link').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
-    await page.locator('#candidate-more').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await page.locator('#deorphanize-link').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+    await page.locator('#candidate-more').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(7);
     await expect(page.locator('#candidate-more')).toBeDisabled();
-    await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(20);
+    await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
     await page.locator('#candidate-more').focus();await page.keyboard.press('Enter');
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(7);
     await inspectPagination(page,testInfo,'candidate');
     for(const width of [1280,390]) {
       await page.setViewportSize({width,height:844});
@@ -408,12 +330,12 @@ databaseTest('database alone serves paginated articles, creators and cards on de
     }
     await page.locator('#ui-language-toggle').click();await expect(page.locator('html')).toHaveAttribute('lang','en');
     await page.locator('#theme-toggle').click();await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
-    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(12);
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(7);
     await expect(page.locator('#candidate-info')).toContainText('Page 2 of 2');
     await expect(page.locator('#candidate-more')).toHaveText('Next');
     await page.locator('nav.list-pagination').scrollIntoViewIfNeeded();
     await page.screenshot({path:testInfo.outputPath('database-mobile-dark.png')});
     expect(resources.some(url=>url.endsWith('/data/fixture.json')||url.includes('-articles.json')||url.includes('-cards-v2.json')||url.includes('-creators.json'))).toBe(false);
-    expect(queries.some(value=>record(value)&&value.offset===20)).toBe(true);
+    expect(queries.some(value=>record(value)&&value.offset===25)).toBe(true);
     expect(traffic.editorial).toEqual([]);
 });
