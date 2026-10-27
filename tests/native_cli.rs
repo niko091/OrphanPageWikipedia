@@ -19,8 +19,48 @@ fn standalone_editorial_http_preserves_reviews_and_stops_on_sigterm() {
     let workspace = Workspace::new();
     fs::create_dir_all(workspace.0.join("web/data/vec-connections")).unwrap();
     fs::write(workspace.0.join("web/index.html"), "<h1>Dashboard</h1>").unwrap();
-    fs::write(workspace.0.join("web/data/manifest.json"),r#"[{"file":"vec.json","language":"vec","date":"2026-10-01T00:00:00Z","connections_dir":"vec-connections"}]"#).unwrap();
-    fs::write(workspace.0.join("web/data/vec-connections/1.json"),r#"{"format":"connections_v1","metadata":{"language":"vec","finished_at":"2026-10-01T00:00:00Z","complete":true},"pages":[{"page_id":1,"orphan":true}],"link_candidates":{"1":{"candidates":[{"page_id":2}]}}}"#).unwrap();
+    let folder = workspace.0.join("web/data");
+    let metadata = serde_json::json!({"language":"vec","complete":true,"demo":false,
+        "started_at":"2026-10-01T00:00:00Z","finished_at":"2026-10-01T00:00:00Z",
+        "sql_release":"20261001","history":{"status":"not_collected","history_release":"2026-09"},
+        "quality":{"status":"not_collected","content_release":"2026-10-01"}});
+    let dataset = serde_json::json!({"metadata":metadata,"pages":[
+        {"page_id":1,"title":"Target","orphan":true},{"page_id":2,"title":"Source","orphan":false}],
+        "link_candidates":{"1":{"candidate_count":1,"status":"compared","candidates":[{"page_id":2,"title":"Source","out_degree":0,"dead_end":true,"evidence":[]}]}}});
+    fs::write(
+        folder.join("vec.json"),
+        format!(
+            "{{\"metadata\":{},\"pages\":{},\"link_candidates\":{}}}",
+            dataset["metadata"], dataset["pages"], dataset["link_candidates"]
+        ),
+    )
+    .unwrap();
+    let staging = workspace.0.join("prepared");
+    let mut entry = orphanwiki::dumps::prepare_dashboard_exports(
+        &folder.join("vec.json"),
+        &staging,
+        None,
+        None,
+    )
+    .unwrap();
+    for item in fs::read_dir(&staging).unwrap() {
+        let item = item.unwrap();
+        fs::rename(item.path(), folder.join(item.file_name())).unwrap();
+    }
+    entry["file"] = serde_json::json!("vec.json");
+    entry["language"] = serde_json::json!("vec");
+    entry["date"] = metadata["finished_at"].clone();
+    fs::write(
+        folder.join("manifest.json"),
+        serde_json::to_vec(&vec![entry]).unwrap(),
+    )
+    .unwrap();
+    orphanwiki::store::publish(
+        &folder,
+        &folder.join("collection.sqlite"),
+        &serde_json::json!({"test":true}),
+    )
+    .unwrap();
     let mut server = Server(
         Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
             .args(["serve", "--port", "0"])
@@ -355,43 +395,17 @@ fn bad_arguments_never_publish_output() {
 }
 
 #[test]
-fn standalone_dashboard_publishes_a_full_generation_without_python_or_repository_config() {
+fn dashboard_requires_a_database_even_when_standalone_exports_exist() {
     let workspace = Workspace::new();
-    let canonical = r#"{"metadata":{"language":"vec","complete":true,"finished_at":"2026-10-02T00:00:00Z"},"pages":[{"page_id":1,"title":"A","orphan":true}]}"#;
-    fs::write(workspace.0.join("vec.json"), canonical).unwrap();
-    fs::write(
-        workspace.0.join("manifest.json"),
-        r#"[{"file":"vec.json","language":"vec","date":"2026-10-02T00:00:00Z"}]"#,
-    )
-    .unwrap();
+    fs::write(workspace.0.join("manifest.json"), "[]").unwrap();
+    let original = fs::read(workspace.0.join("manifest.json")).unwrap();
     let result = workspace.run(&["dashboard", "--data-dir", "."]);
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(workspace.0.join("manifest.json")).unwrap()).unwrap();
-    for key in [
-        "observations_file",
-        "articles_file",
-        "summary_file",
-        "creator_index_file",
-        "cards_file",
-        "cards_dir",
-        "connections_dir",
-        "connections_metadata_file",
-        "profile_topics_dir",
-    ] {
-        assert!(workspace
-            .0
-            .join(manifest[0][key].as_str().unwrap())
-            .exists());
-    }
+    assert!(!result.status.success());
     assert_eq!(
-        fs::read_to_string(workspace.0.join("vec.json")).unwrap(),
-        canonical
+        fs::read(workspace.0.join("manifest.json")).unwrap(),
+        original
     );
+    assert!(!workspace.0.join("collection.sqlite").exists());
 }
 
 #[test]

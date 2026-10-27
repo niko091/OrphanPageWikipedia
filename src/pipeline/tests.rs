@@ -152,6 +152,13 @@ impl FakeSteps {
             metadata["history"]["status"] = json!("collected");
             metadata["quality"] =
                 dumps::first_metadata(&input.join(format!("{language}-quality.json"))).unwrap();
+            if let Some(manifest) = metadata["dump_manifest"].as_str() {
+                let path = Path::new(manifest)
+                    .parent()
+                    .unwrap()
+                    .join("content-2026-10-01.json");
+                metadata["quality"]["manifest_sha256"] = json!(dumps::file_sha256(&path).unwrap());
+            }
             if languages.len() > 1 {
                 metadata["comparison"] = json!({"status":"compared","reference_languages":languages.iter().filter(|l|*l!=language).collect::<Vec<_>>()});
             }

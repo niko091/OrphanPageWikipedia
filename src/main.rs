@@ -419,7 +419,7 @@ impl Invocation {
                     &input.join(format!("{language}-raw.json")),
                     &input.join(format!("{language}-history.json")),
                     &output,
-                    quality.is_file().then_some(quality.as_path()),
+                    Some(quality.as_path()),
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -552,7 +552,7 @@ impl Invocation {
         }
         if self.name == "dashboard" {
             let database = self.path("data-dir")?.join("collection.sqlite");
-            if self.args.get_one::<String>("collection-database").is_none() && database.is_file() {
+            if self.args.get_one::<String>("collection-database").is_none() {
                 return orphanwiki::store::Census::open(&database)
                     .and_then(|db| db.verify())
                     .map_err(|e| e.to_string());

@@ -112,22 +112,22 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
     let mut request = w.request("articles");
     let first = db.query(&request, &[]).unwrap();
     assert_eq!(first["total"], 63);
-    assert_eq!(first["pages"].as_array().unwrap().len(), 20);
+    assert_eq!(first["pages"].as_array().unwrap().len(), 25);
     assert_eq!(first["pages"][0]["length_bytes"], Value::Null);
-    request.offset = 20;
-    let second = db.query(&request, &[]).unwrap();
-    assert_eq!(second["pages"].as_array().unwrap().len(), 20);
-    assert_eq!(second["pages"][0]["page_id"], 21);
     request.offset = 25;
+    let second = db.query(&request, &[]).unwrap();
+    assert_eq!(second["pages"].as_array().unwrap().len(), 25);
+    assert_eq!(second["pages"][0]["page_id"], 26);
+    request.offset = 20;
     assert!(db.query(&request, &[]).is_err());
     request.offset = 0;
     request.search = "Page 06".into();
     assert_eq!(db.query(&request, &[]).unwrap()["total"], 2);
     request.search.clear();
     request.order = "length-desc".into();
-    request.offset = 60;
+    request.offset = 50;
     let last = db.query(&request, &[]).unwrap();
-    assert_eq!(last["pages"].as_array().unwrap().len(), 3);
+    assert_eq!(last["pages"].as_array().unwrap().len(), 13);
     assert_eq!(
         last["pages"].as_array().unwrap().last().unwrap()["page_id"],
         1
@@ -157,7 +157,7 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
         assert!(![2, 3, 4, 5].contains(&p["page_id"].as_i64().unwrap()));
     }
     let closed = vec![("vec".into(), 1, 101), ("vec".into(), 1, 102)];
-    cards.offset = 40;
+    cards.offset = 50;
     let sorted = db.query(&cards, &closed).unwrap();
     assert_eq!(
         sorted["pages"].as_array().unwrap().last().unwrap()["page_id"],
@@ -400,7 +400,7 @@ fn http_dashboard_queries_downloads_and_reviews_work_with_only_the_database() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let result: Value = serde_json::from_slice(&response.bytes().unwrap()).unwrap();
-    assert_eq!(result["pages"].as_array().unwrap().len(), 20);
+    assert_eq!(result["pages"].as_array().unwrap().len(), 25);
     let response = client
         .get(format!(
             "{url}/api/export?dataset={}",
@@ -437,4 +437,50 @@ fn http_dashboard_queries_downloads_and_reviews_work_with_only_the_database() {
             .status(),
         405
     );
+}
+
+#[test]
+fn missing_required_resources_and_comparison_rows_are_errors() {
+    let w = Fixture::new("20261001");
+    w.publish();
+    let approved = fs::read(w.db()).unwrap();
+    for field in [
+        "summary_file",
+        "creator_index_file",
+        "connections_metadata_file",
+    ] {
+        let mut entries = w.entries.clone();
+        entries[0].as_object_mut().unwrap().remove(field);
+        write(&w.root.join("manifest.json"), &entries);
+        assert!(
+            store::publish(&w.root, &w.db(), &json!({"test":true})).is_err(),
+            "{field}"
+        );
+        assert_eq!(fs::read(w.db()).unwrap(), approved);
+    }
+    write(&w.root.join("manifest.json"), &w.entries);
+    let db = rusqlite::Connection::open(w.db()).unwrap();
+    db.execute("DELETE FROM targets WHERE language='vec' AND id=1", [])
+        .unwrap();
+    drop(db);
+    let db = Census::open(&w.db()).unwrap();
+    let manifest = db.manifest().unwrap();
+    let entry = manifest
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["language"] == "vec")
+        .unwrap();
+    assert!(db
+        .resource(&format!(
+            "{}/1.json",
+            entry["connections_dir"].as_str().unwrap()
+        ))
+        .is_err());
+    assert!(db
+        .resource(&format!(
+            "{}/999999.json",
+            entry["profile_topics_dir"].as_str().unwrap()
+        ))
+        .is_err());
 }

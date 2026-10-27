@@ -50,7 +50,7 @@ Downloads are processed one edition at a time and removed after their verified i
 
 ### Starting the dashboard
 
-Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service. The Rust service reads the SQLite collection and performs article, orphan-card and creator filtering and pagination on the server, returning 25 records per request. Editorial review state stays in a separate database. Existing JSON collections remain readable until migrated.
+Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service. The Rust service reads the SQLite collection and performs article, orphan-card and creator filtering and pagination on the server, returning 25 records per request. Editorial review state stays in a separate database. The service requires a verified collection database and returns an error when a required resource is missing.
 
 ```sh
 bash scripts/start-dashboard.sh
