@@ -44,11 +44,13 @@ Data is not included in the repository. The following command downloads and anal
 target/release/orphanwiki pipeline --sql-release 20261001 --history-release 2026-09
 ```
 
-The pipeline downloads and verifies the dumps, analyzes complete editions, compares languages, and publishes the results in `web/data/`.
+The pipeline downloads and verifies the dumps, analyzes complete editions, compares languages, and publishes one collection in `web/data/collection.sqlite`. All selected editions use the same SQL release, History release and current-content XML release (the SQL date by default). SQL tables are independently produced snapshots. A new collection replaces the previous one only after every selected edition and comparison has passed verification.
+
+Downloads are processed one edition at a time and removed after their verified import; temporary graphs, supplements, comparison caches and JSON/CSV exports are removed after the database is published. Failed runs retain their private checkpoints for retry. The local topic model and operational logs remain on disk. Allow space for imports and for both the active and incoming collection during updates; final database size alone does not determine the required disk capacity.
 
 ### Starting the dashboard
 
-Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service.
+Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service. The Rust service reads the SQLite collection and performs article, orphan-card and creator filtering and pagination on the server, returning 25 records per request. Editorial review state stays in a separate database. Existing JSON collections remain readable until migrated.
 
 ```sh
 bash scripts/start-dashboard.sh

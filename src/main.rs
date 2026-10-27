@@ -133,6 +133,7 @@ fn cli() -> Command {
         .about("Dashboard e valutazioni editoriali condivise")
         .arg(option("web-root"))
         .arg(option("database"))
+        .arg(option("collection-database"))
         .arg(option("bind").default_value("127.0.0.1"))
         .arg(
             option("port")
@@ -149,6 +150,7 @@ fn cli() -> Command {
     .arg(path_option("dump-root", "data/dumps"))
     .arg(path_option("import-dir", "data/imported"))
     .arg(path_option("output-dir", "web/data"))
+    .arg(option("collection-database"))
     .arg(option("work-dir"))
     .arg(path_option("log-dir", "data/logs"))
     .arg(path_option(
@@ -213,7 +215,7 @@ fn cli() -> Command {
         .subcommand_required(true)
         .arg(option("repo-root").global(true).help("Radice di configurazioni e percorsi relativi; altrimenti cerca dalla directory corrente"))
         .subcommands([
-            Command::new("dashboard").about("Prepara i trasporti dagli export approvati").arg(path_option("data-dir", "web/data")),
+            Command::new("dashboard").about("Prepara la dashboard dagli export approvati").arg(path_option("data-dir", "web/data")).arg(option("collection-database")),
             content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve, pipeline, benchmark,
         ])
 }
@@ -359,6 +361,12 @@ impl Invocation {
                 dump_root,
                 import_dir: self.path("import-dir")?,
                 output_dir: self.path("output-dir")?,
+                collection_database: Some(
+                    self.args
+                        .get_one::<String>("collection-database")
+                        .map(|p| self.root.join(p))
+                        .unwrap_or(self.path("output-dir")?.join("collection.sqlite")),
+                ),
                 work_dir,
                 log_dir: self.path("log-dir")?,
                 model: self.path("model")?,
@@ -385,9 +393,14 @@ impl Invocation {
                 .cloned()
                 .or_else(|| std::env::var("ORPHANWIKI_WEB_ROOT").ok())
                 .unwrap_or_else(|| "web".into());
-            let app =
+            let mut app =
                 orphanwiki::editorial::ReviewApplication::new(self.root.join(web_root), database)
                     .with_oauth_from_environment()?;
+            if let Some(path) = self.args.get_one::<String>("collection-database") {
+                orphanwiki::store::Census::open(&self.root.join(path))
+                    .map_err(|e| e.to_string())?;
+                app = app.with_collection_database(self.root.join(path));
+            }
             return orphanwiki::editorial::serve(
                 app,
                 self.args
@@ -538,8 +551,17 @@ impl Invocation {
             return Ok(());
         }
         if self.name == "dashboard" {
+            let database = self.path("data-dir")?.join("collection.sqlite");
+            if self.args.get_one::<String>("collection-database").is_none() && database.is_file() {
+                return orphanwiki::store::Census::open(&database)
+                    .and_then(|db| db.verify())
+                    .map_err(|e| e.to_string());
+            }
             orphanwiki::dumps::rebuild_dashboard(&self.path("data-dir")?)
                 .map_err(|e| e.to_string())?;
+            if let Some(path) = self.args.get_one::<String>("collection-database") {
+                orphanwiki::store::publish(&self.path("data-dir")?,&self.root.join(path),&serde_json::json!({"rule":orphanwiki::store::RULE,"source":"approved_exports"})).map_err(|e|e.to_string())?;
+            }
             return Ok(());
         }
         if self.name == "topics" {

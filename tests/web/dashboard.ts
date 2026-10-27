@@ -37,6 +37,7 @@ interface HarnessPreferences {
   authAPI?: (url: string,options: FetchOptions) => MockResponse | Promise<MockResponse>;
   reviewStore?: Map<string,EditorialReview>;
   reviewAPI?: (url: string,options: FetchOptions) => MockResponse | Promise<MockResponse>;
+  pagesAPI?: (options: FetchOptions) => MockResponse | Promise<MockResponse>;
   reviewsUnavailable?: boolean;
   beforeFetch?: (url: string,options: FetchOptions) => unknown;
   apiResponse?: (url: URL,options: FetchOptions) => unknown;
@@ -648,6 +649,7 @@ async function harness(page: string,raw: unknown,search='?dataset=fixture.json',
       return {ok:true,status:200,json:async()=>authSession};
     }
     requests.push({url,method:options?.method||'GET',body:options?.body,headers:options?.headers,cache:options?.cache,credentials:options?.credentials,signal:options?.signal});fetchCount++;if(preferences.beforeFetch)await preferences.beforeFetch(url,options);
+    if(url==='api/pages'&&preferences.pagesAPI)return preferences.pagesAPI(options);
     if(String(url).startsWith('api/reviews')) {
       if(preferences.reviewAPI)return preferences.reviewAPI(url,options);
       if(preferences.reviewsUnavailable)return {ok:false,status:503,json:async()=>({error:'unavailable'})};
@@ -3020,6 +3022,60 @@ async function checkPreparedSummaries() {
   console.log('Prepared Rust summaries: the first 25 articles render from the summary without a full transport or load button.');
   await checkArticleIndex();
 }
+async function checkRelationalDashboard() {
+  const raw=fixture(),summary=fixtureTransport('summary_file'),creators=fixtureTransport('creator_index_file');
+  raw.metadata.demo=false;summary.metadata.demo=false;creators.metadata.demo=false;
+  const entry: ManifestEntry={language:'vec',file:'fixture.json',date:raw.metadata.finished_at,storage:'relational_census_v1',summary_file:'fixture-summary.json',creator_index_file:'fixture-creators.json'};
+  const files={'fixture-summary.json':summary};
+  const requests: Record<string,unknown>[]=[];
+  let releaseSlow: (()=>void) | undefined,slowSignal: AbortSignal | undefined;
+  const pagesAPI=async(options: FetchOptions): Promise<MockResponse>=>{
+    const query: unknown=JSON.parse(options.body??'{}');assert(isRecord(query));requests.push(query);
+    if(query.search==='slow') {slowSignal=options.signal;await new Promise<void>(resolve=>{releaseSlow=resolve;});}
+    const offset=Number(query.offset);
+    const available=query.kind==='creators'?creators.creators:query.kind==='cards'?raw.pages.filter(page=>page.orphan):raw.pages;
+    const rows=query.search?[available[query.search==='fast'?1:0]]:available;
+    const selected=rows.slice(offset,offset+25);
+    return {ok:true,json:async()=>query.kind==='creators'?{format:'creator_results_v1',dataset:query.dataset,offset,total:rows.length,creators:selected}:
+      {format:'page_results_v1',dataset:query.dataset,offset,total:rows.length,metadata:summary.metadata,census_page_count:summary.census_page_count,
+        pages:selected,link_candidates:raw.link_candidates,card_transports:{}}};
+  };
+  const articles=await harness('articles',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
+  assert.equal(articles.nodes['article-rows'].children.length,25);
+  assert.equal(requests[0].offset,0);
+  assert(articles.requests.every(request=>!['data/fixture.json','data/fixture-creators.json'].includes(request.url)));
+  articles.nodes['article-more'].listeners.click();await evaluateAsync('listHydration',articles.context);
+  assert.equal(articles.nodes['article-rows'].children.length,50);assert.equal(requests[1].offset,25);
+  articles.nodes['article-search'].value='slow';articles.nodes['article-search'].listeners.input();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  articles.nodes['article-search'].value='fast';articles.nodes['article-search'].listeners.input();await evaluateAsync('listHydration',articles.context);
+  assert(slowSignal?.aborted);required(releaseSlow)();await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(articles.nodes['article-rows'].children.length,1);
+  assert.equal(articles.nodes['article-rows'].children[0].children[0].children[0].textContent,raw.pages[1].title);
+  articles.nodes['article-classification'].value='topics';articles.nodes['article-classification'].listeners.change();await evaluateAsync('listHydration',articles.context);
+  assert.equal(requests.at(-1)?.classification,'topics');assert.equal(requests.at(-1)?.offset,0);
+  const authors=await harness('creators',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
+  assert.equal(authors.nodes['creator-rows'].children.length,Math.min(25,creators.creators.length));
+  assert(!authors.requests.some(request=>request.url==='data/fixture-creators.json'));
+  const pooled=structuredClone(summary);pooled.metadata={...pooled.metadata,language:'all',kind:'aggregate',languages:['vec','lmo']};
+  pooled.census_page_count*=2;pooled.reports.overview.total*=2;
+  if(pooled.article_preview)pooled.article_preview=pooled.article_preview.map(page=>({...page,language:'vec'}));
+  const aggregate: ManifestEntry={...entry,language:'all',kind:'aggregate',file:'all.json',summary_file:'all-summary.json'};
+  const combined=await harness('articles',raw,'?dataset=all.json',[aggregate,entry],{pagesAPI:async options=>{
+    const query:unknown=JSON.parse(options.body??'{}');assert(isRecord(query));
+    return {ok:true,json:async()=>({format:'page_results_v1',dataset:'all.json',offset:query.offset,total:pooled.census_page_count,
+      metadata:pooled.metadata,census_page_count:pooled.census_page_count,pages:raw.pages.slice(0,25).map(page=>({...page,language:'vec'})),link_candidates:{},card_transports:{}})};
+  }},{'all-summary.json':pooled});
+  assert.equal(combined.nodes['article-rows'].children.length,25);
+  assert(!combined.nodes['article-info'].textContent.includes('non valido'));
+  const cards=await harness('deorphanize',raw,'?dataset=fixture.json',[entry],{pagesAPI},files);
+  assert.equal(cards.nodes['candidate-cards'].children.filter(node=>node.className==='candidate-card').length,25);
+  changeCheckbox(cards.nodes,'candidate-show-without-connections',true);await evaluateAsync('listHydration',cards.context);
+  assert.equal(requests.at(-1)?.show_without_connections,true);
+  assert(!cards.requests.some(request=>request.url==='data/fixture.json'));
+  console.log('Relational dashboard: server pagination, filter parameters, cancellation, creators, cards and CSV routes passed.');
+}
+
 async function checkArticleIndex() {
   const raw=fixture(),summary=fixtureTransport('summary_file');
   const observations=fixtureTransport('observations_file');
@@ -3198,4 +3254,4 @@ function checkThemeContrast() {
   }
   console.log('Theme tokens: normal text, muted text, links, buttons and badges meet 4.5:1 contrast in both themes.');
 }
-(async()=>{try{await checkFreshResources();await checkProjectFooter();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{try{await checkFreshResources();await checkProjectFooter();await checkPage(false);await checkPage(true);await checkPaperProfiles();await checkDeorphanize();await checkCandidateSorting();await checkHiddenPages();await checkConnections();await checkFixPrompts();await checkSingleConnectionPrompts();await checkLlmSelection();await checkWikitextPreparation();await checkDatasetSelection();await checkProgressiveCandidates();await checkCompactLists();await checkCreatorBots();await checkPreferences();await checkAggregation();await checkCompactTransport();await checkEditorialTransports();await checkTopicExplorer();await checkConnectionCopy();await checkSharedEditorialReviews();await checkWikipediaAuthentication();await checkPersonalization();await checkPersonalizationRecovery();await checkProfileTopicShards();await benchmarkPersonalization();await checkCreatorHistory();await checkPreparedSummaries();await checkRelationalDashboard();await checkReconstructedCreatorFallback();await checkMissingCreationAge();await checkReconstructedCreationQualityAndCreators();checkThemeContrast();}finally{fs.rmSync(fixtureDir,{recursive:true});}})().catch(error=>{console.error(error);process.exitCode=1;});

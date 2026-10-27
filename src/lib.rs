@@ -9,6 +9,8 @@ pub mod editorial;
 pub mod pipeline;
 #[cfg(feature = "cli")]
 pub mod runtime;
+#[cfg(feature = "cli")]
+pub mod store;
 
 use std::collections::{HashMap, HashSet};
 

@@ -23,7 +23,7 @@ function native(args: string[]): void {
   assert.equal(result.status, 0, result.stderr);
 }
 
-function prepareSite(directory: string): string {
+function prepareSite(directory: string, relational=false): string {
   const web = path.join(directory, 'web');
   const data = path.join(web, 'data');
   fs.mkdirSync(data, {recursive: true});
@@ -73,11 +73,18 @@ function prepareSite(directory: string): string {
       creator_tenure_days: 10, creator_languages_created: ['vec'], creator_data_status: 'matched',
     });
   }
+  if(relational&&record(dataset.link_candidates)) {
+    for(const value of Object.values(dataset.link_candidates)) {
+      assert(record(value)&&Array.isArray(value.candidates));
+      for(const candidate of value.candidates) {assert(record(candidate));candidate.evidence=[];}
+    }
+  }
   fs.writeFileSync(path.join(data, 'fixture.json'), JSON.stringify(dataset));
   fs.writeFileSync(path.join(data, 'manifest.json'), JSON.stringify([
     {file: 'fixture.json', language: 'vec', date: dataset.metadata.finished_at, demo: false},
   ]));
-  native(['dashboard', '--data-dir', data]);
+  native(['dashboard', '--data-dir', data,...(relational?['--collection-database',path.join(data,'collection.sqlite')]:[])]);
+  if(relational)for(const name of fs.readdirSync(data))if(name!=='collection.sqlite')fs.rmSync(path.join(data,name),{recursive:true});
   return web;
 }
 
@@ -90,12 +97,13 @@ async function stop(server: ChildProcess): Promise<void> {
   });
 }
 
-const test = base.extend<{traffic: {editorial: string[]}}, {site: string}>({
-  site: [async ({}, use) => {
+const test = base.extend<{traffic: {editorial: string[]}}, {site: string; relational:boolean}>({
+  relational:[false,{option:true,scope:'worker'}],
+  site: [async ({relational}, use) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orphanwiki-browser-'));
     let server: ChildProcess | undefined;
     try {
-      const web = prepareSite(directory);
+      const web = prepareSite(directory,relational);
       server = spawn(executable, ['serve', '--web-root', web, '--database', path.join(directory, 'reviews.sqlite'),
         '--bind', '127.0.0.1', '--port', '0'], {cwd: root, env, stdio: ['ignore', 'pipe', 'pipe']});
       const process = server;
@@ -306,4 +314,40 @@ test('mobile layout, keyboard controls and Escape cleanup', async ({page, site})
   await expect(page.locator('#llm-prompt-text')).toHaveValue('');
   await expect(page.locator('#llm-prompt-debug')).not.toBeChecked();
   await expect(fix).toBeFocused();
+});
+
+const databaseTest=test.extend({relational:[true,{scope:'worker'}]});
+databaseTest('database alone serves paginated articles, creators and cards on desktop and mobile',async({page,site,traffic},testInfo)=>{
+    const resources:string[]=[],queries:unknown[]=[];
+    page.on('request',request=>{
+      if(request.url().includes('/data/'))resources.push(request.url());
+      if(request.url().endsWith('/api/pages'))queries.push(request.postDataJSON());
+    });
+    await open(page,site,'index.html');
+    await expect(page.locator('#article-rows tr')).toHaveCount(25);
+    await page.locator('#article-group').selectOption('all');
+    await expect(page.locator('#article-info')).toContainText('64');
+    await page.locator('#article-more').click();await expect(page.locator('#article-rows tr')).toHaveCount(50);
+    await page.locator('#article-search').fill(title(64));await expect(page.locator('#article-rows tr')).toHaveCount(1);
+    await expect(page.locator('#article-rows')).toContainText(title(64));
+    await page.locator('#creators-link').click();await expect(page.locator('#creator-rows tr')).toHaveCount(25);
+    await page.locator('#creator-more').click();await expect(page.locator('#creator-rows tr')).toHaveCount(32);
+    await page.locator('#creator-search').fill('creator:31');await expect(page.locator('#creator-rows tr')).toHaveCount(1);
+    await page.locator('#deorphanize-link').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(25);
+    await page.locator('#candidate-more').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(32);
+    for(const width of [1280,390]) {
+      await page.setViewportSize({width,height:844});
+      await page.getByRole('button',{name:'Pagine nascoste',exact:true}).click();
+      await expect(page.locator('#candidate-hidden-options')).toBeVisible();await page.keyboard.press('Escape');
+      await expect(page.locator('#candidate-hidden')).toBeFocused();
+      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
+      if(width===1280)await page.screenshot({path:testInfo.outputPath('database-desktop-light.png')});
+    }
+    await page.locator('#ui-language-toggle').click();await expect(page.locator('html')).toHaveAttribute('lang','en');
+    await page.locator('#theme-toggle').click();await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(32);
+    await page.screenshot({path:testInfo.outputPath('database-mobile-dark.png')});
+    expect(resources.some(url=>url.endsWith('/data/fixture.json')||url.includes('-articles.json')||url.includes('-cards-v2.json')||url.includes('-creators.json'))).toBe(false);
+    expect(queries.some(value=>record(value)&&value.offset===25)).toBe(true);
+    expect(traffic.editorial).toEqual([]);
 });

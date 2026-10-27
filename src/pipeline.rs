@@ -13,6 +13,7 @@ use std::{
 
 type PipelineResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Clone)]
 pub struct PipelineOptions {
     pub root: PathBuf,
     pub languages_file: PathBuf,
@@ -23,6 +24,7 @@ pub struct PipelineOptions {
     pub dump_root: PathBuf,
     pub import_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub collection_database: Option<PathBuf>,
     pub work_dir: PathBuf,
     pub log_dir: PathBuf,
     pub model: PathBuf,
@@ -1819,6 +1821,122 @@ fn with_languages(mut arguments: Vec<String>, languages: &[String]) -> Vec<Strin
     arguments
 }
 
+/// Delete only verified downloads inside the pipeline's owned work area. Check
+/// every path before removing any; never accept a manifest pointing elsewhere.
+fn remove_downloads(manifest: &Path, metadata: &Value, root: &Path) -> PipelineResult<()> {
+    let root = root.canonicalize()?;
+    let mut files = Vec::new();
+    for path in fetched_outputs(manifest, metadata)?.into_iter().skip(1) {
+        if !path.exists() {
+            continue;
+        }
+        let resolved = path.canonicalize()?;
+        if !resolved.starts_with(&root)
+            || std::fs::symlink_metadata(&path)?.file_type().is_symlink()
+        {
+            return Err("Il dump da eliminare non appartiene all'area di lavoro".into());
+        }
+        files.push(path);
+    }
+    for path in files {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn collection_workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult<()> {
+    let Some(destination) = &options.collection_database else {
+        return workflow(options, steps);
+    };
+    if options.plan {
+        steps.log(&format!("PUBBLICAZIONE database {}; una raccolta completa; dump eliminati dopo importazione, intermedi dopo pubblicazione",destination.display()))?;
+        return workflow(options, steps);
+    }
+    let identity = json!({"rule":crate::store::RULE,"languages":options.selected,"sql_release":options.sql_release,
+        "history_release":options.history_release,"content_release":options.content_release,
+        "languages_sha256":dumps::file_sha256(&options.languages_file)?,"topics_sha256":dumps::file_sha256(&options.model_config)?,
+        "categories_sha256":dumps::file_sha256(&options.root.join("config/categories.json"))?,
+        "quality_sha256":dumps::file_sha256(&options.root.join("config/quality.json"))?});
+    let hash = dumps::canonical_json_sha256(&identity)?;
+    let parent = destination
+        .parent()
+        .ok_or("Directory del database mancante")?;
+    std::fs::create_dir_all(parent)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(destination.with_extension("lock"))?;
+    lock.try_lock()
+        .map_err(|_| "Un'altra pipeline sta pubblicando la raccolta")?;
+    let mut private = options.clone();
+    let directories = [
+        options
+            .dump_root
+            .join(format!(".collection-{}-downloads", &hash[..16])),
+        options
+            .import_dir
+            .join(format!(".collection-{}-imports", &hash[..16])),
+        options
+            .work_dir
+            .join(format!(".collection-{}-staging", &hash[..16])),
+        options
+            .output_dir
+            .join(format!(".collection-{}-exports", &hash[..16])),
+    ];
+    let cleanup = || -> PipelineResult<()> {
+        for directory in &directories {
+            if directory.exists() {
+                if read_json(&directory.join(".owner.json"))? != identity {
+                    return Err("Area temporanea non appartenente alla raccolta".into());
+                }
+                std::fs::remove_dir_all(directory)?;
+            }
+        }
+        Ok(())
+    };
+    if !options.force
+        && crate::store::Census::open(destination)
+            .and_then(|db| {
+                db.verify()?;
+                db.identity()
+            })
+            .ok()
+            .as_ref()
+            == Some(&identity)
+    {
+        steps.log(
+            "SALTA raccolta: database completo già pubblicato per queste release e configurazioni",
+        )?;
+        cleanup()?;
+        return Ok(());
+    }
+    for directory in &directories {
+        if directory.exists() {
+            if read_json(&directory.join(".owner.json"))? != identity {
+                return Err("Area temporanea non appartenente alla raccolta".into());
+            }
+        } else {
+            std::fs::create_dir_all(directory)?;
+            dumps::DumpClient::<dumps::WikimediaHttp>::write_json(
+                &directory.join(".owner.json"),
+                &identity,
+            )?;
+        }
+    }
+    private.dump_root = directories[0].clone();
+    private.import_dir = directories[1].clone();
+    private.work_dir = directories[2].clone();
+    private.output_dir = directories[3].clone();
+    workflow(&private, steps)?;
+    steps.log("Pubblicazione atomica del database relazionale completo")?;
+    crate::store::publish(&private.output_dir, destination, &identity)?;
+    cleanup()?;
+    steps.log("Raccolta pubblicata; dump e intermedi temporanei eliminati")?;
+    Ok(())
+}
+
 fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult<()> {
     let languages = options
         .selected
@@ -1863,52 +1981,73 @@ fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult
         .map_err(|_| "Un'altra pipeline sta usando gli stessi checkpoint")?;
     let _lock = lock;
     let mut state = StepState::open(options.dump_root.join("pipeline-state.json"))?;
-    let mut missing = Vec::new();
-    for edition in &options.selected {
-        let (language, database) = edition;
-        let inputs = json!({"language":language,"database":database,"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)});
-        let outputs = manifest_for(options, language, database)
-            .and_then(|(path, meta)| fetched_outputs(&path, &meta).ok())
-            .unwrap_or_default();
-        let inherited=state.inherit("fetch",&json!({"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)}),edition,&outputs);
-        let key = format!("fetch:{language}");
-        let reason = state.reason(&key, &inputs, &outputs);
-        steps.log(&format!(
-            "CHECKPOINT download {language}: {}",
-            if options.force {
-                "forced"
-            } else if inherited {
-                "verified_reuse"
-            } else {
-                reason
-            }
-        ))?;
-        if !options.force && !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
+    if options.collection_database.is_none() {
+        let mut missing = Vec::new();
+        for edition in &options.selected {
+            let (language, database) = edition;
+            let inputs = json!({"language":language,"database":database,"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)});
+            let outputs = manifest_for(options, language, database)
+                .and_then(|(path, meta)| fetched_outputs(&path, &meta).ok())
+                .unwrap_or_default();
+            let inherited=state.inherit("fetch",&json!({"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)}),edition,&outputs);
+            let key = format!("fetch:{language}");
+            let reason = state.reason(&key, &inputs, &outputs);
             steps.log(&format!(
-                "SALTA download {language}: file verificati e invariati"
+                "CHECKPOINT download {language}: {}",
+                if options.force {
+                    "forced"
+                } else if inherited {
+                    "verified_reuse"
+                } else {
+                    reason
+                }
             ))?;
-            state.save(&key, inputs, &outputs)?;
-        } else {
-            missing.push(language.clone());
+            if !options.force && !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
+                steps.log(&format!(
+                    "SALTA download {language}: file verificati e invariati"
+                ))?;
+                state.save(&key, inputs, &outputs)?;
+            } else {
+                missing.push(language.clone());
+            }
         }
-    }
-    if !missing.is_empty() {
-        steps.run(
-            &format!("download verificato: {}", missing.join(" ")),
-            &with_languages(fetch, &missing),
-        )?;
+        if !missing.is_empty() {
+            steps.run(
+                &format!("download verificato: {}", missing.join(" ")),
+                &with_languages(fetch.clone(), &missing),
+            )?;
+        }
     }
     let mut manifests = BTreeMap::new();
     let mut graph_paths = Vec::new();
     for (language, database) in &options.selected {
+        if options.collection_database.is_some() {
+            let imported = manifest_for(options, language, database).is_some_and(|(path, meta)| {
+                imported_reason(
+                    &options.import_dir.join(format!("{language}-raw.json")),
+                    &options.import_dir.join(format!("{language}-history.json")),
+                    &options
+                        .work_dir
+                        .join(format!("{database}-{}.sqlite", options.sql_release)),
+                    &path,
+                    &meta,
+                    true,
+                ) == "verified_reuse"
+            });
+            if options.force || !imported {
+                steps.run(
+                    &format!("download verificato {language}"),
+                    &with_languages(fetch.clone(), std::slice::from_ref(language)),
+                )?;
+            }
+        }
         let (manifest, metadata) = manifest_for(options, language, database)
             .ok_or("Download terminato senza tutti i manifest richiesti")?;
         let fetch_inputs = json!({"language":language,"database":database,"sql_release":options.sql_release,"history_release":options.history_release,"dump_root":path_text(&options.dump_root)});
-        state.save(
-            &format!("fetch:{language}"),
-            fetch_inputs,
-            &fetched_outputs(&manifest, &metadata)?,
-        )?;
+        let fetched = fetched_outputs(&manifest, &metadata)?;
+        if fetched.iter().all(|p| p.is_file()) {
+            state.save(&format!("fetch:{language}"), fetch_inputs, &fetched)?;
+        }
         let manifest_sha = dumps::file_sha256(&manifest)?;
         manifests.insert(language.clone(), manifest_sha.clone());
         let graph = options.import_dir.join(format!("{language}-raw.json"));
@@ -1985,6 +2124,9 @@ fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult
             }
         }
         state.save(&key, inputs, &outputs)?;
+        if options.collection_database.is_some() {
+            remove_downloads(&manifest, &metadata, &options.dump_root)?;
+        }
         graph_paths.push(graph);
     }
     let model = read_json(&options.model_config)?;
@@ -2050,46 +2192,63 @@ fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult
         }
     }
     // XML downloads have the same per-edition reuse guarantee as SQL/History.
-    let mut missing_content = Vec::new();
-    for edition in &options.selected {
-        let (language, database) = edition;
-        let path = options
-            .dump_root
-            .join(database)
-            .join(format!("content-{}.json", options.content_release));
-        let outputs = read_json(&path)
-            .ok()
-            .and_then(|meta| fetched_outputs(&path, &meta).ok())
-            .unwrap_or_default();
-        let inputs = json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)});
-        let key = format!("content-fetch:{language}");
-        let inherited = state.inherit(
-            "content-fetch",
-            &json!({"release":options.content_release}),
-            edition,
-            &outputs,
-        );
-        let reason = state.reason(&key, &inputs, &outputs);
-        if !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
-            state.save(&key, inputs, &outputs)?;
-            steps.log(&format!(
-                "SALTA contenuto XML {language}: file verificati e invariati"
-            ))?;
-        } else {
-            missing_content.push(language.clone());
+    if options.collection_database.is_none() {
+        let mut missing_content = Vec::new();
+        for edition in &options.selected {
+            let (language, database) = edition;
+            let path = options
+                .dump_root
+                .join(database)
+                .join(format!("content-{}.json", options.content_release));
+            let outputs = read_json(&path)
+                .ok()
+                .and_then(|meta| fetched_outputs(&path, &meta).ok())
+                .unwrap_or_default();
+            let inputs = json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)});
+            let key = format!("content-fetch:{language}");
+            let inherited = state.inherit(
+                "content-fetch",
+                &json!({"release":options.content_release}),
+                edition,
+                &outputs,
+            );
+            let reason = state.reason(&key, &inputs, &outputs);
+            if !outputs.is_empty() && (reason == "verified_reuse" || inherited) {
+                state.save(&key, inputs, &outputs)?;
+                steps.log(&format!(
+                    "SALTA contenuto XML {language}: file verificati e invariati"
+                ))?;
+            } else {
+                missing_content.push(language.clone());
+            }
         }
-    }
-    if !missing_content.is_empty() {
-        steps.run(
-            "contenuto corrente verificato",
-            &with_languages(content, &missing_content),
-        )?;
+        if !missing_content.is_empty() {
+            steps.run(
+                "contenuto corrente verificato",
+                &with_languages(content.clone(), &missing_content),
+            )?;
+        }
     }
     for (language, database) in &options.selected {
         let manifest = options
             .dump_root
             .join(database)
             .join(format!("content-{}.json", options.content_release));
+        if options.collection_database.is_some() {
+            let quality = options.import_dir.join(format!("{language}-quality.json"));
+            let graph = options.import_dir.join(format!("{language}-raw.json"));
+            let reusable=(||->PipelineResult<bool>{
+                let inputs=json!({"graph_sha256":dumps::file_sha256(&graph)?,"manifest_sha256":dumps::file_sha256(&manifest)?,
+                    "model_sha256":dumps::file_sha256(&options.root.join("config/quality.json"))?,"quality_revision_rule":"selected_official_xml_revision_v1"});
+                Ok(state.reason(&format!("quality:{language}"),&inputs,std::slice::from_ref(&quality))=="verified_reuse")
+            })().unwrap_or(false);
+            if options.force || !reusable {
+                steps.run(
+                    &format!("contenuto corrente verificato {language}"),
+                    &with_languages(content.clone(), std::slice::from_ref(language)),
+                )?;
+            }
+        }
         let metadata = read_json(&manifest)?;
         if metadata["language"] != *language
             || metadata["database"] != *database
@@ -2098,7 +2257,10 @@ fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult
         {
             return Err("Manifest del contenuto corrente non corrispondente".into());
         }
-        state.save(&format!("content-fetch:{language}"),json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)}),&fetched_outputs(&manifest,&metadata)?)?;
+        let fetched = fetched_outputs(&manifest, &metadata)?;
+        if fetched.iter().all(|p| p.is_file()) {
+            state.save(&format!("content-fetch:{language}"),json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)}),&fetched)?;
+        }
         let graph = options.import_dir.join(format!("{language}-raw.json"));
         let quality = options.import_dir.join(format!("{language}-quality.json"));
         let inputs = json!({"graph_sha256":dumps::file_sha256(&graph)?,"manifest_sha256":dumps::file_sha256(&manifest)?,
@@ -2128,6 +2290,9 @@ fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> PipelineResult
             )?;
         }
         state.save(&key, inputs, std::slice::from_ref(&quality))?;
+        if options.collection_database.is_some() {
+            remove_downloads(&manifest, &metadata, &options.dump_root)?;
+        }
     }
     let configured = crate::configured_languages(&read_json(&options.languages_file)?)?;
     let allowed = configured
@@ -2279,6 +2444,9 @@ pub fn run(mut options: PipelineOptions) -> PipelineResult<()> {
     ] {
         *path = dumps::resolved_path(&options.root.join(&*path))?;
     }
+    if let Some(path) = &mut options.collection_database {
+        *path = dumps::resolved_path(&options.root.join(&*path))?;
+    }
     let sql = chrono::NaiveDate::parse_from_str(&options.sql_release, "%Y%m%d")?;
     let content = chrono::NaiveDate::parse_from_str(&options.content_release, "%Y-%m-%d")?;
     let history =
@@ -2314,7 +2482,7 @@ pub fn run(mut options: PipelineOptions) -> PipelineResult<()> {
         let mut runner = Runner::new(&options)?;
         let settings = runner.trace.clone();
         let result = runtime::with_tracing(settings, || {
-            runtime::phase("pipeline", || workflow(&options, &mut runner))
+            runtime::phase("pipeline", || collection_workflow(&options, &mut runner))
         });
         let report = runner.finish(&result);
         result.and(report)
@@ -2364,6 +2532,7 @@ mod tests {
                 dump_root: root.join("dumps"),
                 import_dir: root.join("imported"),
                 output_dir: root.join("exports"),
+                collection_database: None,
                 work_dir: root.join("staging"),
                 log_dir: root.join("logs"),
                 model: root.join("unused-model.bin"),
@@ -2452,7 +2621,7 @@ mod tests {
     }
 
     impl FakeSteps {
-        fn publish(&mut self, languages: &[String], folder: &Path) {
+        fn publish(&mut self, languages: &[String], folder: &Path, input: &Path) {
             self.generation += 1;
             std::fs::create_dir_all(folder).unwrap();
             let mut manifest = read_json(&folder.join("manifest.json"))
@@ -2462,27 +2631,20 @@ mod tests {
                 .clone();
             let mut members = Vec::new();
             for language in languages {
-                let graph =
-                    read_json(&self.root.join(format!("imported/{language}-raw.json"))).unwrap();
+                let graph = read_json(&input.join(format!("{language}-raw.json"))).unwrap();
                 let mut metadata = graph["metadata"].clone();
                 metadata["age_rule"] = json!(dumps::HISTORY_RULE);
                 metadata["measures_rule"] = json!("creation_quality_creators_v3");
                 metadata["category_rules"] =
                     read_json(&self.root.join("config/categories.json")).unwrap();
-                metadata["topics"] = dumps::first_metadata(
-                    &self.root.join(format!("imported/{language}-topics.json")),
-                )
-                .unwrap();
+                metadata["topics"] =
+                    dumps::first_metadata(&input.join(format!("{language}-topics.json"))).unwrap();
                 metadata["topics"]["status"] = json!("predicted");
-                metadata["history"] = dumps::first_metadata(
-                    &self.root.join(format!("imported/{language}-history.json")),
-                )
-                .unwrap();
+                metadata["history"] =
+                    dumps::first_metadata(&input.join(format!("{language}-history.json"))).unwrap();
                 metadata["history"]["status"] = json!("collected");
-                metadata["quality"] = dumps::first_metadata(
-                    &self.root.join(format!("imported/{language}-quality.json")),
-                )
-                .unwrap();
+                metadata["quality"] =
+                    dumps::first_metadata(&input.join(format!("{language}-quality.json"))).unwrap();
                 if languages.len() > 1 {
                     metadata["comparison"] = json!({"status":"compared","reference_languages":languages.iter().filter(|l|*l!=language).collect::<Vec<_>>()});
                 }
@@ -2663,7 +2825,7 @@ mod tests {
                         write(
                             &PathBuf::from(value("--output-dir"))
                                 .join(format!("{language}-quality.json")),
-                            &json!({"metadata":{"language":language,"complete":true,"quality_revision_rule":"selected_official_xml_revision_v1","definition":"synthetic controller fixture"},"pages":[]}),
+                            &json!({"metadata":{"language":language,"complete":true,"content_release":"2026-10-01","quality_revision_rule":"selected_official_xml_revision_v1","definition":"synthetic controller fixture"},"pages":[]}),
                         );
                     }
                 }
@@ -2672,7 +2834,11 @@ mod tests {
                         .as_str()
                         .unwrap()
                         .to_owned();
-                    self.publish(&[language], Path::new(&value("--output")).parent().unwrap());
+                    self.publish(
+                        &[language],
+                        Path::new(&value("--output")).parent().unwrap(),
+                        Path::new(&args[1]).parent().unwrap(),
+                    );
                 }
                 "compare" => {
                     let languages = args[1..]
@@ -2685,7 +2851,11 @@ mod tests {
                                 .to_owned()
                         })
                         .collect::<Vec<_>>();
-                    self.publish(&languages, Path::new(&value("--output-dir")));
+                    self.publish(
+                        &languages,
+                        Path::new(&value("--output-dir")),
+                        Path::new(&args[1]).parent().unwrap(),
+                    );
                 }
                 "refresh-measures" => {
                     let folder = PathBuf::from(value("--data-dir"));
@@ -2700,12 +2870,99 @@ mod tests {
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
-                    self.publish(&languages, &folder);
+                    self.publish(&languages, &folder, &self.root.join("imported"));
                 }
                 _ => panic!("Unexpected test command {command}"),
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn relational_collection_is_atomic_resumable_and_removes_only_its_own_files() {
+        let mut f = Fixture::new();
+        f.options.selected.push(("lmo".into(), "lmowiki".into()));
+        let destination = f.root.join("collection.sqlite");
+        f.options.collection_database = Some(destination.clone());
+        std::fs::create_dir_all(&f.options.import_dir).unwrap();
+        let collected = f.options.import_dir.join("existing-collected.json");
+        std::fs::write(&collected, "preserve existing research").unwrap();
+        f.steps.fail = Some("quality".into());
+        assert!(collection_workflow(&f.options, &mut f.steps).is_err());
+        assert!(!destination.exists());
+        let imports = f
+            .steps
+            .calls
+            .iter()
+            .filter(|c| c[0] == "import-dumps")
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), 2);
+        for call in imports {
+            let manifest =
+                Path::new(&call[call.iter().position(|a| a == "--manifest").unwrap() + 1]);
+            for path in fetched_outputs(manifest, &read_json(manifest).unwrap())
+                .unwrap()
+                .into_iter()
+                .skip(1)
+            {
+                assert!(!path.exists());
+            }
+        }
+        f.reset();
+        f.steps.fail = None;
+        collection_workflow(&f.options, &mut f.steps).unwrap();
+        assert!(!f
+            .steps
+            .calls
+            .iter()
+            .any(|c| c[0] == "fetch-dumps" || c[0] == "import-dumps" || c[0] == "topics"));
+        let db = crate::store::Census::open(&destination).unwrap();
+        assert_eq!(db.manifest().unwrap().as_array().unwrap().len(), 3);
+        let approved = std::fs::read(&destination).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&collected).unwrap(),
+            "preserve existing research"
+        );
+        for base in [
+            &f.options.dump_root,
+            &f.options.import_dir,
+            &f.options.work_dir,
+            &f.options.output_dir,
+        ] {
+            assert!(!std::fs::read_dir(base).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".collection-")));
+        }
+        f.reset();
+        collection_workflow(&f.options, &mut f.steps).unwrap();
+        assert!(f.steps.calls.is_empty());
+        f.options.force = true;
+        f.steps.fail = Some("topics".into());
+        assert!(collection_workflow(&f.options, &mut f.steps).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), approved);
+        assert_eq!(db.manifest().unwrap().as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn relational_cleanup_rejects_manifest_paths_outside_the_work_area() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(&f.options.dump_root).unwrap();
+        let outside = f.root.join("collected-dump.sql.gz");
+        std::fs::write(&outside, "existing research").unwrap();
+        let manifest = f.options.dump_root.join("manifest.json");
+        write(&manifest, &json!({}));
+        assert!(remove_downloads(
+            &manifest,
+            &json!({"files":{"page":{"path":outside}}}),
+            &f.options.dump_root
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "existing research"
+        );
     }
 
     #[test]

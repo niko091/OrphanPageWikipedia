@@ -968,7 +968,7 @@ impl<T: DumpHttp> DumpClient<T> {
     }
 }
 
-type DumpResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(crate) type DumpResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[cfg(feature = "cli")]
 fn write_atomic(
@@ -2319,7 +2319,7 @@ fn csv_value(value: &serde_json::Value, nonprintable: &regex::Regex) -> DumpResu
 }
 
 #[cfg(feature = "cli")]
-fn write_csv_row<'a>(
+pub(crate) fn write_csv_row<'a>(
     writer: &mut impl std::io::Write,
     values: impl IntoIterator<Item = &'a serde_json::Value>,
     nonprintable: &regex::Regex,
@@ -2349,15 +2349,15 @@ fn write_csv_row<'a>(
 }
 
 #[cfg(feature = "cli")]
-struct CanonicalExport {
-    database: rusqlite::Connection,
-    metadata: serde_json::Value,
-    signature: (u64, i64),
-    count: usize,
+pub(crate) struct CanonicalExport {
+    pub(crate) database: rusqlite::Connection,
+    pub(crate) metadata: serde_json::Value,
+    pub(crate) signature: (u64, i64),
+    pub(crate) count: usize,
 }
 
 #[cfg(feature = "cli")]
-fn stage_export(source: &std::path::Path) -> DumpResult<CanonicalExport> {
+pub(crate) fn stage_export(source: &std::path::Path) -> DumpResult<CanonicalExport> {
     crate::runtime::phase("export.stage", || {
         crate::runtime::check_cancelled()?;
         use rusqlite::params;
@@ -3244,14 +3244,14 @@ fn write_profile_topics(directory: &std::path::Path, staged: &CanonicalExport) -
 
 #[cfg(feature = "cli")]
 #[derive(serde::Serialize)]
-struct EditorialCandidate<'a> {
+pub(crate) struct EditorialCandidate<'a> {
     #[serde(flatten)]
     fields: std::collections::BTreeMap<&'a str, &'a serde_json::Value>,
     evidence: [&'a serde_json::Value; 1],
 }
 
 #[cfg(feature = "cli")]
-fn editorial_shortlist<'a>(
+pub(crate) fn editorial_shortlist<'a>(
     record: &'a serde_json::Value,
     target: i64,
     language: &str,
@@ -6332,11 +6332,60 @@ pub fn aggregate_index(members: &[serde_json::Value]) -> DumpResult<serde_json::
     )
 }
 
+/// Metadata shared by the prepared aggregate summaries and relational validation.
+#[cfg(feature = "cli")]
+pub(crate) fn aggregate_summary_metadata(
+    members: &[serde_json::Value],
+    metadata: &serde_json::Value,
+    aggregate: bool,
+) -> DumpResult<(serde_json::Value, bool)> {
+    use serde_json::{json, Value};
+    if members.is_empty() || !metadata.is_object() {
+        return Err("Riepilogo aggregato senza membri".into());
+    }
+    let mut meta = metadata.clone();
+    let collected =
+        |value: &Value| matches!(value.as_str(), Some("collected" | "partially_collected"));
+    let creators = members
+        .iter()
+        .filter(|m| collected(&m["metadata"]["creators"]["status"]))
+        .collect::<Vec<_>>();
+    let history = members
+        .iter()
+        .filter(|m| collected(&m["metadata"]["history"]["status"]))
+        .collect::<Vec<_>>();
+    let status = |count: usize| {
+        if count == members.len() {
+            "collected"
+        } else if count == 0 {
+            "not_collected"
+        } else {
+            "partially_collected"
+        }
+    };
+    if aggregate {
+        meta["creators"] = json!({"status":status(creators.len()),"languages_scanned":creators.iter().map(|m|&m["language"]).collect::<Vec<_>>(),"collected_languages":creators.len()});
+        let matched = history
+            .iter()
+            .try_fold(0u64, |total, m| {
+                total.checked_add(
+                    m["metadata"]["history"]
+                        .get("matched_pages")
+                        .map(|v| v.as_u64())
+                        .unwrap_or(Some(0))?,
+                )
+            })
+            .ok_or("Conteggio History non valido")?;
+        meta["history"] = json!({"status":status(history.len()),"matched_pages":matched});
+    }
+    Ok((meta, creators.is_empty() && !history.is_empty()))
+}
+
+#[cfg(feature = "cli")]
 /// Prepare an aggregate summary and its separate creator index from approved
 /// canonical member page streams. Paths are operational inputs only and never
 /// enter the aggregate metadata or source fingerprints. Candidate evidence is
 /// not read a second time to calculate charts.
-#[cfg(feature = "cli")]
 pub fn write_aggregate_summary(
     members: &[serde_json::Value],
     output: &std::path::Path,
@@ -6345,7 +6394,7 @@ pub fn write_aggregate_summary(
 ) -> DumpResult<()> {
     crate::runtime::phase("dashboard.aggregate", || {
         crate::runtime::check_cancelled()?;
-        use serde_json::{json, Value};
+        use serde_json::json;
         use std::io::BufReader;
         if members.is_empty() || !metadata.is_object() {
             return Err("Riepilogo aggregato senza membri".into());
@@ -6363,48 +6412,14 @@ pub fn write_aggregate_summary(
             resolved_path(output)?,
             resolved_path(&folder.join(&creator_name))?,
         ];
-        let mut meta = metadata.clone();
-        let collected =
-            |value: &Value| matches!(value.as_str(), Some("collected" | "partially_collected"));
-        let creators = members
-            .iter()
-            .filter(|m| collected(&m["metadata"]["creators"]["status"]))
-            .collect::<Vec<_>>();
-        let history = members
-            .iter()
-            .filter(|m| collected(&m["metadata"]["history"]["status"]))
-            .collect::<Vec<_>>();
-        let status = |count: usize| {
-            if count == members.len() {
-                "collected"
-            } else if count == 0 {
-                "not_collected"
-            } else {
-                "partially_collected"
-            }
-        };
-        if aggregate {
-            meta["creators"] = json!({"status":status(creators.len()),"languages_scanned":creators.iter().map(|m|&m["language"]).collect::<Vec<_>>(),"collected_languages":creators.len()});
-            let matched = history
-                .iter()
-                .try_fold(0u64, |total, m| {
-                    total.checked_add(
-                        m["metadata"]["history"]
-                            .get("matched_pages")
-                            .map(|v| v.as_u64())
-                            .unwrap_or(Some(0))?,
-                    )
-                })
-                .ok_or("Conteggio History non valido")?;
-            meta["history"] = json!({"status":status(history.len()),"matched_pages":matched});
-        }
+        let (meta, historical) = aggregate_summary_metadata(members, metadata, aggregate)?;
         let mut summary = crate::dashboard::SummaryAccumulator::new(
             meta["language"]
                 .as_str()
                 .ok_or("Lingua riepilogo mancante")?
                 .into(),
             aggregate,
-            creators.is_empty() && !history.is_empty(),
+            historical,
         );
         let mut preview = Vec::with_capacity(26);
         let mut sources = Vec::with_capacity(members.len());

@@ -56,6 +56,7 @@ interface AggregateMember {
   language: string; file: string; page_count: number; metadata: DatasetMetadata;
 }
 interface ManifestEntry {
+  storage?: string;
   language: string; file: string; date: string; published_at?: string; kind?: string; demo?: boolean;
   observations_file?: string; articles_file?: string; summary_file?: string; creator_index_file?: string;
   cards_file?: string; cards_dir?: string; connections_dir?: string; connections_metadata_file?: string; profile_topics_dir?: string;
@@ -651,6 +652,94 @@ let datasetController = new AbortController();
 const candidatePreviews = new Map<string, Promise<Dataset | null>>();
 let precomputed: DashboardSummaryData | null = null, precomputedCreators: CreatorRow[] | null = null;
 let summaryOnly = false, articleListLoading = false;
+type RemoteKind='articles'|'cards'|'creators';
+interface RemoteList {
+  key: string; total: number; pages: PageObservation[]; creators: CreatorRow[];
+  records: Record<string,CandidateRecord>; transports: Record<string,CardTransport>;
+}
+let remoteRendering=false,remoteController=new AbortController(),remoteVersion=0;
+let remoteList: RemoteList | null=null,listHydration: Promise<void>=Promise.resolve();
+let remoteProfileEdits: RecentEdit[]=[];
+function databaseMode(): boolean {return datasetEntries.some(entry=>entry.file===datasetFile&&entry.storage==='relational_census_v1');}
+function resetRemoteList() {++remoteVersion;remoteController.abort();remoteList=null;remoteProfileEdits=[];}
+
+function databaseList(kind: RemoteKind,render: ()=>void): boolean {
+  if(!databaseMode()||remoteRendering)return false;
+  listHydration=loadDatabaseList(kind,render);return true;
+}
+async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void> {
+  const prefix=kind==='cards'?'candidate':kind==='creators'?'creator':'article';
+  const field=(id: keyof UIElements)=>{const node=$(id);return node&&'value' in node?String(node.value):'';};
+  const request={dataset:datasetFile,kind,search:field((prefix+'-search') as keyof UIElements),
+    category:kind==='articles'&&field('article-classification')==='macro'?field('article-macro'):kind==='creators'?'':field((prefix+'-category') as keyof UIElements),
+    classification:kind==='articles'?field('article-classification')||'categories':'categories',
+    group:kind==='articles'?field('article-group')||'orphans':'orphans',
+    order:field((prefix+'-sort') as keyof UIElements)||(kind==='cards'?'candidates-desc':kind==='creators'?'orphans-desc':'title-asc'),
+    show_disambiguation:kind==='cards'&&Boolean($('candidate-show-disambiguation')?.checked),
+    show_redirects:kind==='cards'&&Boolean($('candidate-show-redirects')?.checked),
+    show_without_connections:kind==='cards'&&Boolean($('candidate-show-without-connections')?.checked),
+    missing_category:t('Senza categoria idonea'),missing_topics:t('Temi non disponibili'),empty_topics:t('Nessun tema sopra soglia'),
+    closed_pairs:kind==='cards'?[...editorialReviews.values()].filter(review=>review.status==='fixed'||review.status==='bad_link').map(review=>[review.language,review.target_id,review.source_id]):[],
+    edits:kind==='cards'&&field('candidate-sort')==='personalized'?remoteProfileEdits:[]};
+  const key=canonicalJSON([request,kind==='cards'?[...editorialReviews.values()]:[],uiLanguage]);
+  const limit=kind==='cards'?candidateLimit:kind==='creators'?creatorLimit:articleLimit;
+  const count=remoteList?(kind==='creators'?remoteList.creators.length:remoteList.pages.length):0;
+  const more=$(prefix+'-more' as keyof UIElements) as HTMLButtonElement;
+  const info=$(prefix+'-info' as keyof UIElements)!;
+  function display(list: RemoteList) {
+    data.pages=list.pages;data.link_candidates=list.records;data.card_transports=list.transports;
+    if(kind==='creators')creatorRows=list.creators;
+    remoteRendering=true;
+    try {render();} finally {remoteRendering=false;}
+    const shown=kind==='creators'?list.creators.length:list.pages.length;
+    if(kind!=='creators')info.textContent=t(kind==='cards'?'{n} orfane corrispondenti · {shown} schede visualizzate':'{n} voci · {shown} visualizzate',{n:number(list.total),shown:number(shown)});
+    else info.textContent=info.textContent.replace(number(list.creators.length),number(list.total));
+    more.hidden=shown>=list.total;more.disabled=false;
+  }
+  if(remoteList?.key===key&&(count>=limit||count>=remoteList.total)){display(remoteList);return;}
+  const previous=remoteList?.key===key?remoteList:null;
+  const offset=previous?(kind==='creators'?previous.creators.length:previous.pages.length):0;
+  const version=++remoteVersion,load=loadVersion;
+  remoteController.abort();remoteController=new AbortController();
+  const signal=remoteController.signal;
+  ++cardRequestVersion;cardController.abort();
+  more.disabled=true;info.textContent=t('Caricamento…');
+  try {
+    const response=await fetch('api/pages',{method:'POST',cache:'no-store',credentials:'omit',signal,
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({...request,offset})});
+    const payload: unknown=await response.json();
+    if(signal.aborted||version!==remoteVersion||load!==loadVersion)return;
+    if(!response.ok||!isRecord(payload)||payload.dataset!==datasetFile||payload.offset!==offset||
+      !Number.isSafeInteger(payload.total)||Number(payload.total)<offset)throw new Error('Indice degli articoli non valido');
+    const next: RemoteList=previous?{...previous,pages:[...previous.pages],creators:[...previous.creators],records:{...previous.records},transports:{...previous.transports}}:{key,total:0,pages:[],creators:[],records:{},transports:{}};
+    next.total=Number(payload.total);
+    if(kind==='creators') {
+      if(payload.format!=='creator_results_v1'||!Array.isArray(payload.creators)||payload.creators.length>25||
+        payload.creators.some(row=>!isRecord(row)||typeof row.key!=='string'||!Number.isSafeInteger(row.total)||!Number.isSafeInteger(row.orphans)||!Array.isArray(row.languages)))throw new Error('Indice dei creatori non valido');
+      next.creators.push(...payload.creators as CreatorRow[]);
+    } else {
+      if(payload.format!=='page_results_v1'||!Array.isArray(payload.pages)||payload.pages.length>25||
+        canonicalJSON(payload.metadata)!==canonicalJSON(data.metadata)||payload.census_page_count!==precomputed?.census_page_count||
+        !isRecord(payload.link_candidates)||!isRecord(payload.card_transports))throw new Error('Indice degli articoli non valido');
+      if(payload.pages.some(page=>!isRecord(page)||!Number.isSafeInteger(page.page_id)||Number(page.page_id)<=0||typeof page.title!=='string'||typeof page.orphan!=='boolean'))throw new Error('Indice degli articoli non valido');
+      const member={metadata:data.metadata,pages:payload.pages,link_candidates:payload.link_candidates} as Dataset;
+      if(data.metadata.kind==='aggregate') {
+        for(const page of member.pages) {
+          if(!data.metadata.languages?.includes(page.language??''))throw new Error('Indice degli articoli non valido');
+          validateDataset({metadata:{...member.metadata,language:page.language!},pages:[page]});
+        }
+      } else validateDataset(member);
+      next.pages.push(...member.pages);Object.assign(next.records,member.link_candidates);Object.assign(next.transports,payload.card_transports);
+      if(new Set(next.pages.map(pageKey)).size!==next.pages.length)throw new Error('Indice degli articoli non valido');
+    }
+    const loaded=kind==='creators'?next.creators.length:next.pages.length;
+    if(loaded!==Math.min(next.total,offset+25))throw new Error('Indice degli articoli non valido');
+    remoteList=next;display(next);
+    if(loaded<limit&&loaded<next.total)await loadDatabaseList(kind,render);
+  } catch(error) {
+    if(!signal.aborted&&version===remoteVersion&&load===loadVersion)info.textContent=t('Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.',{error:t(error instanceof Error?error.message:String(error))});
+  } finally {if(version===remoteVersion)more.disabled=false;}
+}
 let profileRequestVersion = 0;
 let profileController = new AbortController();
 // Only requested page IDs are retained, never full observation files or text.
@@ -1030,6 +1119,7 @@ async function scoreProfile(edits: RecentEdit[], version: number) {
   const report=calculateReport<InterestReport>('interests',{edits:enriched,candidates:data.pages.filter(page=>page.orphan).map(page=>({
     key:pageKey(page),language:pageLanguage(page),topic_labels:page.topic_status==='predicted'?page.topic_labels??null:null
   })),aggregate:data.metadata.kind==='aggregate'});
+  if(databaseMode())remoteProfileEdits=enriched;
   profileScores=new Map(report.scores.map(row=>[row.key,{topic:row.topic,language:row.language}]));
   $('profile-sort-option')!.disabled=false;
   $('candidate-sort')!.value='personalized';candidateLimit=25;candidateCards();
@@ -1650,11 +1740,12 @@ function articleLabels(page: PageObservation): string[] {
 }
 function articleList() {
   if(!$('article-rows')!)return;
+  if(databaseList('articles',articleList))return;
   const search=$('article-search')!.value.toLocaleLowerCase();
   const category=($('article-classification')!.value==='macro'?$('article-macro')!.value:$('article-category')!.value).toLocaleLowerCase();
   const group=$('article-group')!.value||'orphans';
-  const pages=(summaryOnly?precomputed!.article_preview??[]:data.pages).filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
-  sortArticles(pages,$('article-sort')!.value||'title-asc');
+  const pages=remoteRendering?data.pages:(summaryOnly?precomputed!.article_preview??[]:data.pages).filter(p=>p.title.toLocaleLowerCase().includes(search)&&articleLabels(p).some(name=>name.toLocaleLowerCase().includes(category))&&(group==='all'||p.orphan===(group==='orphans')));
+  if(!remoteRendering)sortArticles(pages,$('article-sort')!.value||'title-asc');
   const box=$('article-rows')!;box.replaceChildren();
   for(const page of pages.slice(0,articleLimit)) {
     const row=element('tr'),title=element('td');title.append(wikiLink(page.title,pageLanguage(page)));
@@ -1679,10 +1770,11 @@ function prepareCreators() {
 }
 function creatorList() {
   if(!$('creator-rows')!)return;
+  if(databaseList('creators',creatorList))return;
   const search=$('creator-search')!.value.toLocaleLowerCase(),order=$('creator-sort')!.value||'orphans-desc';
-  const rows=creatorRows.filter(row=>row.key.toLocaleLowerCase().includes(search));
+  const rows=remoteRendering?creatorRows:creatorRows.filter(row=>row.key.toLocaleLowerCase().includes(search));
   const field=order.startsWith('articles')?(creatorMode()==='history'?'total':'articles'):'orphans';
-  rows.sort((a,b)=>numericOrder(a[field],b[field],order.endsWith('asc')?1:-1)||a.key.localeCompare(b.key));
+  if(!remoteRendering)rows.sort((a,b)=>numericOrder(a[field],b[field],order.endsWith('asc')?1:-1)||a.key.localeCompare(b.key));
   const articlesHeading=document.getElementById('creator-articles-heading');
   if(articlesHeading)articlesHeading.hidden=creatorMode()==='history';
   const box=$('creator-rows')!;box.replaceChildren();
@@ -1765,6 +1857,7 @@ function orphanCategoryName(page: PageObservation): string {
 }
 function candidateCards() {
   if(!deorphanizePage||$('dataset')!.value==='')return;
+  if(databaseList('cards',candidateCards))return;
   const request=++cardRequestVersion;cardController.abort();cardController=new AbortController();
   const records=candidatePreview?{}:data.link_candidates||{};
   const search=$('candidate-search')!.value.toLocaleLowerCase(), category=$('candidate-category')!.value.toLocaleLowerCase();
@@ -1772,7 +1865,7 @@ function candidateCards() {
   const showDisambiguation=$('candidate-show-disambiguation')!.checked;
   const showRedirects=$('candidate-show-redirects')!.checked;
   const showWithoutConnections=$('candidate-show-without-connections')!.checked;
-  const sorted=orphans.filter(p=>{
+  const sorted=remoteRendering?orphans:orphans.filter(p=>{
     const count=records[pageKey(p)]?.candidate_count;
     const categoryName=orphanCategoryName(p);
     return (showDisambiguation||!specialOrphanCategories.has(categoryName))&&
@@ -1781,15 +1874,15 @@ function candidateCards() {
       p.title.toLocaleLowerCase().includes(search)&&label(p).toLocaleLowerCase().includes(category);
   });
   const order=$('candidate-sort')!.value||'candidates-desc';
-  if(order==='personalized'&&profileScores) {
+  if(!remoteRendering&&order==='personalized'&&profileScores) {
     const counts=(page: PageObservation)=>records[pageKey(page)]?.candidate_count??0;
     sorted.sort((a,b)=>{
       const left=profileScores!.get(pageKey(a)),right=profileScores!.get(pageKey(b));
       return (right?.topic??0)-(left?.topic??0)||(right?.language??0)-(left?.language??0)||
         counts(b)-counts(a)||a.title.localeCompare(b.title)||a.page_id-b.page_id;
     });
-  } else sortArticles(sorted,order==='personalized'?'candidates-desc':order);
-  sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
+  } else if(!remoteRendering)sortArticles(sorted,order==='personalized'?'candidates-desc':order);
+  if(!remoteRendering)sorted.sort((a,b)=>Number(reviewedOnly(a,records[pageKey(a)]))-Number(reviewedOnly(b,records[pageKey(b)])));
   $('candidate-info')!.textContent=candidatePreview&&!showWithoutConnections?t('Caricamento dei collegamenti possibili…'):candidatePreview?
     t('Anteprima: {shown} schede visualizzate. Le altre voci sono in caricamento.',{shown:number(Math.min(candidateLimit,sorted.length))}):
     t('{n} orfane corrispondenti · {shown} schede visualizzate',{n:number(sorted.length),shown:number(Math.min(candidateLimit,sorted.length))});
@@ -2074,11 +2167,13 @@ function selectedEntry(): ManifestEntry | undefined {
 }
 function datasetLinks(entry: ManifestEntry) {
   if($('download')){$('download')!.hidden=false;$('download')!.href='data/'+(entry.kind==='aggregate'?entry.file:entry.file.replace(/\.json$/,'.csv'));}
+  if($('download')&&entry.storage&&entry.kind!=='aggregate')$('download')!.href='api/export?dataset='+encodeURIComponent(entry.file);
   $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
   $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
   $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
 }
 function clearLanguageSelection() {
+  resetRemoteList();
   ++loadVersion;datasetController.abort();
   ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
   ++profileRequestVersion;profileController.abort();profileScores=null;
@@ -2092,6 +2187,7 @@ function clearLanguageSelection() {
   for(const [id,file] of [['articles-link','index.html'],['creators-link','creators.html'],['deorphanize-link','deorphanize.html']] as const)$(id)!.href=file;
 }
 async function load(entry: ManifestEntry) {
+  resetRemoteList();
   closePrompt();
   ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
   const version=++loadVersion;
@@ -2113,7 +2209,7 @@ async function load(entry: ManifestEntry) {
   $('status')!.textContent=t('Caricamento…');
   candidateLimit=25;
   for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
-  if(deorphanizePage)void readCandidatePreview(entry).then(preview=>{
+  if(deorphanizePage&&!entry.storage)void readCandidatePreview(entry).then(preview=>{
     if(!preview||fullReady||version!==loadVersion)return;
     data=preview;datasetFile=entry.file;candidatePreview=true;
     editorialReviews=new Map();reviewsAvailable=false;
@@ -2124,10 +2220,10 @@ async function load(entry: ManifestEntry) {
   });
   let next;
   try {
-    if(entry.summary_file&&!deorphanizePage&&!connectionsPage) {
+    if(entry.summary_file&&!connectionsPage&&(!deorphanizePage||entry.storage)) {
       const summary=await readSummary(entry);
       if(version!==loadVersion)return;
-      precomputedCreators=creatorsPage?await readCreatorIndex(entry,summary):null;
+      precomputedCreators=creatorsPage?(entry.storage?[]:await readCreatorIndex(entry,summary)):null;
       if(version!==loadVersion)return;
       next={metadata:summary.metadata,pages:[],link_candidates:{}};
       precomputed=summary;summaryOnly=true;
@@ -2157,6 +2253,7 @@ async function load(entry: ManifestEntry) {
   lastError=null;
   document.body.dataset.loading='false';
   renderDataset();renderAuth();
+  if(entry.storage&&!connectionsPage)await listHydration;
   if(deorphanizePage)await cardHydration;
   if(version!==loadVersion)return;
   if(deorphanizePage&&authUsername&&!profileContributions){await applyProfile();return;}
@@ -2312,7 +2409,7 @@ for(const id of ['article-search','article-category','article-group','article-so
 $('article-macro')?.addEventListener('change',()=>{articleLimit=25;if(data)articleList();});
 for(const id of ['creator-search','creator-sort']) $(id)?.addEventListener('input',()=>{creatorLimit=25;if(data)creatorList();});
 $('article-classification')?.addEventListener('change',()=>{if(data){$('article-category')!.value='';$('article-macro')!.value='';articleLimit=25;refreshCategoryChoices();articleList();}});
-$('article-more')?.addEventListener('click',()=>{articleLimit+=25;if(summaryOnly)void loadFullArticles();else articleList();});
+$('article-more')?.addEventListener('click',()=>{articleLimit+=25;if(summaryOnly&&!databaseMode())void loadFullArticles();else articleList();});
 $('creator-more')?.addEventListener('click',()=>{creatorLimit+=25;creatorList();});
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>{candidateLimit+=25;candidateCards();});

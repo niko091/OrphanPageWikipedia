@@ -634,6 +634,7 @@ fn return_page(value: &str) -> bool {
 #[derive(Clone)]
 pub struct ReviewApplication {
     web_root: PathBuf,
+    collection_database: PathBuf,
     database: ReviewDatabase,
     oauth: Option<OAuthConfig>,
     sessions: Arc<Mutex<BTreeMap<String, LoginSession>>>,
@@ -642,11 +643,17 @@ pub struct ReviewApplication {
 impl ReviewApplication {
     pub fn new(web_root: PathBuf, database: ReviewDatabase) -> Self {
         Self {
+            collection_database: web_root.join("data/collection.sqlite"),
             web_root,
             database,
             oauth: None,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub fn with_collection_database(mut self, path: PathBuf) -> Self {
+        self.collection_database = path;
+        self
     }
 
     /// OAuth is optional for local anonymous review installations; partial configuration is an error.
@@ -711,6 +718,11 @@ impl ReviewApplication {
     }
 
     fn data_json(&self, relative: &Path, missing: ReviewError) -> ReviewResult<Value> {
+        if self.collection_database.is_file() {
+            return crate::store::Census::open(&self.collection_database)
+                .and_then(|db| db.resource(relative.to_str().unwrap_or("")))
+                .map_err(|_| missing);
+        }
         let path = self.data_file(relative, missing)?;
         let bytes = std::fs::read(path).map_err(|_| ReviewError::unavailable())?;
         serde_json::from_slice(&bytes).map_err(|_| ReviewError::invalid())
@@ -847,10 +859,104 @@ impl ReviewApplication {
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/reviews", any(api))
+            .route("/api/pages", any(page_query))
+            .route("/api/export", any(export_csv))
             .route("/api/auth/{action}", any(auth))
             .fallback(static_file)
             .with_state(Arc::new(self))
     }
+}
+
+async fn page_query(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
+    if request.method() != Method::POST {
+        return ReviewError::new(StatusCode::METHOD_NOT_ALLOWED, "Metodo non consentito")
+            .into_response();
+    }
+    let body = match to_bytes(request.into_body(), 8 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(_) => return ReviewError::invalid().into_response(),
+    };
+    let query: crate::store::PageQuery = match serde_json::from_slice(&body) {
+        Ok(query) => query,
+        Err(_) => return ReviewError::invalid().into_response(),
+    };
+    match tokio::task::spawn_blocking(move || {
+        // Ordering uses the review snapshot explicitly loaded by this browser;
+        // filtering must not silently refresh shared workflow state.
+        crate::store::Census::open(&app.collection_database)
+            .and_then(|db| db.query(&query, &query.closed_pairs))
+    })
+    .await
+    {
+        Ok(Ok(value)) => response(StatusCode::OK, value),
+        _ => ReviewError::invalid().into_response(),
+    }
+}
+
+async fn export_csv(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
+    if request.method() != Method::GET {
+        return ReviewError::new(StatusCode::METHOD_NOT_ALLOWED, "Metodo non consentito")
+            .into_response();
+    }
+    let url = match reqwest::Url::parse(&format!(
+        "http://localhost/?{}",
+        request.uri().query().unwrap_or("")
+    )) {
+        Ok(url) => url,
+        Err(_) => return ReviewError::invalid().into_response(),
+    };
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    if pairs.len() != 1 || pairs[0].0 != "dataset" || !filename(&pairs[0].1) {
+        return ReviewError::invalid().into_response();
+    }
+    let dataset = pairs[0].1.to_string();
+    if app.members(&dataset).is_err() {
+        return ReviewError::invalid().into_response();
+    }
+    struct Download(tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>);
+    impl std::io::Write for Download {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.blocking_send(Ok(bytes.to_vec())).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Download closed")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::with_capacity(65536, Download(sender.clone()));
+        let result = crate::store::Census::open(&app.collection_database)
+            .and_then(|db| db.export_csv(&dataset, &mut writer))
+            .and_then(|_| {
+                writer.flush()?;
+                Ok(())
+            });
+        if result.is_err() {
+            let _ =
+                sender.blocking_send(Err(std::io::Error::other("Esportazione non disponibile")));
+        }
+    });
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|value| (value, receiver))
+    });
+    let mut result = Response::new(Body::from_stream(stream));
+    result.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    result.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_static("attachment; filename=articles.csv"),
+    );
+    result.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    result
 }
 
 fn response(status: StatusCode, value: Value) -> Response {
@@ -1161,6 +1267,32 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
 }
 
 async fn static_file(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
+    if app.collection_database.is_file() && request.uri().path().starts_with("/data/") {
+        if !matches!(*request.method(), Method::GET | Method::HEAD) {
+            return ReviewError::new(StatusCode::METHOD_NOT_ALLOWED, "Metodo non consentito")
+                .into_response();
+        }
+        let path = request.uri().path().trim_start_matches("/data/").to_owned();
+        let head = request.method() == Method::HEAD;
+        return match tokio::task::spawn_blocking(move || {
+            app.data_json(
+                Path::new(&path),
+                ReviewError::new(StatusCode::NOT_FOUND, "Risorsa non disponibile"),
+            )
+        })
+        .await
+        {
+            Ok(Ok(value)) => {
+                let mut result = response(StatusCode::OK, value);
+                if head {
+                    *result.body_mut() = Body::empty();
+                }
+                result
+            }
+            Ok(Err(error)) => error.into_response(),
+            Err(_) => ReviewError::unavailable().into_response(),
+        };
+    }
     match serve_file(&app.web_root, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -1245,6 +1377,15 @@ pub fn serve(
     bind: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let ReviewDatabase::Sqlite(path) = &app.database {
+        if crate::dumps::resolved_path(path)?
+            == crate::dumps::resolved_path(&app.collection_database)?
+        {
+            return Err(
+                "Il database editoriale deve essere separato dalla raccolta scientifica".into(),
+            );
+        }
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
