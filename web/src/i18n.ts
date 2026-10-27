@@ -178,7 +178,7 @@ const translations: Record<string, string> = {
   "Non ancora valutata": "Not reviewed yet",
   "Valutazione condivisa: {status}": "Shared review: {status}",
   "Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.": "Shared user reviews; not automatically verified on Wikipedia.",
-  "Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; Non fixato la mantiene attiva.": "Review each pair. Fixed and Bad link exclude it from future prompts; Not fixed keeps it active.",
+  "Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; riclicca la valutazione selezionata per annullarla.": "Review each pair. Fixed and Bad link exclude it from future prompts; click the selected review again to clear it.",
   "Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.": "Shared reviews are unavailable. Close and reload the page to try again.",
   "Salvataggio…": "Saving…",
   "Un altro utente ha aggiornato questa coppia. Controlla lo stato e riprova.": "Another user updated this pair. Check its status and try again.",

@@ -223,12 +223,12 @@ test('article search, filtering, sorting and pagination', async ({page, site}) =
   await expect(page.locator('#article-rows tr').first()).toContainText(title(32));
 });
 
-test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic}) => {
-  await open(page, site, 'connections.html');
+test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic},testInfo) => {
+  await open(page, site, 'deorphanize.html');
   expect(traffic.editorial).toEqual([]);
   await page.locator('#llm-provider').selectOption('mistral');
   expect(traffic.editorial).toEqual([]);
-  await page.getByRole('button', {name: 'Fix this', exact: true}).click();
+  await page.locator('#candidate-cards button.fix-link').first().click();
   await expect(page.locator('#llm-prompt')).toBeVisible();
   await expect(page.locator('#llm-prompt-copy')).toBeEnabled();
   expect(traffic.editorial).toHaveLength(4);
@@ -243,16 +243,29 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await expect(page.locator('#llm-prompt')).not.toBeVisible();
   await expect(page.locator('#llm-prompt-text')).toHaveValue('');
   await expect(page.locator('#review-rows .review-row')).toHaveCount(1);
+  await expect(page.locator('#review-rows button')).toHaveCount(2);
+  await expect(page.getByRole('button', {name: 'Non fixato', exact: true})).toHaveCount(0);
+  for(const width of [1280,390])for(const theme of ['light','dark']) {
+    await page.setViewportSize({width,height:844});
+    await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+    await expect(page.locator('#review-close')).toBeInViewport();
+    await page.locator('#review-dialog').screenshot({path:testInfo.outputPath(`review-${width}-${theme}.png`)});
+  }
   await page.getByRole('button', {name: 'Fixato', exact: true}).click();
   await expect(page.getByRole('button', {name: 'Fixato', exact: true})).toHaveAttribute('aria-pressed', 'true');
   await page.locator('#review-close').click();
-  await page.reload();
+  await open(page, site, 'connections.html');
   await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toHaveCount(0);
   await page.getByRole('button', {name: 'Valuta coppia', exact: true}).click();
-  await page.getByRole('button', {name: 'Non fixato', exact: true}).click();
-  await expect(page.getByRole('button', {name: 'Non fixato', exact: true})).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', {name: 'Fixato', exact: true}).click();
+  await expect(page.locator('#review-rows button[aria-pressed="true"]')).toHaveCount(0);
+  await page.getByRole('button', {name: 'Bad link', exact: true}).click();
+  await expect(page.getByRole('button', {name: 'Bad link', exact: true})).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', {name: 'Bad link', exact: true}).click();
+  await expect(page.locator('#review-rows button[aria-pressed="true"]')).toHaveCount(0);
   await page.locator('#review-close').click();
+  await page.reload();
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
   expect(traffic.editorial).toHaveLength(4);
   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('Testo sintetico');

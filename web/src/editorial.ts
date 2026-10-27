@@ -147,7 +147,7 @@ function renderReviewDialog(message='') {
   const context=reviewContext;
   const box=$('review-rows')!;box.replaceChildren();
   $('review-dialog-status')!.textContent=message||t(editorialContext.authEnabled!==false&&!editorialContext.authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
-    'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; Non fixato la mantiene attiva.':
+    'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; riclicca la valutazione selezionata per annullarla.':
     'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.');
   for(const source of reviewContext.sources) {
     const row=element('article',null,'review-row');
@@ -155,7 +155,7 @@ function renderReviewDialog(message='') {
     const review=editorialReviews.get(reviewKey(reviewContext.language,source.page_id,reviewContext.target_id));
     row.append(review?reviewBadge(review):element('p',t('Non ancora valutata')));
     const actions=element('div',null,'review-actions');
-    for(const status of ['fixed','not_fixed','bad_link'] as const) {
+    for(const status of ['fixed','bad_link'] as const) {
       const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||editorialContext.authEnabled!==false&&!editorialContext.authUsername;
       button.setAttribute('aria-pressed',String(review?.status===status));
       button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
@@ -167,18 +167,19 @@ export function showReview(context: ReviewContext) {
   closePrompt();reviewContext=context;
   renderReviewDialog();$('review-dialog')!.showModal();
 }
-async function saveReview(context: ReviewContext,source: {page_id: number; title: string},status: ReviewStatus) {
+async function saveReview(context: ReviewContext,source: {page_id: number; title: string},status: 'fixed' | 'bad_link') {
   if(reviewSaving||!reviewsAvailable||context!==reviewContext||editorialContext.authEnabled!==false&&!editorialContext.authUsername)return;
   ++reviewReadVersion;
   const version=reviewVersion,key=reviewKey(context.language,source.page_id,context.target_id);
   const current=editorialReviews.get(key);
+  const nextStatus=current?.status===status?'not_fixed':status;
   const controller=new AbortController();reviewSaveController=controller;reviewSaving=true;renderReviewDialog(t('Salvataggio…'));
   const timer=setTimeout(()=>controller.abort(),8000);
   let message='';
   try {
     const response=await fetch('api/reviews',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:context.dataset,language:context.language,
-        source_id:source.page_id,target_id:context.target_id,status,version:current?.version??0})});
+        source_id:source.page_id,target_id:context.target_id,status:nextStatus,version:current?.version??0})});
     const payload: unknown=await response.json();
     if(version!==reviewVersion||context!==reviewContext)return;
     if(response.status===401){await editorialContext.loadAuth();message=t('Accedi con Wikipedia per salvare la valutazione');return;}

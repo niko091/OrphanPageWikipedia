@@ -192,6 +192,34 @@ await test('missing shared review state is an error, not an anonymous empty snap
   await assert.rejects(editorial.loadSharedReviews(),/Valutazioni condivise non disponibili/);
   assert.equal(editorial.reviewsAvailable,false);respond=localResponse;
 });
+await test('review buttons toggle either selection off and preserve shared versions and prompt eligibility',async()=>{
+  const prepared=request(),context=prepared.review;assert(context);
+  const source=context.sources[0];let version=0;
+  respond=async()=>new Response(JSON.stringify({format:'editorial_reviews_v1',reviews:[]}));
+  await editorial.loadSharedReviews();editorial.showReview(context);
+  const buttons=()=>node('review-rows').children[0].children.at(-1)!.children;
+  assert.deepEqual(buttons().map(button=>button.textContent),['Fixato','Bad link']);
+  const sequence=['fixed','fixed','bad_link','fixed','fixed','bad_link','bad_link'] as const;
+  const expected=['fixed','not_fixed','bad_link','fixed','not_fixed','bad_link','not_fixed'];
+  for(const [index,status] of sequence.entries()) {
+    respond=async(url,init)=>{
+      assert.equal(url,'api/reviews');assert.equal(init?.method,'POST');
+      const body:unknown=JSON.parse(String(init.body));assert(record(body));
+      assert.equal(body.status,expected[index]);assert.equal(body.version,version);
+      assert.equal(body.source_id,source.page_id);assert.equal(body.target_id,context.target_id);
+      return new Response(JSON.stringify({review:{...body,version:++version,updated_at:'2026-10-01T00:00:00Z'}}));
+    };
+    buttons()[status==='fixed'?0:1].listeners.get('click')!();
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    assert.equal(version,index+1);
+    const closed=expected[index]!=='not_fixed';
+    assert.equal(editorial.closedEdge(dataset.pages[0],source.page_id),closed);
+    assert.equal(editorial.fixRequest(dataset.pages[0],recordFor(1))===null,closed);
+    assert.deepEqual(buttons().map(button=>button.attributes.get('aria-pressed')),
+      [String(expected[index]==='fixed'),String(expected[index]==='bad_link')]);
+  }
+  editorial.closeReview();editorial.resetReviews();respond=localResponse;
+});
 await test('malformed predicted topic labels are errors, not missing observations',async()=>{
   profile.clearProfileCache();
   respond=async(url,init)=>{
