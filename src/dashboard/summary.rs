@@ -295,16 +295,19 @@ impl SummaryAccumulator {
                     (page.orphan, value)
                 })
                 .collect();
-            numeric_reports.insert(
-                field.to_owned(),
-                numeric(NumericInput {
-                    rows,
-                    logarithmic: field == "length_bytes"
-                        || (field.starts_with("creator_")
-                            && field != "creator_continuity_months_before_creation"),
-                    age: field == "age_days",
-                }),
-            );
+            let input = NumericInput {
+                rows,
+                logarithmic: field == "length_bytes"
+                    || (field.starts_with("creator_")
+                        && field != "creator_continuity_months_before_creation"),
+                age: field == "age_days",
+            };
+            let report = if field == "creator_continuity_months_before_creation" {
+                numeric::continuity(input)?
+            } else {
+                numeric(input)
+            };
+            numeric_reports.insert(field.to_owned(), report);
         }
         let report = DashboardSummary {
             overview: overview(

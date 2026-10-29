@@ -93,7 +93,11 @@ export interface NumericGroup {
   total: number; known: number; missing: number; median: number | null;
   counts: number[]; percentages: (number | null)[]; cumulative: [number, number][];
 }
-export interface NumericReport { known: number; available: boolean; groups: NumericGroup[]; count_max: number; bin_edges: number[]; ticks: number[]; cumulative_ticks: number[]; }
+export interface NumericReport {
+  known: number; available: boolean; groups: NumericGroup[]; count_max: number;
+  bin_edges: number[]; ticks: number[]; cumulative_ticks: number[];
+  month_histogram?: {rule: 'months_0_12_overflow_v1'; through: 12; count_max: number; groups: {counts: number[]; percentages: (number | null)[]}[]};
+}
 export interface OriginsReport { origins: CategoryReportRow[]; bots: CategoryReportRow[]; known_bots: number; }
 export interface OverviewReport {
   total: number; orphans: number; percent: number | null; dead_ends: number;

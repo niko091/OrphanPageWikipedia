@@ -152,6 +152,67 @@ fn histogram_groups_both_tails_without_losing_observations() {
     assert_eq!(report.cumulative_ticks[4], 100.0);
 }
 #[test]
+fn continuity_shows_each_month_and_keeps_the_complete_tail_and_missing_denominators() {
+    let rows = vec![
+        (true, Some(0.0)),
+        (true, Some(1.0)),
+        (true, Some(2.0)),
+        (true, Some(12.0)),
+        (true, Some(13.0)),
+        (true, Some(113.0)),
+        (true, None),
+        (false, Some(0.0)),
+        (false, Some(3.0)),
+        (false, Some(24.0)),
+    ];
+    let input = || NumericInput {
+        rows: rows.clone(),
+        logarithmic: false,
+        age: false,
+    };
+    let ordinary = numeric(input());
+    let report = numeric::continuity(input()).unwrap();
+    let months = report.month_histogram.as_ref().unwrap();
+    assert_eq!(
+        months.groups[0].counts,
+        vec![1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+    );
+    assert_eq!(
+        months.groups[1].counts,
+        vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    );
+    assert_eq!(months.groups[0].percentages[13], Some(200.0 / 7.0));
+    for index in 0..2 {
+        assert_eq!(
+            months.groups[index].counts.iter().sum::<usize>(),
+            report.groups[index].known
+        );
+        assert_eq!(
+            report.groups[index].cumulative,
+            ordinary.groups[index].cumulative
+        );
+        assert_eq!(report.groups[index].median, ordinary.groups[index].median);
+        assert_eq!(report.groups[index].missing, ordinary.groups[index].missing);
+    }
+    assert_eq!(report.cumulative_ticks[4], 113.0);
+    assert!(numeric::continuity(NumericInput {
+        rows: vec![(true, Some(1.5))],
+        logarithmic: false,
+        age: false
+    })
+    .is_err());
+    let empty = numeric::continuity(NumericInput {
+        rows: vec![(true, None)],
+        logarithmic: false,
+        age: false,
+    })
+    .unwrap();
+    assert!(empty.month_histogram.unwrap().groups[1]
+        .percentages
+        .iter()
+        .all(Option::is_none));
+}
+#[test]
 fn numeric_empty_groups_have_no_percentages_or_fabricated_values() {
     let report = numeric(NumericInput {
         rows: vec![(true, None)],

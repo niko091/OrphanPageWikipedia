@@ -25,6 +25,69 @@ pub(super) struct NumericReport {
     pub(super) bin_edges: Vec<f64>,
     pub(super) ticks: Vec<f64>,
     pub(super) cumulative_ticks: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) month_histogram: Option<MonthHistogram>,
+}
+#[derive(Serialize)]
+pub(crate) struct MonthHistogram {
+    pub(super) rule: &'static str,
+    pub(super) through: usize,
+    pub(super) count_max: usize,
+    pub(super) groups: [MonthGroup; 2],
+}
+impl MonthHistogram {
+    pub(crate) fn from_counts(counts: [Vec<usize>; 2], totals: [usize; 2]) -> Self {
+        let count_max = counts
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .div_ceil(4)
+            .max(1)
+            * 4;
+        let [first, second] = counts;
+        let group = |counts: Vec<usize>, total| MonthGroup {
+            percentages: counts
+                .iter()
+                .map(|&count| percentage(count, total))
+                .collect(),
+            counts,
+        };
+        Self {
+            rule: "months_0_12_overflow_v1",
+            through: 12,
+            count_max,
+            groups: [group(first, totals[0]), group(second, totals[1])],
+        }
+    }
+}
+#[derive(Serialize)]
+pub(super) struct MonthGroup {
+    pub(super) counts: Vec<usize>,
+    pub(super) percentages: Vec<Option<f64>>,
+}
+
+// Continuity is a discrete count of completed months. Keep short runs separate
+// and retain every longer run in an explicit overflow category. The original
+// full-range cumulative report and all denominators are unchanged.
+pub(super) fn continuity(input: NumericInput) -> Result<NumericReport, String> {
+    let through = 12;
+    let mut counts = [vec![0; through + 2], vec![0; through + 2]];
+    for &(orphan, value) in &input.rows {
+        if let Some(value) = measured(value) {
+            if value.fract() != 0.0 {
+                return Err("continuity must be a whole number of completed months".into());
+            }
+            counts[usize::from(!orphan)][value.min((through + 1) as f64) as usize] += 1;
+        }
+    }
+    let mut report = numeric(input);
+    report.month_histogram = Some(MonthHistogram::from_counts(
+        counts,
+        report.groups.each_ref().map(|group| group.total),
+    ));
+    Ok(report)
 }
 pub(super) fn combined_rank(left: &[f64], right: &[f64], rank: usize) -> f64 {
     let (mut a, mut b, mut selected) = (0, 0, 0.0);
@@ -151,6 +214,7 @@ pub(super) fn numeric(input: NumericInput) -> NumericReport {
         .unwrap_or(1)
         .max(1);
     NumericReport {
+        month_histogram: None,
         known: groups.iter().map(|g| g.known).sum(),
         available,
         groups,

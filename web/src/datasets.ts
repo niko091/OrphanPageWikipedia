@@ -68,6 +68,14 @@ export async function readSummary(entry: ManifestEntry,signal?: AbortSignal): Pr
     const report=summary.reports.numeric[key];
     if(!report||!Array.isArray(report.groups)||report.groups.length!==2)throw new Error('Riepilogo non valido');
   }
+  const months=summary.reports.numeric.creator_continuity_months_before_creation.month_histogram;
+  if(months&&(months.rule!=='months_0_12_overflow_v1'||months.through!==12||!Array.isArray(months.groups)||months.groups.length!==2||
+    !Number.isSafeInteger(months.count_max)||months.count_max<1||
+    months.groups.some(group=>!Array.isArray(group.counts)||group.counts.length!==14||
+      group.counts.some(value=>!Number.isSafeInteger(value)||value<0)||
+      !Array.isArray(group.percentages)||group.percentages.length!==14||
+      group.percentages.some(value=>value!==null&&(!Number.isFinite(value)||value<0||value>100)))))
+    throw new Error('Riepilogo della continuità non valido.');
   return summary;
 }
 

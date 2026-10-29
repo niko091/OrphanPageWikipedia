@@ -1,6 +1,58 @@
 use super::*;
 
 impl Census {
+    // Existing immutable collections retain their original summaries. Prepare
+    // only the additional discrete display from relational observations, with
+    // bounded SQL aggregation and the same Rust denominator calculation.
+    fn continuity_summary(&self, summary: &mut Value) -> DumpResult<()> {
+        const FIELD: &str = "creator_continuity_months_before_creation";
+        if summary["format"] != "dashboard_summary_v1"
+            || summary["reports"]["numeric"][FIELD]["month_histogram"].is_object()
+        {
+            return Ok(());
+        }
+        let mut counts = [vec![0usize; 14], vec![0usize; 14]];
+        let mut totals = [0usize; 2];
+        for source in summary["sources"]
+            .as_array()
+            .ok_or("Fonti del riepilogo mancanti")?
+        {
+            let language = source["language"]
+                .as_str()
+                .ok_or("Lingua della fonte mancante")?;
+            let mut query = self.db.prepare(
+                "SELECT orphan,CASE WHEN json_extract(data,'$.creator_continuity_months_before_creation')>12 THEN 13 ELSE json_extract(data,'$.creator_continuity_months_before_creation') END,count(*),sum(json_extract(data,'$.creator_continuity_months_before_creation') != CAST(json_extract(data,'$.creator_continuity_months_before_creation') AS INTEGER)) FROM pages WHERE language=? GROUP BY 1,2",
+            )?;
+            let mut rows = query.query([language])?;
+            while let Some(row) = rows.next()? {
+                let group = usize::from(!row.get::<_, bool>(0)?);
+                let count = row.get::<_, usize>(2)?;
+                totals[group] += count;
+                if row.get::<_, Option<usize>>(3)?.unwrap_or(0) > 0 {
+                    return Err("Continuità non espressa in mesi interi".into());
+                }
+                if let Some(month) = row
+                    .get::<_, Option<f64>>(1)?
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                {
+                    counts[group][month as usize] += count;
+                }
+            }
+        }
+        let report = &mut summary["reports"]["numeric"][FIELD];
+        for group in 0..2 {
+            if report["groups"][group]["total"].as_u64() != Some(totals[group] as u64)
+                || report["groups"][group]["known"].as_u64()
+                    != Some(counts[group].iter().sum::<usize>() as u64)
+            {
+                return Err("Copertura della continuità non corrispondente".into());
+            }
+        }
+        report["month_histogram"] = serde_json::to_value(
+            crate::dashboard::MonthHistogram::from_counts(counts, totals),
+        )?;
+        Ok(())
+    }
     pub(super) fn record(&self, language: &str, id: i64, short: bool) -> DumpResult<Value> {
         let stored: Option<String> = self
             .db
@@ -56,7 +108,9 @@ impl Census {
             })
             .optional()?;
         if let Some(value) = direct {
-            return Ok(serde_json::from_str(&value)?);
+            let mut value = serde_json::from_str(&value)?;
+            self.continuity_summary(&mut value)?;
+            return Ok(value);
         }
         for entry in self.manifest()?.as_array().ok_or("Manifest non valido")? {
             if entry["kind"] == "aggregate" {

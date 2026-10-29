@@ -6,6 +6,27 @@ interface ChartContext {
  readonly topicDisplayNames: Map<string,string>;
  creatorMode: () => 'observed' | 'history' | 'missing';
 }
+function readableTicks(minimum: number, maximum: number, logarithmic: boolean, limit: number): number[] {
+  if(maximum===minimum)return [minimum];
+  if(logarithmic&&Math.log10((maximum+1)/(minimum+1))>2) {
+    const ticks=minimum===0?[0]:[];
+    for(let exponent=Math.floor(Math.log10(Math.max(1,minimum)));exponent<=Math.ceil(Math.log10(maximum));exponent++) {
+      const value=10**exponent;
+      if(value>=minimum&&value<=maximum)ticks.push(value);
+    }
+    return ticks;
+  }
+  const interval=(maximum-minimum)/(limit-1);
+  const magnitude=10**Math.floor(Math.log10(interval));
+  const steps=[1,2,5,10],index=steps.findIndex(value=>value*magnitude>=interval);
+  let step=steps[index]*magnitude;
+  // A narrow range can fall between two round multiples. Keep at least two
+  // references when possible; the renderer still prevents label collisions.
+  if(Math.floor(maximum/step)-Math.ceil(minimum/step)+1<2)step=index===0?magnitude/2:steps[index-1]*magnitude;
+  const ticks: number[]=[];
+  for(let index=Math.ceil(minimum/step);index*step<=maximum;index++)ticks.push(index*step);
+  return ticks;
+}
 export function createCharts(context: ChartContext) {
 function featureBars(id: string, summary: FeatureSummary, count=false) {
   const box=$(id)!;box.replaceChildren();
@@ -81,8 +102,13 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   const width=Math.max(260, box.clientWidth || 900), height=width<600?380:520;
   const left=64, right=24, top=32, bottom=height-76;
   const plotWidth=width-left-right, plotHeight=bottom-top;
-  const binCount=20,bins=groups.map(group=>group.counts),groupedTails=Array.isArray(report.cumulative_ticks);
-  const yMax=mode==='count'?report.count_max:100;
+  const months=histogram&&field==='creator_continuity_months_before_creation'?report.month_histogram:undefined;
+  if(histogram&&field==='creator_continuity_months_before_creation'&&!months) {
+    box.append(element('p',t('Grafico della continuità non disponibile: aggiornare e riavviare il servizio dashboard.')));
+    return report;
+  }
+  const binCount=months?months.through+2:20,bins=(months?.groups??groups).map(group=>group.counts),groupedTails=Array.isArray(report.cumulative_ticks);
+  const yMax=mode==='count'?(months?.count_max??report.count_max):100;
   const chartLabel=t(percent?'Percentuale del gruppo per intervallo':histogram?'Numero di pagine per intervallo':'Percentuale cumulativa per gruppo');
   const svg = svgNode('svg', {viewBox:`0 0 ${width} ${height}`, role:'img', 'aria-label':`${chartLabel}: ${field}`});
   svg.append(svgNode('text',{x:left,y:18,fill:'var(--text)','font-size':16},mode==='count'?t('Numero di pagine'):t('% di voci del gruppo')));
@@ -96,9 +122,9 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
       if(percent && totals[group]===0)return;
       const lo=report.bin_edges[bin],hi=report.bin_edges[bin+1];
       const boundary=(value: number)=>new Intl.NumberFormat(locale(),{maximumSignificantDigits:6}).format(value);
-      const value=percent?groups[group].percentages[bin]:count;
+      const value=percent?(months?.groups??groups)[group].percentages[bin]:count;
       if(value===null)return;
-      const range=groupedTails&&bin===0?`<${boundary(hi)}`:groupedTails&&bin===binCount-1?`>${boundary(lo)}`:
+      const range=months?(bin>months.through?`>${months.through}`:String(bin)):groupedTails&&bin===0?`<${boundary(hi)}`:groupedTails&&bin===binCount-1?`>${boundary(lo)}`:
         `[${boundary(lo)}, ${boundary(hi)}${bin===(groupedTails?binCount-2:binCount-1)?']':')'}`;
       const description=`${t(group===0?'Orfane':'Non orfane')} · ${range} ${unit}: ${percent?`${number(value)}% (${count}/${totals[group]} ${t('pagine del gruppo')})`:`${count} ${t('pagine')}`}`;
       const bar=svgNode('rect',{x:left+bin*binWidth+binWidth*0.06+group*barWidth,y:bottom-value/yMax*plotHeight,width:barWidth,height:value/yMax*plotHeight,fill:group===0?'var(--orange)':'var(--teal)','aria-label':description});
@@ -111,16 +137,37 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
     for(const [x,y] of group.cumulative)path+=` H${left+x*plotWidth} V${bottom-y*plotHeight}`;
     svg.append(svgNode('path',{d:path,stroke:index===0?'var(--orange)':'var(--teal)',fill:'none','stroke-width':3}));
   });
-  const positions=width<600?[0,2,4]:[0,1,2,3,4];
-  for(const index of positions) {
-    const original=(histogram?report.ticks:report.cumulative_ticks)[index];
-    const value=field==='length_bytes'?new Intl.NumberFormat(locale(),{notation:'compact',maximumFractionDigits:1}).format(original):number(original);
-    const tick=histogram&&groupedTails&&index===0?`<${value}`:histogram&&groupedTails&&index===4?`>${value}`:value;
-    const x=histogram&&groupedTails?(1+index*18/4)/20:index/4;
-    svg.append(svgNode('text',{x:left+x*plotWidth,y:bottom+30,'text-anchor':index===0?'start':index===4?'end':'middle',fill:'var(--muted)','font-size':16},tick));
+  const axis=histogram?report.ticks:report.cumulative_ticks;
+  if(months) {
+    for(let bin=0;bin<binCount;bin++) {
+      if(width<600&&bin<=months.through&&bin%4!==0)continue;
+      if(width<600&&bin===months.through)continue;
+      const label=bin>months.through?`>${months.through}`:String(bin);
+      svg.append(svgNode('text',{x:left+(bin+0.5)/binCount*plotWidth,y:bottom+30,'text-anchor':'middle',fill:'var(--muted)','font-size':16},label));
+    }
+  } else {
+    // Round display references only. Keep the prepared bins and percentile
+    // cutoffs intact, positioning each label at its actual value on the axis.
+    const logarithmic=field==='length_bytes'||(id.startsWith('creator_')&&field!=='creator_continuity_months_before_creation');
+    const transform=(value: number)=>logarithmic?Math.log1p(value):value;
+    const minimum=axis[0],maximum=axis[4],span=transform(maximum)-transform(minimum);
+    let previousRight=-Infinity;
+    for(const value of readableTicks(minimum,maximum,logarithmic,width<600?3:5)) {
+      const fraction=span===0?0.5:(transform(value)-transform(minimum))/span;
+      const x=left+(histogram&&groupedTails?(1+fraction*18)/20:fraction)*plotWidth;
+      const label=number(value),labelWidth=label.length*9;
+      const anchor=x-labelWidth/2<left?'start':x+labelWidth/2>width-right?'end':'middle';
+      const labelLeft=anchor==='start'?x:anchor==='end'?x-labelWidth:x-labelWidth/2;
+      if(labelLeft<previousRight+12)continue;
+      previousRight=labelLeft+labelWidth;
+      svg.append(svgNode('line',{x1:x,x2:x,y1:bottom,y2:bottom+6,stroke:'var(--muted)'}),
+        svgNode('text',{x,y:bottom+30,'text-anchor':anchor,fill:'var(--muted)','font-size':16},label));
+    }
   }
   svg.append(svgNode('text',{x:left+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel || (field==='age_days'?t('Età (anni)'):t('Lunghezza (byte, scala logaritmica)'))));
   box.append(svg);
+  if(months)box.append(element('p',t('Ogni barra mostra un singolo mese da 0 a 12; l’ultima raggruppa tutti i valori oltre 12 mesi. Nessuna osservazione disponibile è esclusa.')));
+  else if(histogram&&groupedTails)box.append(element('p',t('Le barre alle estremità raggruppano i valori sotto il 2° e sopra il 98° percentile; gli intervalli esatti sono nei dettagli delle barre.')));
   const orphanMedian=groups[0].median,otherMedian=groups[1].median;
   box.append(element('p',t('Mediana orfane: {a} {unit} (n={n}) · Non orfane: {b} {unit} (n={m})',{a:number(orphanMedian),b:number(otherMedian),unit,n:groups[0].known,m:groups[1].known})));
   const legend=element('div',null,'legend');
@@ -194,7 +241,7 @@ function historyCharts() {
   $('history-section')!.hidden=!available;
   if(!available)return;
   const report=distribution('creator_continuity_months_before_creation-chart',
-    'creator_continuity_months_before_creation','Mesi consecutivi',null);
+    'creator_continuity_months_before_creation','Mesi consecutivi',t('Mesi consecutivi'));
   $('creator_continuity_months_before_creation-note')!.textContent=t(
     'Adattamento della stabilità Vital Signs: mesi completi consecutivi prima della creazione con almeno cinque modifiche. Sono escluse le modifiche nel mese di creazione. Cronologia pubblica ricostruita; disponibile per {n}/{total} voci.',
     {n:number(report.known),total:number(context.precomputed.census_page_count)});

@@ -41,6 +41,7 @@ impl Fixture {
                 "category":if id==2&&language=="vec"{"Páginas de desambiguação"}else if id==2{"Paginas de desambiguac\u{0327}a\u{0303}o"}else if id==3{"Redireccions"}else{"Musica"},"length_bytes":if id==1{None}else{Some(id*10)},
                 "created_at":if id==60{Some("2026-10-01T00:00:00+02:00")}else if id==61{Some("2026-09-30T23:00:00Z")}else{None},
                 "topic_status":if id==1{"missing"}else{"predicted"},"topic_labels":if id==1{Value::Null}else if id==2{json!([])}else if id==61{json!(["Culture.Media.Music","STEM.STEM*"])}else if id%2==1{json!(["Culture.Media.Music"])}else{json!(["STEM.STEM*"])},
+                "creator_continuity_months_before_creation":if id==1{None}else{Some(if id==102{113}else{id%14})},
                 "history_creator_key":format!("local-{}",id%4),"quality_score":if id==1{None}else{Some(0.5)}})).collect::<Vec<_>>();
             let mut records = serde_json::Map::new();
             for id in 1..=61 {
@@ -102,6 +103,48 @@ impl Fixture {
     fn request(&self, kind: &str) -> PageQuery {
         serde_json::from_value(json!({"dataset":self.entries[0]["file"],"kind":kind,"group":"all","missing_category":"Senza categoria idonea","missing_topics":"Temi non disponibili","empty_topics":"Nessun tema sopra soglia"})).unwrap()
     }
+}
+
+#[test]
+fn older_collections_gain_the_discrete_continuity_view_without_rewriting_the_database() {
+    let w = Fixture::new("20261001");
+    let mut expected = Vec::new();
+    for entry in w.entries.as_array().unwrap() {
+        let path = w.root.join(entry["summary_file"].as_str().unwrap());
+        let mut summary: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let report =
+            &mut summary["reports"]["numeric"]["creator_continuity_months_before_creation"];
+        let months = report
+            .as_object_mut()
+            .unwrap()
+            .remove("month_histogram")
+            .unwrap();
+        expected.push((
+            entry["summary_file"].as_str().unwrap().to_owned(),
+            months,
+            report.clone(),
+        ));
+        write(&path, &summary);
+    }
+    w.publish();
+    let before = fs::read(w.db()).unwrap();
+    let census = Census::open(&w.db()).unwrap();
+    for (path, expected_months, original_report) in expected {
+        let mut summary = census.resource(&path).unwrap();
+        let report =
+            &mut summary["reports"]["numeric"]["creator_continuity_months_before_creation"];
+        assert_eq!(
+            report
+                .as_object_mut()
+                .unwrap()
+                .remove("month_histogram")
+                .unwrap(),
+            expected_months
+        );
+        assert_eq!(*report, original_report);
+    }
+    census.verify().unwrap();
+    assert_eq!(fs::read(w.db()).unwrap(), before);
 }
 
 #[test]

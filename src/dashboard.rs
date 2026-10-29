@@ -5,6 +5,8 @@
 mod profiles;
 use profiles::{measured, median, percentage, profiles, Profiles, Taxonomy};
 mod numeric;
+#[cfg(feature = "cli")]
+pub(crate) use numeric::MonthHistogram;
 use numeric::{numeric, NumericInput, NumericReport};
 mod categories;
 use categories::{category_counts, CategoryRow};

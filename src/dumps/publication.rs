@@ -7,7 +7,7 @@ use super::{
 };
 
 #[cfg(feature = "cli")]
-pub(super) const TRANSPORT_RULE: &str = "dashboard_transports_v3";
+pub(super) const TRANSPORT_RULE: &str = "dashboard_transports_v4";
 
 #[cfg(feature = "cli")]
 pub(super) struct PreparedDirectory {

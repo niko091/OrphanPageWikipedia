@@ -1,4 +1,8 @@
 const translations: Record<string, string> = {
+  "Ogni barra mostra un singolo mese da 0 a 12; l’ultima raggruppa tutti i valori oltre 12 mesi. Nessuna osservazione disponibile è esclusa.": "Each bar shows a single month from 0 to 12; the last groups all values above 12 months. No available observations are excluded.",
+  "Grafico della continuità non disponibile: aggiornare e riavviare il servizio dashboard.": "Continuity chart unavailable: update and restart the dashboard service.",
+  "Riepilogo della continuità non valido.": "Invalid continuity summary.",
+  "Le barre alle estremità raggruppano i valori sotto il 2° e sopra il 98° percentile; gli intervalli esatti sono nei dettagli delle barre.": "The end bars group values below the 2nd and above the 98th percentile; exact ranges are in the bar details.",
   "Informazioni sul progetto": "Project information",
   "Repository GitHub": "GitHub repository",
   "Licenza MIT": "MIT license",

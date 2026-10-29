@@ -142,6 +142,94 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   expect(traffic.editorial).toEqual([]);
 });
 
+test('article chart references stay readable in both languages and themes',async({page,site},testInfo)=>{
+  await open(page,site,'index.html');
+  for(const width of [1280,390])for(const theme of ['light','dark']) {
+    await page.setViewportSize({width,height:844});
+    await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+    for(const mode of ['percent','cumulative']) {
+      await page.locator('#chart-type').selectOption(mode);
+      for(const id of ['age','length']) {
+        const chart=page.locator('#'+id);await chart.scrollIntoViewIfNeeded();
+        const labels=await chart.locator('svg text').evaluateAll(nodes=>nodes.filter(node=>node.getAttribute('y')===
+          String(Number(node.closest('svg')!.getAttribute('viewBox')!.split(' ')[3])-76+30)).map(node=>{
+            const bounds=node.getBoundingClientRect();return {text:node.textContent,left:bounds.left,right:bounds.right};
+          }));
+        expect(labels.length).toBeGreaterThan(id==='length'?1:0);
+        expect(new Set(labels.map(label=>label.text)).size).toBe(labels.length);
+        const bounds=await chart.boundingBox();assert(bounds);
+        for(const label of labels) {
+          expect(label.left).toBeGreaterThanOrEqual(bounds.x-1);expect(label.right).toBeLessThanOrEqual(bounds.x+bounds.width+1);
+        }
+        if(mode==='percent')await expect(chart).toContainText('Le barre alle estremità');
+        else await expect(chart.locator('svg path')).toHaveCount(2);
+        await chart.screenshot({path:testInfo.outputPath(`${id}-${mode}-${width}-${theme}.png`)});
+      }
+    }
+  }
+  await page.locator('#ui-language-toggle').click();
+  await page.locator('#chart-type').selectOption('percent');
+  await expect(page.locator('#age')).toContainText('The end bars group values');
+  await expect(page.locator('#length')).toContainText('Length (bytes, logarithmic scale)');
+});
+
+test('creator chart references stay readable at desktop and mobile widths',async({page,site},testInfo)=>{
+  await open(page,site,'creators.html');
+  for(const width of [1280,390])for(const theme of ['light','dark']) {
+    await page.setViewportSize({width,height:844});
+    await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+    // Changing mode redraws the chart using the current available width.
+    await page.locator('#chart-type').selectOption('cumulative');
+    await page.locator('#chart-type').selectOption('percent');
+    const chart=page.locator('#creator_tenure_days-chart');
+    await chart.scrollIntoViewIfNeeded();
+    const labels=await chart.locator('svg text').evaluateAll(nodes=>nodes.filter(node=>node.getAttribute('y')===
+      String(Number(node.closest('svg')!.getAttribute('viewBox')!.split(' ')[3])-76+30)).map(node=>{
+        const bounds=node.getBoundingClientRect();return {text:node.textContent,left:bounds.left,right:bounds.right};
+      }));
+    expect(labels.map(label=>label.text)).toEqual(['10']);
+    for(const label of labels) {
+      expect(label.left).toBeGreaterThanOrEqual(0);expect(label.right).toBeLessThanOrEqual(width);
+    }
+    await chart.screenshot({path:testInfo.outputPath(`creator-axis-${width}-${theme}.png`)});
+  }
+  await page.locator('#ui-language-toggle').click();
+  await expect(page.locator('#creator_tenure_days-chart')).toContainText('The end bars group values');
+});
+
+test('continuity shows individual months and a complete overflow category',async({page,site},testInfo)=>{
+  await open(page,site,'creators.html');
+  const chart=page.locator('#creator_continuity_months_before_creation-chart');
+  for(const width of [1280,390])for(const theme of ['light','dark']) {
+    await page.setViewportSize({width,height:844});
+    await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+    await page.locator('#chart-type').selectOption('count');
+    await page.locator('#chart-type').selectOption('percent');
+    await chart.scrollIntoViewIfNeeded();
+    await expect(chart.locator('svg text').filter({hasText:/^Mesi consecutivi$/})).toBeVisible();
+    await expect(chart.locator('svg text').filter({hasText:/^>12$/})).toBeVisible();
+    await expect(chart.locator('svg rect')).toHaveCount(28);
+    await expect(chart.locator('svg rect[aria-label*="· 1 Mesi"]')).toHaveCount(2);
+    await expect(chart.locator('svg rect[aria-label*="· 2 Mesi"]')).toHaveCount(2);
+    const bounds=await chart.boundingBox();assert(bounds);
+    const labels=await chart.locator('svg text').evaluateAll(nodes=>nodes.map(node=>{
+      const rect=node.getBoundingClientRect();return {left:rect.left,right:rect.right};
+    }));
+    for(const label of labels) {
+      expect(label.left).toBeGreaterThanOrEqual(bounds.x-1);
+      expect(label.right).toBeLessThanOrEqual(bounds.x+bounds.width+1);
+    }
+    await chart.screenshot({path:testInfo.outputPath(`continuity-${width}-${theme}.png`)});
+  }
+  await page.locator('#chart-type').selectOption('cumulative');
+  await expect(chart.locator('svg path')).toHaveCount(2);
+  await expect(chart).not.toContainText('Ogni barra mostra un singolo mese');
+  await page.locator('#ui-language-toggle').click();
+  await expect(chart.locator('svg text').filter({hasText:/^Consecutive months$/})).toBeVisible();
+  await page.locator('#chart-type').selectOption('percent');
+  await expect(chart).toContainText('the last groups all values above 12 months');
+});
+
 test('hidden pages opens independent options with keyboard and mobile support', async ({page, site, traffic}, testInfo) => {
   for (const width of [1280, 390]) {
     await page.setViewportSize({width, height: 844});

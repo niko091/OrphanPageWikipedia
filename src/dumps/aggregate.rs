@@ -611,6 +611,9 @@ pub(crate) fn prepared_summaries(
     let orphans = summary["reports"]["overview"]["orphans"].as_u64()?;
     if summary["format"] != "dashboard_summary_v1"
         || summary["histogram_rule"] != "shared_p2_p98_tails_v1"
+        || summary["reports"]["numeric"]["creator_continuity_months_before_creation"]
+            ["month_histogram"]["rule"]
+            != "months_0_12_overflow_v1"
         || summary["measures_rule"]
             != metadata
                 .get("measures_rule")

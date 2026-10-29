@@ -16,6 +16,7 @@ class Element {
   style: Record<string,string>={};
   value='';textContent='';className='';href='';hidden=false;disabled=false;checked=false;open=false;focused=false;
   attributes=new Map<string,string>();
+  clientWidth=900;
   listeners=new Map<string,()=>unknown>();
   append(...nodes: Element[]): void {this.children.push(...nodes);}
   replaceChildren(...nodes: Element[]): void {this.children=nodes;}
@@ -33,7 +34,7 @@ const location={search:'?page=1'};
 Object.assign(globalThis,{
   window:{location,localStorage:{getItem:(key:string)=>storage.get(key)??null,setItem:(key:string,value:string)=>storage.set(key,value)},
     navigator:{clipboard:{writeText:async(value:string)=>{copied.push(value);}}}},
-  document:{body:{dataset:{page:'connections'}},getElementById:node,createElement:()=>new Element()},
+  document:{body:{dataset:{page:'connections'}},getElementById:node,createElement:()=>new Element(),createElementNS:()=>new Element()},
 });
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orphanwiki-modules-'));
 process.on('exit',()=>fs.rmSync(directory,{recursive:true,force:true}));
@@ -111,6 +112,115 @@ await test('prepared summaries retain NULL and fail rather than recalculate abse
   respond=async()=>new Response('missing',{status:404});
   const start=requests.length;await assert.rejects(datasets.readSummary(entry),/Riepilogo non disponibile/);
   assert.deepEqual(requests.slice(start).map(request=>request.url),['data/'+entry.summary_file]);
+  respond=localResponse;
+});
+await test('creator axes use round references at their true positions without changing prepared observations',async()=>{
+  const {createCharts}=await import(moduleURL('charts')) as typeof import('../../web/src/charts.js');
+  const summary=await datasets.readSummary(entry);
+  const report=summary.reports.numeric.creator_prior_edits_main;
+  report.ticks=[0,9,99,999,10000];report.cumulative_ticks=[0,9,99,999,10000];
+  const original=structuredClone(report);
+  const charts=createCharts({data:dataset,precomputed:summary,topicDisplayNames:new Map(),creatorMode:()=> 'observed'});
+  const chart=node('creator_prior_edits_main-chart');
+  for(const width of [900,300])for(const mode of ['percent','count','cumulative']) {
+    chart.clientWidth=width;node('chart-type').value=mode;
+    charts.distribution('creator_prior_edits_main-chart','creator_prior_edits_main','modifiche');
+    const svg=chart.children.find(child=>child.attributes.has('viewBox'));assert(svg);
+    const bottom=(width<600?380:520)-76;
+    const labels=svg.children.filter(child=>child.attributes.get('y')===String(bottom+30));
+    assert(labels.length>=2);
+    const values=labels.map(label=>Number(label.textContent.replaceAll('.','')));
+    assert(values.every(value=>[0,1,10,100,1000,10000].includes(value)));
+    assert.equal(new Set(values).size,values.length);
+    for(const [index,label] of labels.entries()) {
+      const fraction=Math.log1p(values[index])/Math.log1p(10000);
+      const expected=64+(mode==='cumulative'?fraction:(1+fraction*18)/20)*(width-88);
+      assert(Math.abs(Number(label.attributes.get('x'))-expected)<1e-8);
+    }
+    assert.deepEqual(report,original);
+  }
+  // A constant distribution has one reference, and small ranges retain useful ticks.
+  for(const [minimum,maximum] of [[10,10],[12,18],[0,0.5]]) {
+    report.ticks=[minimum,minimum,minimum,minimum,maximum];
+    chart.clientWidth=900;node('chart-type').value='percent';
+    charts.distribution('creator_prior_edits_main-chart','creator_prior_edits_main','modifiche');
+    const svg=chart.children.find(child=>child.attributes.has('viewBox'));assert(svg);
+    const labels=svg.children.filter(child=>child.attributes.get('y')===String(520-76+30));
+    assert(labels.length>0);assert.equal(new Set(labels.map(label=>label.textContent)).size,labels.length);
+  }
+});
+await test('article axes use round years and bytes at their true linear and logarithmic positions',async()=>{
+  const {createCharts}=await import(moduleURL('charts')) as typeof import('../../web/src/charts.js');
+  const summary=await datasets.readSummary(entry);
+  const charts=createCharts({data:dataset,precomputed:summary,topicDisplayNames:new Map(),creatorMode:()=> 'observed'});
+  for(const [id,field,maximum,unit] of [['age','age_days',24,'anni'],['length','length_bytes',100000,'byte']] as const) {
+    const report=summary.reports.numeric[field];
+    report.ticks=[0,maximum/4,maximum/2,maximum*3/4,maximum];
+    report.cumulative_ticks=[...report.ticks];
+    const original=structuredClone(report),chart=node(id);
+    for(const width of [900,300])for(const mode of ['percent','count','cumulative']) {
+      chart.clientWidth=width;node('chart-type').value=mode;
+      charts.distribution(id,field,unit);
+      const svg=chart.children.find(child=>child.attributes.has('viewBox'));assert(svg);
+      const bottom=(width<600?380:520)-76;
+      const labels=svg.children.filter(child=>child.attributes.get('y')===String(bottom+30));
+      const values=labels.map(label=>Number(label.textContent.replaceAll('.','')));
+      assert(values.length>=2);assert.equal(new Set(values).size,values.length);
+      for(const [index,value] of values.entries()) {
+        assert((field==='age_days'?[0,10,20]:[0,1,10,100,1000,10000,100000]).includes(value));
+        const fraction=field==='age_days'?value/maximum:Math.log1p(value)/Math.log1p(maximum);
+        const expected=64+(mode==='cumulative'?fraction:(1+fraction*18)/20)*(width-88);
+        assert(Math.abs(Number(labels[index].attributes.get('x'))-expected)<1e-8);
+      }
+      if(mode!=='cumulative') {
+        assert.equal(svg.children.filter(child=>child.attributes.has('width')).length,40);
+        assert(chart.children.some(child=>child.textContent.includes('2°')));
+      }
+      assert.deepEqual(report,original);
+    }
+  }
+  const narrow=summary.reports.numeric.length_bytes;
+  narrow.ticks=[103,118,133,148,163];node('length').clientWidth=300;node('chart-type').value='percent';
+  charts.distribution('length','length_bytes','byte');
+  const svg=node('length').children.find(child=>child.attributes.has('viewBox'));assert(svg);
+  assert.deepEqual(svg.children.filter(child=>child.attributes.get('y')===String(380-76+30)).map(label=>label.textContent),['120','140','160']);
+});
+await test('continuity separates zero, one and two months and retains overflow in counts and percentages',async()=>{
+  const {createCharts}=await import(moduleURL('charts')) as typeof import('../../web/src/charts.js');
+  const summary=await datasets.readSummary(entry),original=structuredClone(summary);
+  const report=summary.reports.numeric.creator_continuity_months_before_creation;
+  assert(report.month_histogram);
+  const charts=createCharts({data:dataset,precomputed:summary,topicDisplayNames:new Map(),creatorMode:()=> 'observed'});
+  const chart=node('creator_continuity_months_before_creation-chart');
+  for(const width of [900,300])for(const mode of ['percent','count','cumulative']) {
+    chart.clientWidth=width;node('chart-type').value=mode;
+    charts.historyCharts();
+    const svg=chart.children.find(child=>child.attributes.has('viewBox'));assert(svg);
+    const bottom=(width<600?380:520)-76;
+    const labels=svg.children.filter(child=>child.attributes.get('y')===String(bottom+30)).map(label=>label.textContent);
+    assert(svg.children.some(child=>child.textContent==='Mesi consecutivi'));
+    if(mode!=='cumulative') {
+      if(width===900)assert.deepEqual(labels,Array.from({length:13},(_,index)=>String(index)).concat('>12'));
+      else assert.deepEqual(labels,['0','4','8','>12']);
+      const bars=svg.children.filter(child=>child.attributes.has('width'));
+      assert.equal(bars.length,28);
+      assert(bars.some(bar=>bar.attributes.get('aria-label')?.includes('>12 Mesi consecutivi')));
+      for(const bin of [0,1,2])assert(bars.some(bar=>bar.attributes.get('aria-label')?.includes(`· ${bin} Mesi consecutivi`)));
+    } else assert.equal(svg.children.filter(child=>child.attributes.has('d')).length,2);
+    assert.deepEqual(summary,original);
+  }
+  const invalid=structuredClone(summary);delete invalid.reports.numeric.creator_continuity_months_before_creation.month_histogram;
+  respond=async()=>new Response(JSON.stringify(invalid));
+  const older=await datasets.readSummary(entry);
+  const olderCharts=createCharts({data:dataset,precomputed:older,topicDisplayNames:new Map(),creatorMode:()=> 'observed'});
+  node('chart-type').value='percent';olderCharts.historyCharts();
+  assert.equal(chart.children.length,1);
+  assert(chart.children[0].textContent.includes('aggiornare e riavviare il servizio dashboard'));
+  olderCharts.creatorCharts();
+  assert(node('creator_tenure_days-chart').children.some(child=>child.attributes.has('viewBox')));
+  invalid.reports.numeric.creator_continuity_months_before_creation.month_histogram=structuredClone(report.month_histogram);
+  invalid.reports.numeric.creator_continuity_months_before_creation.month_histogram!.groups[0].counts=[];
+  await assert.rejects(datasets.readSummary(entry),/Riepilogo della continuità non valido/);
   respond=localResponse;
 });
 await test('connection v2 requires matching metadata and never loads a canonical census',async()=>{

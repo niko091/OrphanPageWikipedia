@@ -43,13 +43,14 @@ export function prepareSite(directory: string): {web: string; datasets: Dataset[
     const dataset=JSON.parse(fs.readFileSync(path.join(data,entry.file),'utf8')) as Dataset;
     entry.demo=false;dataset.metadata.demo=false;
     // Only private fixtures enable editorial controls. All external calls are mocked.
-    Object.assign(dataset.metadata,{sql_release:'20261001',history:{status:'not_collected',history_release:'2026-09'},
+    Object.assign(dataset.metadata,{sql_release:'20261001',history:{status:'collected',history_release:'2026-09'},
       quality:{status:'not_collected',content_release:'2026-10-01'},topics:{status:'predicted'},
       creators:{status:'collected',language:entry.language,languages_scanned:[entry.language]}});
     for(const page of dataset.pages)Object.assign(page,{
       creator_key:`synthetic:creator:${(page.page_id-1)%32}`,creator_attribution:'synthetic',creator_account_type:'registered',
       creator_articles_created_total:2,creator_articles_in_census:2,creator_orphans_current:1,creator_orphans_current_share:0.5,
       creator_prior_articles:0,creator_prior_edits_main:0,creator_prior_edits_other:0,creator_tenure_days:10,
+      creator_continuity_months_before_creation:page.page_id===1?null:page.page_id<=40?0:page.page_id<=50?1:page.page_id<=58?2:page.page_id===64?113:page.page_id-56,
       creator_languages_created:[entry.language],creator_data_status:'matched',
       topic_status:'predicted',topic_labels:page.page_id===1?[]:['Culture.Media.Music']});
     const original=entry.file;entry.file=entry.language==='vec'?'fixture.json':'lmo.json';
