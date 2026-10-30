@@ -375,7 +375,6 @@ function renderConnections() {
   const language=new URLSearchParams(window.location.search).get('language');
   const page=data.pages.find(p=>String(p.page_id)===id&&(data.metadata.kind!=='aggregate'||pageLanguage(p)===language));
   if(!page||!page.orphan)throw new Error('Pagina orfana non presente in questa raccolta');
-  $('connection-title')!.textContent=page.title;
   const target=$('connection-target')!;target.replaceChildren();
   target.append(element('h2',t('Pagina da collegare')),wikiLink(page.title,pageLanguage(page)),element('p',t('Lingua: {language} · {category}',{language:pageLanguage(page).toUpperCase(),category:label(page)})));
   const record=data.link_candidates?.[pageKey(page)],count=record?.candidate_count;
