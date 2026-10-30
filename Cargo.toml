@@ -20,7 +20,7 @@ dashboard = ["dep:wasm-bindgen"]
 cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc", "dep:focaccia", "dep:axum", "dep:tokio", "dep:mysql", "dep:futures-util", "dep:rustix", "dep:signal-hook", "dep:nix", "dep:indexmap", "serde_json/float_roundtrip"]
 
 [dependencies]
-regex = "=1.12.4"
+regex = "=1.13.1"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 
 serde = { version = "=1.0.228", features = ["derive"] }
