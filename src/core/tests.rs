@@ -56,6 +56,107 @@ fn unresolved_fanout_cannot_accumulate_in_cross_batch_redirect_caches() {
     }
 }
 #[test]
+fn category_ancestor_cache_is_bounded_without_changing_rankings_or_overrides() {
+    use super::categories::{ANCESTOR_CACHE_BYTES, ANCESTOR_CACHE_ENTRIES};
+    for padding in [0, 300] {
+        let names = (0..512)
+            .map(|i| format!("Ancestor {i:04} {}", "x".repeat(padding)))
+            .collect::<Vec<_>>();
+        let mut parents = names
+            .windows(2)
+            .map(|pair| (pair[0].clone(), vec![pair[1].clone()]))
+            .collect::<HashMap<_, _>>();
+        parents.insert(names[511].clone(), vec!["Cycle A".into()]);
+        parents.insert("Cycle A".into(), vec!["Cycle B".into()]);
+        parents.insert("Cycle B".into(), vec!["Cycle A".into()]);
+        let pages = (1..=400)
+            .map(|id| {
+                let leaf = format!("Leaf {id:04}");
+                parents.insert(leaf.clone(), vec![names[0].clone()]);
+                (
+                    id,
+                    vec![
+                        leaf,
+                        names[0].clone(),
+                        "Cycle A".into(),
+                        "Cycle B".into(),
+                        "Independent".into(),
+                        "Maintenance".into(),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let rules = (
+            vec!["^Maintenance$".into()],
+            HashSet::new(),
+            HashMap::from([("Independent".into(), 1.0)]),
+            HashMap::from([("1".into(), names[0].clone())]),
+            5.0,
+        );
+        let expected = classify_categories(&pages, &parents, rules.clone()).unwrap();
+        assert!(expected[0].2);
+        assert_eq!(expected[0].0.as_ref(), Some(&names[0]));
+        assert_eq!(expected[0].1.len(), 2);
+        if padding > 0 {
+            // Copying every leaf's closure would exceed the production budget.
+            assert!(
+                pages.len() * names.iter().map(String::len).sum::<usize>() > ANCESTOR_CACHE_BYTES
+            );
+        }
+        for batch_size in [1, 37, 512] {
+            let mut classifier =
+                CategoryBatchClassifier::new(pages.len(), parents.clone(), rules.clone()).unwrap();
+            classifier
+                .add_support_batch(pages.iter().map(|(_, names)| names.clone()).collect())
+                .unwrap();
+            let mut actual = Vec::new();
+            for batch in pages.chunks(batch_size) {
+                actual.extend(classifier.classify_batch(batch.to_vec()).unwrap());
+                let (entries, bytes) = classifier.ancestor_cache_usage();
+                assert!(entries > 0 && entries <= ANCESTOR_CACHE_ENTRIES);
+                assert!(bytes > 0 && bytes <= ANCESTOR_CACHE_BYTES);
+            }
+            assert_eq!(actual, expected);
+            // Revisit evicted categories in reverse order, including the override.
+            for (page, expected) in pages.iter().zip(&expected).rev() {
+                assert_eq!(
+                    classifier.classify_batch(vec![page.clone()]).unwrap(),
+                    vec![expected.clone()]
+                );
+                let (entries, bytes) = classifier.ancestor_cache_usage();
+                assert!(entries <= ANCESTOR_CACHE_ENTRIES);
+                assert!(bytes <= ANCESTOR_CACHE_BYTES);
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_category_closures_are_searched_exactly_without_retaining_copies() {
+    let names = (0..1024)
+        .map(|i| format!("{i:04} {}", "x".repeat(17000)))
+        .collect::<Vec<_>>();
+    let mut parents = names
+        .windows(2)
+        .map(|pair| (pair[0].clone(), vec![pair[1].clone()]))
+        .collect::<HashMap<_, _>>();
+    parents.insert("Root".into(), vec![names[0].clone()]);
+    parents.insert("Leaf".into(), vec!["Root".into()]);
+    let pages = vec![
+        (1, vec!["Leaf".into(), "Root".into()]),
+        (2, vec!["Leaf".into()]),
+    ];
+    let rules = (vec![], HashSet::new(), HashMap::new(), HashMap::new(), 5.0);
+    let expected = classify_categories(&pages, &parents, rules.clone()).unwrap();
+    let mut classifier = CategoryBatchClassifier::new(pages.len(), parents, rules).unwrap();
+    classifier
+        .add_support_batch(pages.iter().map(|(_, names)| names.clone()).collect())
+        .unwrap();
+    assert_eq!(classifier.classify_batch(pages).unwrap(), expected);
+    assert_eq!(classifier.ancestor_cache_usage(), (0, 0));
+}
+
+#[test]
 fn collection_bounds_use_instants_and_reject_invalid_intervals() {
     let start = "2026-01-01T01:00:00+02:00";
     let finish = "2026-01-02T00:00:00Z";

@@ -94,13 +94,24 @@ pub fn classify_categories(
         .collect()
 }
 
+pub(super) const ANCESTOR_CACHE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const ANCESTOR_CACHE_ENTRIES: usize = 256;
+
+struct CachedAncestors {
+    values: HashSet<String>,
+    bytes: usize,
+    used: u64,
+}
+
 /// Preserve census-wide support counts while classifying bounded page batches.
 pub struct CategoryBatchClassifier {
     total: usize,
     support_sources: usize,
     frequencies: HashMap<String, u64>,
     parents: HashMap<String, Vec<String>>,
-    ancestors: HashMap<String, HashSet<String>>,
+    ancestors: HashMap<String, CachedAncestors>,
+    ancestor_cache_bytes: usize,
+    ancestor_cache_clock: u64,
     patterns: Vec<regex::Regex>,
     excluded: HashSet<String>,
     priority: HashMap<String, f64>,
@@ -136,6 +147,8 @@ impl CategoryBatchClassifier {
             frequencies: HashMap::new(),
             parents,
             ancestors: HashMap::new(),
+            ancestor_cache_bytes: 0,
+            ancestor_cache_clock: 0,
             patterns,
             excluded,
             priority,
@@ -157,10 +170,23 @@ impl CategoryBatchClassifier {
         Ok(())
     }
 
-    pub(super) fn cache_ancestors(&mut self, category: &str) {
-        if self.ancestors.contains_key(category) {
-            return;
+    fn candidate_ancestors<'a>(
+        &mut self,
+        category: &str,
+        candidates: &HashSet<&'a str>,
+    ) -> Result<HashSet<&'a str>, String> {
+        self.ancestor_cache_clock = self.ancestor_cache_clock.saturating_add(1);
+        if let Some(cached) = self.ancestors.get_mut(category) {
+            cached.used = self.ancestor_cache_clock;
+            return Ok(candidates
+                .iter()
+                .copied()
+                .filter(|candidate| cached.values.contains(*candidate))
+                .collect());
         }
+        // Traverse the complete hierarchy using borrowed names. Only relations
+        // between this page's candidates need to survive the traversal; keeping
+        // owned transitive closures for every census category grows quadratically.
         let mut seen = HashSet::new();
         let mut pending = self
             .parents
@@ -169,14 +195,59 @@ impl CategoryBatchClassifier {
             .flatten()
             .collect::<Vec<_>>();
         while let Some(item) = pending.pop() {
+            #[cfg(feature = "cli")]
+            crate::runtime::check_cancelled()?;
             if seen.insert(item.as_str()) {
                 pending.extend(self.parents.get(item).into_iter().flatten());
             }
         }
-        self.ancestors.insert(
-            category.to_owned(),
-            seen.into_iter().map(str::to_owned).collect(),
-        );
+        let relevant = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| seen.contains(*candidate))
+            .collect();
+        let overhead = category.len() + std::mem::size_of::<(String, CachedAncestors)>();
+        let estimated = overhead
+            + seen.capacity() * std::mem::size_of::<String>()
+            + seen.iter().map(|name| name.len()).sum::<usize>();
+        // Oversized closures are still searched exactly, but never copied into
+        // the cache. Eviction affects reuse only, not category ranking or cycles.
+        if estimated <= ANCESTOR_CACHE_BYTES {
+            let values = seen.into_iter().map(str::to_owned).collect::<HashSet<_>>();
+            let bytes = overhead
+                + values.capacity() * std::mem::size_of::<String>()
+                + values.iter().map(String::capacity).sum::<usize>();
+            if bytes <= ANCESTOR_CACHE_BYTES {
+                while self.ancestors.len() >= ANCESTOR_CACHE_ENTRIES
+                    || self.ancestor_cache_bytes + bytes > ANCESTOR_CACHE_BYTES
+                {
+                    let oldest = self
+                        .ancestors
+                        .iter()
+                        .min_by_key(|(_, cached)| cached.used)
+                        .map(|(name, _)| name.clone())
+                        .ok_or("Cache degli antenati incoerente")?;
+                    if let Some(removed) = self.ancestors.remove(&oldest) {
+                        self.ancestor_cache_bytes -= removed.bytes;
+                    }
+                }
+                self.ancestor_cache_bytes += bytes;
+                self.ancestors.insert(
+                    category.to_owned(),
+                    CachedAncestors {
+                        values,
+                        bytes,
+                        used: self.ancestor_cache_clock,
+                    },
+                );
+            }
+        }
+        Ok(relevant)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ancestor_cache_usage(&self) -> (usize, usize) {
+        (self.ancestors.len(), self.ancestor_cache_bytes)
     }
 
     pub fn classify_batch(
@@ -201,19 +272,20 @@ impl CategoryBatchClassifier {
                             .any(|pattern| pattern.is_match(category))
                 })
                 .collect::<HashSet<_>>();
-            for category in &candidates {
-                self.cache_ancestors(category);
+            let mut ancestors = HashMap::new();
+            if candidates.len() > 1 {
+                for category in &candidates {
+                    ancestors.insert(*category, self.candidate_ancestors(category, &candidates)?);
+                }
             }
             let mut ranked = Vec::new();
             for category in &candidates {
                 let broader = candidates.iter().any(|other| {
                     category != other
-                        && self
-                            .ancestors
+                        && ancestors
                             .get(*other)
                             .is_some_and(|ancestors| ancestors.contains(*category))
-                        && !self
-                            .ancestors
+                        && !ancestors
                             .get(*category)
                             .is_some_and(|ancestors| ancestors.contains(*other))
                 });
