@@ -874,6 +874,15 @@ main {
   min-height: 60vh;
 }
 
+.about-copy {
+  max-width: 75ch;
+  overflow-wrap: anywhere;
+}
+
+.about-copy h2,.about-copy h3 {
+  margin-block: 24px 12px;
+}
+
 footer {
   border-top: 1px solid var(--border);
   padding-top: 20px;

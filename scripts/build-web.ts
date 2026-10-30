@@ -66,7 +66,7 @@ await copyFile(new URL('web/src/style.css', root), new URL('style.css', assets))
 for (const asset of ['app.js', 'style.css']) {
   const version = digest(await readFile(new URL(asset, assets)));
   const reference = new RegExp(`assets/${asset.replace('.', '\\.')}\\?v=[a-f0-9]+`, 'g');
-  for (const page of pages) {
+  for (const page of asset === 'style.css' ? [...pages, 'about.html'] : pages) {
     const path = new URL(`web/${page}`, root);
     const html = await readFile(path, 'utf8');
     if (!reference.test(html)) throw new Error(`${page}: missing ${asset} reference`);

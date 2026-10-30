@@ -1,5 +1,39 @@
 <!doctype html>
-<html lang="it">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>About</title></head>
-<body></body>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>About</title><link rel="stylesheet" href="assets/style.css?v=4d516de605e5"></head>
+<body data-page="about">
+<header><h1>About</h1></header>
+<nav class="page-nav" aria-label="Analysis pages"><a href="index.html">Article analysis</a><a href="creators.html">Who creates orphan pages</a><a href="deorphanize.html">De-orphaning pages</a></nav>
+<main>
+<article class="about-copy">
+<p>This project was developed by <a href="https://www.linkedin.com/in/nicola-bancher/">Nicola Bancher</a> for his Bachelor's Thesis in Computer Science at the University of Trento, under the supervision of <a href="https://consonni.dev/">Cristian Consonni</a> and <a href="https://cricca.disi.unitn.it/montresor/">Alberto Montresor</a>.</p>
+
+<h2>Overview</h2>
+<p>The project aims to provide a regularly updated and interactive dashboard about the characteristics of <a href="https://en.wikipedia.org/wiki/Wikipedia:Orphan">orphan pages</a> and the characteristics of the authors who create them. It also includes a tool for de-orphaning pages aided by an LLM.</p>
+
+<h3>Article analysis</h3>
+<p>The Article Analysis page builds on the research presented in <a href="https://ojs.aaai.org/index.php/ICWSM/article/view/31300"><em>“Orphan Articles: The Dark Matter of Wikipedia”</em></a>.</p>
+<p>It extends the analysis by incorporating Wikipedia’s native article categories and data on the editors who created the orphan articles. It also uses all the 64 themes from the taxonomy described in <a href="https://dl.acm.org/doi/abs/10.1145/3442442.3452347"><em>“Language-agnostic topic classification for Wikipedia.”</em></a>, rather than only the four macro-themes.</p>
+
+<h3>LLM-assisted de-orphaning</h3>
+<p>The tool for de-orphaning articles works by creating a prompt containing the instructions for the LLM, the links to the orphan pages that exist in other languages and the wikitext of those pages.</p>
+<p>The LLM is asked to create a table of suggested edits, specifying:</p>
+<ul>
+<li>The article where a link could be added.</li>
+<li>The article in another language where the corresponding link already exists.</li>
+<li>A text snippet to locate the suggested insertion point using the browser’s search function (<kbd>Ctrl+F</kbd>).</li>
+<li>The proposed text to insert, or <strong>“ADD LINK”</strong> if the relevant mention is already present but is not linked.</li>
+</ul>
+<p>All suggestions must be reviewed by the user and applied manually to Wikipedia. The tool does not edit Wikipedia automatically.</p>
+</article>
+</main>
+<footer>
+<nav class="footer-nav" aria-label="Project information">
+<a href="https://github.com/niko091/OrphanPageWikipedia">GitHub repository</a>
+<a href="https://github.com/niko091/OrphanPageWikipedia/issues/new/choose">Open an Issue</a>
+<a href="https://github.com/niko091/OrphanPageWikipedia/blob/main/LICENSE">MIT License</a>
+<a href="about.html" aria-current="page">About</a>
+</nav>
+</footer>
+</body>
 </html>
