@@ -40,7 +40,7 @@ tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-t
 mysql = { version = "=28.0.4", default-features = false, features = ["minimal-rust", "rustls-tls"], optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"], optional = true }
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "time", "param", "process", "fs", "thread"], optional = true }
-signal-hook = { version = "=0.3.18", optional = true, default-features = false }
+signal-hook = { version = "=0.4.6", optional = true, default-features = false }
 nix = { version = "=0.31.3", default-features = false, features = ["resource"], optional = true }
 indexmap = { version = "=2.14.2", default-features = false, features = ["serde", "std"], optional = true }
 
