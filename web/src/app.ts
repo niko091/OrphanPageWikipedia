@@ -58,7 +58,7 @@ const creatorMode = (): 'observed' | 'history' | 'missing' =>
 const creatorsAvailable = () => creatorMode()!=='missing';
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, connectionOffset = 0, creatorRows: CreatorRow[] = [];
-const connectionPageSize=25;
+const connectionPageSize=24;
 let connectionReviewed = false;
 let datasetController = new AbortController();
 let precomputed: DashboardSummaryData;
@@ -409,10 +409,14 @@ function renderConnections() {
     const proposed=element('div',null,'connection-proposed');
     proposed.append(element('h3',t('Collegamento da valutare in {language}',{language:pageLanguage(page).toUpperCase()})));
     const local=element('p');local.append(wikiLink(candidate.title,pageLanguage(page)),element('span',' → '),wikiLink(page.title,pageLanguage(page)));proposed.append(local);body.append(proposed);
-    for(const evidence of candidate.evidence||[]) {
+    const evidenceList=candidate.evidence||[];
+    const evidenceDetails=element('details',null,'connection-details');
+    evidenceDetails.append(element('summary',t('Collegamenti nelle altre lingue ({n})',{n:number(evidenceList.length)})));
+    for(const evidence of evidenceList) {
       const existing=element('div',null,'connection-evidence');existing.append(element('h3',t('Collegamento esistente in {language}',{language:evidence.language.toUpperCase()})));
-      const line=element('p');line.append(wikiLink(evidence.source_title,evidence.language),element('span',' → '),wikiLink(evidence.target_title,evidence.language));existing.append(line);body.append(existing);
+      const line=element('p');line.append(wikiLink(evidence.source_title,evidence.language),element('span',' → '),wikiLink(evidence.target_title,evidence.language));existing.append(line);evidenceDetails.append(existing);
     }
+    if(evidenceList.length)body.append(evidenceDetails);
     const footer=element('div',null,'candidate-footer');footer.append(fixLink(fixRequest(page,record,candidate)));
     const reviewButton=element('button',t('Valuta coppia'),'review-edge');reviewButton.type='button';reviewButton.disabled=Boolean(data.metadata.demo);
     reviewButton.addEventListener('click',()=>showReview({dataset:datasetFile,language:pageLanguage(page),target_id:page.page_id,

@@ -282,7 +282,7 @@ svg {
   display: none!important;
 }
 
-.candidate-grid {
+.candidate-grid,.connection-list {
   display: grid;
   grid-template-columns: repeat(auto-fill,minmax(min(100%,300px),1fr));
   gap: 20px;
@@ -475,17 +475,16 @@ dialog textarea {
 .connection-views { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-block: 1rem; }
 .connection-views button[aria-pressed="true"] { font-weight: bold; border-color: var(--color-progressive, #36c); }
 .connection-list {
-  display: grid;
-  gap: 20px;
+  margin-block-start: 16px;
 }
 
 .connection-card .candidate-title {
-  font-size: 1.3rem;
+  font-size: 1.15rem;
 }
 
 .connection-proposed,.connection-evidence {
-  margin-top: 20px;
-  padding: 18px;
+  margin-top: 14px;
+  padding: 12px;
   border-radius: 2px;
   background: var(--accent-surface);
 }
@@ -493,6 +492,10 @@ dialog textarea {
 .connection-evidence {
   background: var(--page);
 }
+
+.connection-details { margin-block-start: 14px; }
+.connection-details summary { cursor: pointer; color: var(--link); }
+.connection-card .candidate-footer { flex-wrap: wrap; }
 
 .connection-proposed h3,.connection-evidence h3 {
   font-size: .9rem;

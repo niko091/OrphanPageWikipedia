@@ -317,6 +317,7 @@ const translations: Record<string, string> = {
   "{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.": "{n} candidate pages · {shown} displayed. Review the content before adding a link.",
   "Collegamento da valutare in {language}": "Proposed link in {language}",
   "Collegamento esistente in {language}": "Existing link in {language}",
+  "Collegamenti nelle altre lingue ({n})": "Links in other languages ({n})",
   "Impossibile caricare: {error}. Esegui la pipeline dei dump e servi la cartella web tramite HTTP.": "Unable to load: {error}. Run the dump pipeline and serve the web folder over HTTP.",
   "Voci attribuite ad account bot": "Articles attributed to bot accounts",
   "Bot (stato attuale)": "Bot (current status)",
