@@ -1095,9 +1095,7 @@ pub fn import_history(
             // Both passes are durable. The archive is no longer needed even if
             // metrics or supplement publication is interrupted afterwards.
             if let Some(root) = &downloads {
-                let path =
-                    std::path::Path::new(data["path"].as_str().ok_or("Percorso History mancante")?);
-                super::remove_owned_file(root, path)?;
+                super::remove_consumed_download(root, data)?;
             }
         }
         connection.execute_batch(

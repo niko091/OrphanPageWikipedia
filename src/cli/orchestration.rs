@@ -98,6 +98,10 @@ impl Invocation {
                 .cloned()
                 .unwrap_or_else(|| date.format("%Y-%m-%d").to_string()),
             dump_root,
+            dump_mirror: self
+                .args
+                .get_one::<String>("dump-mirror")
+                .map(|p| self.root.join(p)),
             import_dir: self.path("import-dir")?,
             output_dir: self.path("output-dir")?,
             collection_database: Some(

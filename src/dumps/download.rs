@@ -80,12 +80,20 @@ impl DumpHttp for WikimediaHttp {
 #[cfg(feature = "cli")]
 pub struct DumpClient<T: DumpHttp> {
     http: T,
+    mirror: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "cli")]
 impl<T: DumpHttp> DumpClient<T> {
     pub fn new(http: T) -> Self {
-        Self { http }
+        Self { http, mirror: None }
+    }
+
+    /// Read official files from a local copy of the archive, such as
+    /// /public/dumps/public on Toolforge, instead of downloading them.
+    pub fn with_mirror(mut self, mirror: Option<std::path::PathBuf>) -> Self {
+        self.mirror = mirror;
+        self
     }
 
     fn open(&mut self, url: &str, offset: u64, head: bool) -> Result<DumpResponse, String> {
@@ -343,6 +351,55 @@ impl<T: DumpHttp> DumpClient<T> {
         })
     }
 
+    /// Return the checksum and path of a verified official file. A mirror file
+    /// must match the publisher size and checksums. It is read in place and is
+    /// never written or removed. Without a mirror, download the file to `path`.
+    fn acquire(
+        &mut self,
+        url: &str,
+        path: &std::path::Path,
+        expected_size: u64,
+        sha1: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        let Some(mirror) = self.mirror.clone() else {
+            let checksum = self.fetch(url, path, expected_size, sha1, sha256)?;
+            return Ok((checksum, path.to_owned()));
+        };
+        if expected_size == 0
+            || sha1.is_some_and(|value| !Self::hex(value, 40))
+            || sha256.is_some_and(|value| !Self::hex(value, 64))
+        {
+            return Err("Dimensione o checksum atteso non valido".into());
+        }
+        let relative = url
+            .strip_prefix(&format!("{DUMP_BASE}/"))
+            .ok_or("URL fuori dall’archivio Wikimedia")?;
+        if !std::path::Path::new(relative)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(format!("Percorso del mirror non valido: {relative}"));
+        }
+        let source = mirror.join(relative);
+        let size = std::fs::metadata(&source)
+            .map_err(|error| format!("{}: {error}", source.display()))?
+            .len();
+        if !source.is_file() || size != expected_size {
+            return Err(format!(
+                "Dump del mirror diverso dalla pubblicazione: {}",
+                source.display()
+            ));
+        }
+        let Some(checksum) = Self::verified_sha256(&source, sha1, sha256)? else {
+            return Err(format!(
+                "Checksum Wikimedia errato nel mirror: {}",
+                source.display()
+            ));
+        };
+        Ok((checksum, source))
+    }
+
     pub fn history_partitions(
         names: &[String],
         release: &str,
@@ -564,19 +621,33 @@ impl<T: DumpHttp> DumpClient<T> {
             let mut records = Map::new();
             for (table, name, url, size, sha1) in selected {
                 let path = root.join(database).join(sql_release).join(&name);
-                let checksum = self.fetch(&url, &path, size, Some(&sha1), None)?;
-                records.insert(table.into(), json!({"path":path.canonicalize().map_err(|error| error.to_string())?,"bytes":size,"sha1_publisher":sha1,"sha256_local":checksum,"job_updated":updates.get(&name).unwrap_or(&Value::Null)}));
+                let (checksum, path) = self.acquire(&url, &path, size, Some(&sha1), None)?;
+                let mut record = json!({"path":path.canonicalize().map_err(|error| error.to_string())?,"bytes":size,"sha1_publisher":sha1,"sha256_local":checksum,"job_updated":updates.get(&name).unwrap_or(&Value::Null)});
+                if self.mirror.is_some() {
+                    record["mirror"] = json!(true);
+                }
+                records.insert(table.into(), record);
                 println!("Dump {database}: {name} verificato");
             }
             for (name, url, size) in histories {
                 let path = root.join(database).join(history_release).join(name);
-                let mut checksum = self.fetch(&url, &path, size, None, None)?;
-                if Self::verify_bzip2(&path).is_err() {
+                let (mut checksum, source) = self.acquire(&url, &path, size, None, None)?;
+                if Self::verify_bzip2(&source).is_err() {
+                    if self.mirror.is_some() {
+                        return Err(format!(
+                            "Archivio History non valido nel mirror: {}",
+                            source.display()
+                        ));
+                    }
                     Self::remove_if_present(&path)?;
                     checksum = self.fetch(&url, &path, size, None, None)?;
                     Self::verify_bzip2(&path)?;
                 }
-                records.insert(name.clone(), json!({"path":path.canonicalize().map_err(|error| error.to_string())?,"bytes":size,"sha256_local":checksum,"checksum_scope":"local_only"}));
+                let mut record = json!({"path":source.canonicalize().map_err(|error| error.to_string())?,"bytes":size,"sha256_local":checksum,"checksum_scope":"local_only"});
+                if self.mirror.is_some() {
+                    record["mirror"] = json!(true);
+                }
+                records.insert(name.clone(), record);
                 println!("Dump {database}: {name} verificato");
             }
             let manifest = json!({"language":language,"database":database,"sql_release":sql_release,"history_release":history_release,"sql_status_url":status_url,"history_index_url":history_url,"files":records});
@@ -649,20 +720,28 @@ impl<T: DumpHttp> DumpClient<T> {
                     .ok_or("Dimensione dei dump fuori intervallo")?;
                 let path = root.join(database).join("content").join(release).join(name);
                 files.insert(name.into(), json!({"url":url,"path":path,"bytes":size,"sha256_publisher":digest,"sha256_local":digest}));
-                selected.push((url, path, size, digest.to_owned()));
+                selected.push((name.to_owned(), url, path, size, digest.to_owned()));
             }
             if files.is_empty() {
                 return Err("Nessun file di contenuto nel manifest ufficiale".into());
             }
-            let manifest = json!({"language":language,"database":database,"content_release":release,"source":"mediawiki_content_current","complete":true,"publisher_sha256":Self::digest(&publisher),"files":files});
             println!(
                 "Contenuto {language}: {} partizioni, {total} byte",
                 selected.len()
             );
             if !plan {
-                for (url, path, size, digest) in selected {
-                    self.fetch(&url, &path, size, None, Some(&digest))?;
+                for (name, url, path, size, digest) in selected {
+                    let (_, source) = self.acquire(&url, &path, size, None, Some(&digest))?;
+                    if self.mirror.is_some() {
+                        if let Some(record) = files.get_mut(&name) {
+                            record["path"] = json!(source);
+                            record["mirror"] = json!(true);
+                        }
+                    }
                 }
+            }
+            let manifest = json!({"language":language,"database":database,"content_release":release,"source":"mediawiki_content_current","complete":true,"publisher_sha256":Self::digest(&publisher),"files":files});
+            if !plan {
                 Self::write_json(
                     &root.join(database).join(format!("content-{release}.json")),
                     &manifest,

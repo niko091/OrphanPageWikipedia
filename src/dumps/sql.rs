@@ -618,7 +618,7 @@ pub fn import_graph(
             }
             load_sql_table(&connection, table, path, digest)?;
             if let Some(root) = &downloads {
-                super::remove_owned_file(root, path)?;
+                super::remove_consumed_download(root, record)?;
             }
         }
         connection.execute_batch(

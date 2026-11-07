@@ -73,6 +73,22 @@ pub(crate) fn remove_owned_file(root: &std::path::Path, path: &std::path::Path) 
     Ok(())
 }
 
+/// Remove a consumed download. Keep a mirror file: the pipeline reads it in
+/// place and does not own it.
+#[cfg(feature = "cli")]
+pub(crate) fn remove_consumed_download(
+    root: &std::path::Path,
+    record: &serde_json::Value,
+) -> DumpResult<()> {
+    if record["mirror"] == true {
+        return Ok(());
+    }
+    let path = record["path"]
+        .as_str()
+        .ok_or("Percorso del dump mancante")?;
+    remove_owned_file(root, std::path::Path::new(path))
+}
+
 #[cfg(feature = "cli")]
 pub(super) struct PreparedDirectory {
     pub(super) path: std::path::PathBuf,

@@ -3,7 +3,11 @@ use super::*;
 impl Invocation {
     pub(super) fn run_download(&self) -> Result<(), String> {
         use orphanwiki::dumps::{DumpClient, WikimediaHttp};
-        let mut client = DumpClient::new(WikimediaHttp::new()?);
+        let mirror = self
+            .args
+            .get_one::<String>("mirror")
+            .map(|path| self.root.join(path));
+        let mut client = DumpClient::new(WikimediaHttp::new()?).with_mirror(mirror);
         let release = |name: &str| {
             self.args
                 .get_one::<String>(name)

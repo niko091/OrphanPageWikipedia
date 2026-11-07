@@ -273,6 +273,76 @@ fn verified_manifests_match_python_fields_and_reuse_existing_approved_bytes() {
 }
 
 #[test]
+fn mirror_files_are_verified_in_place_and_never_downloaded() {
+    let workspace = Workspace::new();
+    let mirror = workspace.0.join("mirror");
+    let root = workspace.0.join("dumps");
+    let write = |relative: String, bytes: &[u8]| {
+        let path = mirror.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let sql = |table: &str| format!("vecwiki/20261001/vecwiki-20261001-{table}.sql.gz");
+    for table in SQL_TABLES {
+        write(sql(table), table.as_bytes());
+    }
+    let history = compress(b"mirrored history");
+    let history_name = "2026-09.vecwiki.all-time.tsv.bz2";
+    let history_dir = "other/mediawiki_history/2026-09/vecwiki";
+    let history_path = write(format!("{history_dir}/{history_name}"), &history);
+    let editions = [("vec".into(), "vecwiki".into())];
+    // Only the metadata requests are planned: a download would fail the fixture.
+    let (http, queue) = Fixture::new(metadata(&history));
+    let result = DumpClient::new(http)
+        .with_mirror(Some(mirror.clone()))
+        .fetch_dumps(&editions, "20261001", "2026-09", &root, false)
+        .unwrap();
+    assert!(queue.borrow().is_empty());
+    let files = &result[0]["files"];
+    for table in SQL_TABLES {
+        assert_eq!(files[table]["path"], json!(mirror.join(sql(table))));
+        assert_eq!(files[table]["sha256_local"], sha256(table.as_bytes()));
+        assert_eq!(files[table]["mirror"], true);
+    }
+    assert_eq!(files[history_name]["path"], json!(history_path));
+    assert_eq!(files[history_name]["mirror"], true);
+    let manifest = root.join("vecwiki/manifest-20261001-2026-09.json");
+    assert!(manifest.is_file());
+    assert!(!root.join("vecwiki/20261001").exists());
+    assert!(!root.join("vecwiki/2026-09").exists());
+
+    let xml_name = "vecwiki-2026-10-01-p0.xml.bz2";
+    let xml_dir = "other/mediawiki_content_current/vecwiki/2026-10-01/xml/bzip2";
+    let xml_path = write(format!("{xml_dir}/{xml_name}"), b"XML");
+    let base = format!("{DUMP_BASE}/{xml_dir}/");
+    let publisher = format!("{}  ./{xml_name}\n", sha256(b"XML"));
+    let (http, queue) = Fixture::new(vec![
+        Reply::get(&format!("{base}SHA256SUMS"), publisher.as_bytes()),
+        Reply::head(&format!("{base}{xml_name}"), 3),
+    ]);
+    let result = DumpClient::new(http)
+        .with_mirror(Some(mirror.clone()))
+        .fetch_content(&editions, "2026-10-01", &root, false)
+        .unwrap();
+    assert!(queue.borrow().is_empty());
+    let files = &result[0]["files"];
+    assert_eq!(files[xml_name]["path"], json!(xml_path));
+    assert_eq!(files[xml_name]["mirror"], true);
+    assert!(root.join("vecwiki/content-2026-10-01.json").is_file());
+    assert!(!root.join("vecwiki/content").exists());
+
+    // A mirror file with the published size but other bytes stops the run.
+    write(sql("page"), b"PAGE");
+    let (http, _) = Fixture::new(metadata(&history));
+    let error = DumpClient::new(http)
+        .with_mirror(Some(mirror.clone()))
+        .fetch_dumps(&editions, "20261001", "2026-09", &root, false)
+        .unwrap_err();
+    assert!(error.contains("mirror"), "{error}");
+}
+
+#[test]
 fn interrupted_download_resumes_only_the_verified_range_and_clears_sidecars() {
     let workspace = Workspace::new();
     let path = workspace.0.join("file.bz2");

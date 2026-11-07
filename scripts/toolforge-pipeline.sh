@@ -30,9 +30,14 @@ if [ ! -f "$model" ]; then
     mv "$temporary" "$model"
     trap - EXIT HUP INT TERM
 fi
+set -- --languages "$@"
+if [ -d /public/dumps/public ]; then
+    # With --mount=all, read the dumps from the Toolforge copy. Do not download them.
+    set -- --dump-mirror /public/dumps/public "$@"
+fi
 # The pipeline verifies the model checksum from config/topics.json.
 target/release/orphanwiki pipeline --sql-release "$sql_release" \
-    --history-release "$history_release" --languages "$@"
+    --history-release "$history_release" "$@"
 if [ ! -d "${TOOL_DATA_DIR:-}" ]; then
     echo 'TOOL_DATA_DIR is not mounted. The collection stays in the container.' >&2
     exit 0

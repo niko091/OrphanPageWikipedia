@@ -31,9 +31,17 @@ pub(super) fn remove_downloads(
     root: &Path,
 ) -> PipelineResult<()> {
     let root = root.canonicalize()?;
+    // Mirror files are read in place. The work area does not own them.
+    let mirrored = metadata["files"]
+        .as_object()
+        .ok_or("File del manifest mancanti")?
+        .values()
+        .filter(|item| item["mirror"] == true)
+        .filter_map(|item| item["path"].as_str().map(PathBuf::from))
+        .collect::<Vec<_>>();
     let mut files = Vec::new();
     for path in fetched_outputs(manifest, metadata)?.into_iter().skip(1) {
-        if !path.exists() {
+        if !path.exists() || mirrored.contains(&path) {
             continue;
         }
         let resolved = path.canonicalize()?;
@@ -250,7 +258,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         .map(|(l, _)| l.clone())
         .collect::<Vec<_>>();
     steps.log(&format!("LINGUE {}", languages.join(" ")))?;
-    let fetch = arguments(
+    let mut fetch = arguments(
         "fetch-dumps",
         &[
             ("languages-file", path_text(&options.languages_file)),
@@ -259,7 +267,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             ("root", path_text(&options.dump_root)),
         ],
     );
-    let content = arguments(
+    let mut content = arguments(
         "fetch-content",
         &[
             ("languages-file", path_text(&options.languages_file)),
@@ -267,6 +275,11 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             ("root", path_text(&options.dump_root)),
         ],
     );
+    if let Some(mirror) = &options.dump_mirror {
+        for command in [&mut fetch, &mut content] {
+            append_options(command, &[("mirror", path_text(mirror))]);
+        }
+    }
     if options.plan {
         let mut sql = with_languages(fetch, &languages);
         sql.push("--plan".into());

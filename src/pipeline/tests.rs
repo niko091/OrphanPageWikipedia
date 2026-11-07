@@ -37,6 +37,7 @@ impl Fixture {
             history_release: "2026-09".into(),
             content_release: "2026-10-01".into(),
             dump_root: root.join("dumps"),
+            dump_mirror: None,
             import_dir: root.join("imported"),
             output_dir: root.join("exports"),
             collection_database: None,

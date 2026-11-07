@@ -48,6 +48,8 @@ The pipeline downloads and verifies the dumps, analyzes complete editions, compa
 
 Downloads are processed one edition at a time and removed after their verified import; temporary graphs, supplements, comparison caches and JSON/CSV exports are removed after the database is published. Failed runs retain their private checkpoints for retry. The local topic model and operational logs remain on disk. Allow space for imports and for both the active and incoming collection during updates; final database size alone does not determine the required disk capacity.
 
+With `--dump-mirror PATH`, the pipeline reads the dumps from a local copy of dumps.wikimedia.org instead of downloading them, for example `/public/dumps/public` on Toolforge (jobs need `--mount=all`). Mirror files must match the published sizes and checksums; the pipeline reads them in place and never modifies or deletes them.
+
 ### Starting the dashboard
 
 Once the data is available, the script prepares the build dependencies, builds the project, and starts the local service. The Rust service reads the SQLite collection and performs article, orphan-card and creator filtering and pagination on the server, returning 25 records per request. Editorial review state stays in a separate database. Existing JSON collections remain readable until migrated.

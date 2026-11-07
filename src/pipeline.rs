@@ -34,6 +34,8 @@ pub struct PipelineOptions {
     pub history_release: String,
     pub content_release: String,
     pub dump_root: PathBuf,
+    /// Local copy of the dump archive, read in place instead of downloading.
+    pub dump_mirror: Option<PathBuf>,
     pub import_dir: PathBuf,
     pub output_dir: PathBuf,
     pub collection_database: Option<PathBuf>,
@@ -67,6 +69,9 @@ pub fn run(mut options: PipelineOptions) -> PipelineResult<()> {
         *path = dumps::resolved_path(&options.root.join(&*path))?;
     }
     if let Some(path) = &mut options.collection_database {
+        *path = dumps::resolved_path(&options.root.join(&*path))?;
+    }
+    if let Some(path) = &mut options.dump_mirror {
         *path = dumps::resolved_path(&options.root.join(&*path))?;
     }
     let sql = chrono::NaiveDate::parse_from_str(&options.sql_release, "%Y%m%d")?;

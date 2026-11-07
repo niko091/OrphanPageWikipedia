@@ -44,7 +44,8 @@ use publication::collection_download_root;
 pub use publication::{analyze_file, rebuild_dashboard};
 #[cfg(feature = "cli")]
 pub(crate) use publication::{
-    collection_area, collection_staging, dataset_filename, remove_owned_file, COLLECTION_STAGING,
+    collection_area, collection_staging, dataset_filename, remove_consumed_download,
+    remove_owned_file, COLLECTION_STAGING,
 };
 #[cfg(feature = "cli")]
 use publication::{

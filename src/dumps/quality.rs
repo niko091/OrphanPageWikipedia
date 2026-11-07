@@ -677,7 +677,7 @@ pub fn infer_quality(
             if previous == Some((digest.to_owned(), signature.0, signature.1)) {
                 eprintln!("CHECKPOINT XML {name}: verified_reuse");
                 if let Some(root) = &downloads {
-                    super::remove_owned_file(root, path)?;
+                    super::remove_consumed_download(root, record)?;
                 }
                 continue;
             }
@@ -708,7 +708,7 @@ pub fn infer_quality(
                 params![name, digest, signature.0, signature.1],
             )?;
             if let Some(root) = &downloads {
-                super::remove_owned_file(root, path)?;
+                super::remove_consumed_download(root, record)?;
             }
         }
         let n = db.query_row(

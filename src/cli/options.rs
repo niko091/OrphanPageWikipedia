@@ -42,6 +42,7 @@ pub(crate) fn command() -> Command {
     )
     .arg(option("content-release").required(true))
     .arg(path_option("root", "data/dumps"))
+    .arg(option("mirror"))
     .arg(Arg::new("plan").long("plan").action(ArgAction::SetTrue));
     let quality = editions(
         Command::new("quality").about("Calcola Johnson V2 dai dump XML correnti verificati"),
@@ -62,6 +63,7 @@ pub(crate) fn command() -> Command {
             .arg(option("sql-release").required(true))
             .arg(option("history-release").required(true))
             .arg(path_option("root", "data/dumps"))
+            .arg(option("mirror"))
             .arg(Arg::new("plan").long("plan").action(ArgAction::SetTrue));
     let imported = history_controls(
         Command::new("import-dumps").about("Importa grafo SQL e cronologia verificata"),
@@ -150,6 +152,7 @@ pub(crate) fn command() -> Command {
     .arg(option("history-release").required(true))
     .arg(option("content-release"))
     .arg(path_option("dump-root", "data/dumps"))
+    .arg(option("dump-mirror").help("Copia locale di dumps.wikimedia.org, es. /public/dumps/public su Toolforge: legge i dump sul posto senza scaricarli"))
     .arg(path_option("import-dir", "data/imported"))
     .arg(path_option("output-dir", "web/data"))
     .arg(option("collection-database"))
