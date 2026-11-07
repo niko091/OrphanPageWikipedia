@@ -1,0 +1,3 @@
+# The emk/rust buildpack on Toolforge sources this file.
+# scripts/heroku-build.sh prepares the fastText archive for build.rs first.
+RUST_CARGO_BUILD_FLAGS="--release --locked --bin orphanwiki"

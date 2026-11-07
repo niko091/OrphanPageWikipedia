@@ -1,0 +1,3 @@
+# The apt buildpack on Toolforge installs these packages before the Rust build.
+# rusqlite links the system SQLite. The run image already has libsqlite3-0.
+libsqlite3-dev
