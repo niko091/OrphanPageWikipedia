@@ -306,6 +306,7 @@ const translations: Record<string, string> = {
   "Paginazione delle voci": "Article pagination",
   "Paginazione dei creatori": "Creator pagination",
   "Paginazione delle schede": "Card pagination",
+  "Paginazione dei collegamenti": "Connection pagination",
   "Pagina {page}": "Page {page}",
   "Risultati {from}–{to} · Pagina {page} di {pages}": "Results {from}–{to} · Page {page} of {pages}",
   "{n} creatori · {shown} visualizzati. Identificativi locali; lingue limitate alle wiki esaminate.": "{n} creators · {shown} displayed. Local identifiers; languages limited to scanned wikis.",

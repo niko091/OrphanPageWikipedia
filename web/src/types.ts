@@ -180,7 +180,10 @@ export interface UIElements {
   'connection-candidates': HTMLElement;
   'connection-copy-prompt': HTMLButtonElement;
   'connection-info': HTMLElement;
-  'connection-more': HTMLButtonElement;
+  'connection-pagination': HTMLElement;
+  'connection-previous': HTMLButtonElement;
+  'connection-next': HTMLButtonElement;
+  'connection-pages': HTMLElement;
   'connection-target': HTMLElement;
   'connection-title': HTMLElement;
   'creator-bots': HTMLElement;

@@ -344,6 +344,8 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await expect(page.getByRole('button', {name: 'Fixato', exact: true})).toHaveAttribute('aria-pressed', 'true');
   await page.locator('#review-close').click();
   await open(page, site, 'connections.html');
+  await expect(page.locator('#connection-candidates .review-badge')).toHaveCount(0);
+  await page.locator('#connection-reviewed').click();
   await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toHaveCount(0);
   await page.getByRole('button', {name: 'Valuta coppia', exact: true}).click();
@@ -354,6 +356,9 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await page.getByRole('button', {name: 'Bad link', exact: true}).click();
   await expect(page.locator('#review-rows button[aria-pressed="true"]')).toHaveCount(0);
   await page.locator('#review-close').click();
+  await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);
+  await page.locator('#connection-open').click();
+  await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
   await page.reload();
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
   expect(traffic.editorial).toHaveLength(4);

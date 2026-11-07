@@ -57,7 +57,8 @@ const creatorMode = (): 'observed' | 'history' | 'missing' =>
   ['collected','partially_collected'].includes(data.metadata.history?.status??'')?'history':'missing';
 const creatorsAvailable = () => creatorMode()!=='missing';
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
-let data: Dataset, datasetFile: string, loadVersion = 0, connectionLimit = 50, creatorRows: CreatorRow[] = [];
+let data: Dataset, datasetFile: string, loadVersion = 0, connectionOffset = 0, creatorRows: CreatorRow[] = [];
+const connectionPageSize=25;
 let connectionReviewed = false;
 let datasetController = new AbortController();
 let precomputed: DashboardSummaryData;
@@ -389,15 +390,16 @@ function renderConnections() {
   copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
   const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
   const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed).sort(candidateOrder);
+  connectionOffset=Math.min(connectionOffset,Math.max(0,Math.ceil(candidates.length/connectionPageSize)-1)*connectionPageSize);
   $('connection-open')!.setAttribute('aria-pressed',String(!connectionReviewed));
   $('connection-reviewed')!.setAttribute('aria-pressed',String(connectionReviewed));
   const box=$('connection-candidates')!;box.replaceChildren();
   $('connection-info')!.textContent=count==null?(t(candidateReasons[record?.status ?? '']||'Confronto tra lingue non ancora disponibile.'))
-    :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine in questa lista · {shown} visualizzate.',{n:number(candidates.length),shown:number(Math.min(connectionLimit,candidates.length))});
+    :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine in questa lista · {shown} visualizzate.',{n:number(candidates.length),shown:number(Math.min(connectionPageSize,candidates.length-connectionOffset))})+(candidates.length?' · '+t('Risultati {from}–{to} · Pagina {page} di {pages}',{from:number(connectionOffset+1),to:number(Math.min(connectionOffset+connectionPageSize,candidates.length)),page:number(connectionOffset/connectionPageSize+1),pages:number(Math.ceil(candidates.length/connectionPageSize))}):'');
   const hidden=(record?.candidates?.length??0)-visible.length;
   if(hidden)$('connection-info')!.textContent+=' '+t('{n} collegamenti nascosti dai filtri.',{n:number(hidden)});
   if(count&&candidates.length===0)box.append(element('p',t(connectionReviewed?'Nessuna valutazione in questa lista.':'Nessuna pagina da collegare in questa lista.')));
-  for(const candidate of candidates.slice(0,connectionLimit)) {
+  for(const candidate of candidates.slice(connectionOffset,connectionOffset+connectionPageSize)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
     if(candidate.dead_end===true)header.append(element('span','Dead-end page','dead-end-badge'));
@@ -417,7 +419,24 @@ function renderConnections() {
       target_title:page.title,sources:[{page_id:candidate.page_id,title:candidate.title}]}));footer.append(reviewButton);
     card.append(body,footer);box.append(card);
   }
-  $('connection-more')!.hidden=connectionLimit>=candidates.length;
+  const totalPages=Math.ceil(candidates.length/connectionPageSize),currentPage=connectionOffset/connectionPageSize+1;
+  $('connection-pagination')!.hidden=totalPages<=1;
+  $('connection-previous')!.disabled=currentPage<=1;
+  $('connection-next')!.disabled=currentPage>=totalPages;
+  const pages=$('connection-pages')!;pages.replaceChildren();
+  const start=Math.max(1,Math.min(currentPage-2,totalPages-4)),end=Math.min(totalPages,start+4);
+  const pageNumbers=[...new Set([1,...Array.from({length:Math.max(0,end-start+1)},(_,i)=>start+i),totalPages])].filter(value=>value>0);
+  let last=0;
+  for(const value of pageNumbers) {
+    if(last&&value-last>1)pages.append(element('span','…'));
+    const button=element('button',number(value));button.type='button';button.setAttribute('aria-label',t('Pagina {page}',{page:number(value)}));
+    if(value===currentPage)button.setAttribute('aria-current','page');
+    button.addEventListener('click',()=>changeConnectionPage((value-1)*connectionPageSize));pages.append(button);last=value;
+  }
+}
+function changeConnectionPage(offset: number) {
+  connectionOffset=offset;renderConnections();
+  $('connection-pages')!.querySelector<HTMLButtonElement>('[aria-current="page"]')?.focus();
 }
 let datasetEntries: ManifestEntry[] = [];
 function languageEntries(language: string): ManifestEntry[] {return datasetEntries.filter(entry=>entry.language===language);}
@@ -489,7 +508,7 @@ async function load(entry: ManifestEntry) {
     }
   }
   if(!next)return;
-  data=next; datasetFile=entry.file; connectionLimit=50;
+  data=next; datasetFile=entry.file; connectionOffset=0;
   datasetLinks(entry);
   if(deorphanizePage||connectionsPage) {
     resetReviews();
@@ -636,7 +655,7 @@ for(const id of linkFilterIds) {
   node.checked=readPreference('orphanwiki-'+id,'show',['show','hide'])==='hide';
   node.addEventListener('change',()=>{
     savePreference('orphanwiki-'+id,node.checked?'hide':'show');
-    closePrompt();connectionLimit=50;
+    closePrompt();connectionOffset=0;
     if(data){if(deorphanizePage)candidateCards();else if(connectionsPage)renderConnections();}
   });
 }
@@ -655,9 +674,10 @@ $('creator-more')?.addEventListener('click',()=>stepListPage('creators',1));
 $('article-previous')?.addEventListener('click',()=>stepListPage('articles',-1));
 $('creator-previous')?.addEventListener('click',()=>stepListPage('creators',-1));
 $('candidate-previous')?.addEventListener('click',()=>stepListPage('cards',-1));
-$('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
-$('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionLimit=50;renderConnections();});
-$('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionLimit=50;renderConnections();});
+$('connection-previous')?.addEventListener('click',()=>changeConnectionPage(connectionOffset-connectionPageSize));
+$('connection-next')?.addEventListener('click',()=>changeConnectionPage(connectionOffset+connectionPageSize));
+$('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionOffset=0;renderConnections();});
+$('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionOffset=0;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>stepListPage('cards',1));
 const explorer=createExplorer({get data(){return data;},get datasetFile(){return datasetFile;},get loadVersion(){return loadVersion;},
  get precomputed(){return precomputed;},pageKey,hiddenTargetCategories,creatorListInfo,
