@@ -137,6 +137,7 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await page.locator('#candidate-search').fill(title(1));
   await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(1);
   await page.locator('#candidate-cards a[href*="connections.html"]').click();
+  await expect(page.locator('#candidate-hidden')).toHaveCount(0);
   await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(1);
   await expect(page.locator('.connection-evidence').first()).toBeHidden();
   await page.locator('.connection-details summary').first().click();

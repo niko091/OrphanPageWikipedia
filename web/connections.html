@@ -7,15 +7,6 @@
 <main>
 
 <div class="toolbar"><label><span data-i18n="Modello LLM">Modello LLM</span><select id="llm-provider"></select></label><button type="button" id="connection-copy-prompt" disabled data-i18n="Prepara prompt e fonti">Prepara prompt e fonti</button><a id="download" download data-i18n="Scarica tutti i dati CSV">Scarica tutti i dati CSV</a></div>
-<div id="candidate-hidden-control"><button id="candidate-hidden" type="button" aria-expanded="false" aria-controls="candidate-hidden-options" title="Scegli quali pagine nascoste mostrare." data-i18n-title="Scegli quali pagine nascoste mostrare." data-i18n="Pagine nascoste">Pagine nascoste</button>
-<div id="candidate-hidden-options" role="group" aria-label="Pagine nascoste" data-i18n-aria-label="Pagine nascoste" hidden>
-      <fieldset><legend data-i18n="Collegamenti consigliati">Collegamenti consigliati</legend>
-      <label><input id="candidate-hide-link-disambiguation" type="checkbox"><span data-i18n="Nascondi collegamenti da disambigue">Nascondi collegamenti da disambigue</span></label>
-      <label><input id="candidate-hide-link-names" type="checkbox"><span data-i18n="Nascondi collegamenti da categorie di nomi e cognomi">Nascondi collegamenti da categorie di nomi e cognomi</span></label>
-      <label><input id="candidate-hide-link-redirects" type="checkbox"><span data-i18n="Nascondi collegamenti da redirect e soft redirect">Nascondi collegamenti da redirect e soft redirect</span></label>
-      </fieldset>
-      <p class="muted" data-i18n="Filtri sulle categorie disponibili, non una classificazione completa. Tipi sconosciuti e hatnote non sono identificabili. I conteggi totali restano invariati.">Filtri sulle categorie disponibili, non una classificazione completa. Tipi sconosciuti e hatnote non sono identificabili. I conteggi totali restano invariati.</p>
-</div></div>
 <p id="status" role="status" data-i18n="Caricamento…">Caricamento…</p>
 <p id="review-service-status" class="muted" role="status"></p>
 <section id="connection-target" class="panel"></section>
@@ -33,4 +24,4 @@
 </footer>
 <dialog id="llm-prompt" aria-labelledby="llm-prompt-title"><h2 id="llm-prompt-title">Prompt</h2><p data-i18n="Le fonti vengono lette da Wikipedia dopo il clic. Copia il pacchetto e invialo manualmente al modello scelto.">Le fonti vengono lette da Wikipedia dopo il clic. Copia il pacchetto e invialo manualmente al modello scelto.</p><p id="llm-prompt-status" role="status"></p><label class="prompt-debug"><input type="checkbox" id="llm-prompt-debug"><span data-i18n="Aggiungi DEBUG (test del prompt)">Aggiungi DEBUG (test del prompt)</span></label><textarea id="llm-prompt-text" readonly spellcheck="false" aria-label="Prompt"></textarea><div class="prompt-actions"><button type="button" id="llm-prompt-copy" disabled data-i18n="Copia prompt e fonti">Copia prompt e fonti</button><a id="llm-prompt-open" class="connect-button" target="_blank" rel="noopener noreferrer">Apri chat</a><button type="button" id="llm-prompt-finished" disabled>Finished</button><button type="button" id="llm-prompt-close" data-i18n="Chiudi">Chiudi</button></div></dialog>
 <dialog id="review-dialog" aria-labelledby="review-title"><h2 id="review-title" data-i18n="Valuta le coppie di pagine">Valuta le coppie di pagine</h2><p id="review-dialog-status" role="status"></p><div id="review-rows"></div><div class="prompt-actions"><button id="review-close" type="button" data-i18n="Chiudi">Chiudi</button></div></dialog>
-<script type="module" src="assets/app.js?v=c0d8b9d6bec4"></script></body></html>
+<script type="module" src="assets/app.js?v=294a07d1cc59"></script></body></html>

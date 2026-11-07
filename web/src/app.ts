@@ -333,15 +333,18 @@ function hiddenTargetCategories(): string[] {
   ];
 }
 const linkFilterIds=['candidate-hide-link-disambiguation','candidate-hide-link-names','candidate-hide-link-redirects'] as const;
+function linkFilterActive(id: typeof linkFilterIds[number]): boolean {
+  return $(id)?.checked??readPreference('orphanwiki-'+id,'show',['show','hide'])==='hide';
+}
 function hiddenSuggestedLink(page: PageObservation,candidate: Candidate): boolean {
-  if(!linkFilterIds.some(id=>$(id)?.checked))return false;
+  if(!linkFilterIds.some(linkFilterActive))return false;
   const category=candidate.category??data.pages.find(source=>source.page_id===candidate.page_id&&pageLanguage(source)===pageLanguage(page))?.category;
   if(typeof category!=='string')return false;
   const normalized=filterCategoryName(category),folded=orphanCategoryName({...page,category});
-  return Boolean($('candidate-hide-link-disambiguation')?.checked&&specialOrphanCategories.has(folded)&&
+  return Boolean(linkFilterActive('candidate-hide-link-disambiguation')&&specialOrphanCategories.has(folded)&&
       !['insiemi di caratteri','set di caratteri','character sets','jeux de caracteres','conjunts de caracters','conjuntos de caracteres'].includes(folded)||
-    $('candidate-hide-link-names')?.checked&&nameIndexCategories.includes(normalized)||
-    $('candidate-hide-link-redirects')?.checked&&(redirectOrphanCategories.has(folded)||softRedirectCategories.includes(normalized)));
+    linkFilterActive('candidate-hide-link-names')&&nameIndexCategories.includes(normalized)||
+    linkFilterActive('candidate-hide-link-redirects')&&(redirectOrphanCategories.has(folded)||softRedirectCategories.includes(normalized)));
 }
 function candidateCards() {
   if(!deorphanizePage||$('dataset')!.value==='')return;
@@ -630,7 +633,7 @@ $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.l
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});
 for(const id of ['candidate-search','candidate-category','candidate-sort']) $(id)?.addEventListener('input',()=>{if(data)candidateCards();});
-if(deorphanizePage||connectionsPage) {
+if(deorphanizePage) {
   const button=$('candidate-hidden')!,options=$('candidate-hidden-options')!;
   const open=(visible: boolean)=>{
     options.hidden=!visible;button.setAttribute('aria-expanded',String(visible));
