@@ -58,6 +58,7 @@ const creatorMode = (): 'observed' | 'history' | 'missing' =>
 const creatorsAvailable = () => creatorMode()!=='missing';
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, connectionLimit = 50, creatorRows: CreatorRow[] = [];
+let connectionReviewed = false;
 let datasetController = new AbortController();
 let precomputed: DashboardSummaryData;
 let profileRequestVersion = 0;
@@ -386,12 +387,16 @@ function renderConnections() {
   copyButton.disabled=!connectionCopyRequest;
   copyButton.textContent=t('Prepara prompt e fonti');
   copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
-  const candidates=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate)).sort((a,b)=>Number(closedEdge(page,a.page_id))-Number(closedEdge(page,b.page_id))||candidateOrder(a,b));
+  const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
+  const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed).sort(candidateOrder);
+  $('connection-open')!.setAttribute('aria-pressed',String(!connectionReviewed));
+  $('connection-reviewed')!.setAttribute('aria-pressed',String(connectionReviewed));
   const box=$('connection-candidates')!;box.replaceChildren();
   $('connection-info')!.textContent=count==null?(t(candidateReasons[record?.status ?? '']||'Confronto tra lingue non ancora disponibile.'))
-    :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine candidate · {shown} visualizzate. Verifica il contenuto prima di aggiungere il collegamento.',{n:number(count),shown:number(Math.min(connectionLimit,candidates.length))});
-  const hidden=(record?.candidates?.length??0)-candidates.length;
+    :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine in questa lista · {shown} visualizzate.',{n:number(candidates.length),shown:number(Math.min(connectionLimit,candidates.length))});
+  const hidden=(record?.candidates?.length??0)-visible.length;
   if(hidden)$('connection-info')!.textContent+=' '+t('{n} collegamenti nascosti dai filtri.',{n:number(hidden)});
+  if(count&&candidates.length===0)box.append(element('p',t(connectionReviewed?'Nessuna valutazione in questa lista.':'Nessuna pagina da collegare in questa lista.')));
   for(const candidate of candidates.slice(0,connectionLimit)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
@@ -651,6 +656,8 @@ $('article-previous')?.addEventListener('click',()=>stepListPage('articles',-1))
 $('creator-previous')?.addEventListener('click',()=>stepListPage('creators',-1));
 $('candidate-previous')?.addEventListener('click',()=>stepListPage('cards',-1));
 $('connection-more')?.addEventListener('click',()=>{connectionLimit+=50;renderConnections();});
+$('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionLimit=50;renderConnections();});
+$('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionLimit=50;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>stepListPage('cards',1));
 const explorer=createExplorer({get data(){return data;},get datasetFile(){return datasetFile;},get loadVersion(){return loadVersion;},
  get precomputed(){return precomputed;},pageKey,hiddenTargetCategories,creatorListInfo,

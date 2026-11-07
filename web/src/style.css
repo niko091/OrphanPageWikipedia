@@ -472,6 +472,8 @@ dialog textarea {
   margin-top: 20px;
 }
 
+.connection-views { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-block: 1rem; }
+.connection-views button[aria-pressed="true"] { font-weight: bold; border-color: var(--color-progressive, #36c); }
 .connection-list {
   display: grid;
   gap: 20px;
