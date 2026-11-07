@@ -156,16 +156,26 @@ test('article chart references stay readable in both languages and themes',async
       await page.locator('#chart-type').selectOption(mode);
       for(const id of ['age','length']) {
         const chart=page.locator('#'+id);await chart.scrollIntoViewIfNeeded();
-        const labels=await chart.locator('svg text').evaluateAll(nodes=>nodes.filter(node=>node.getAttribute('y')===
-          String(Number(node.closest('svg')!.getAttribute('viewBox')!.split(' ')[3])-76+30)).map(node=>{
-            const bounds=node.getBoundingClientRect();return {text:node.textContent,left:bounds.left,right:bounds.right};
-          }));
-        expect(labels.length).toBeGreaterThan(id==='length'?1:0);
-        expect(new Set(labels.map(label=>label.text)).size).toBe(labels.length);
-        const bounds=await chart.boundingBox();assert(bounds);
-        for(const label of labels) {
-          expect(label.left).toBeGreaterThanOrEqual(bounds.x-1);expect(label.right).toBeLessThanOrEqual(bounds.x+bounds.width+1);
-        }
+        // Resize redraws replace the SVG after a debounce. Read the chart and
+        // its current labels together so detached text cannot yield zero bounds.
+        await expect(async()=>{
+          const {bounds,labels}=await chart.evaluate(node=>{
+            const rect=node.getBoundingClientRect();
+            const labels=Array.from(node.querySelectorAll('svg text')).filter(label=>label.getAttribute('y')===
+              String(Number(label.closest('svg')!.getAttribute('viewBox')!.split(' ')[3])-76+30)).map(label=>{
+                const rect=label.getBoundingClientRect();
+                return {text:label.textContent,left:rect.left,right:rect.right,width:rect.width};
+              });
+            return {bounds:{left:rect.left,right:rect.right},labels};
+          });
+          expect(labels.length).toBeGreaterThan(id==='length'?1:0);
+          expect(new Set(labels.map(label=>label.text)).size).toBe(labels.length);
+          for(const label of labels) {
+            expect(label.width).toBeGreaterThan(0);
+            expect(label.left).toBeGreaterThanOrEqual(bounds.left-1);
+            expect(label.right).toBeLessThanOrEqual(bounds.right+1);
+          }
+        }).toPass({timeout:10_000});
         if(mode==='percent')await expect(chart).toContainText('Le barre alle estremità');
         else await expect(chart.locator('svg path')).toHaveCount(2);
         await chart.screenshot({path:testInfo.outputPath(`${id}-${mode}-${width}-${theme}.png`)});
