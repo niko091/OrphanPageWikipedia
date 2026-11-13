@@ -58,7 +58,7 @@ const creatorMode = (): 'observed' | 'history' | 'missing' =>
 const creatorsAvailable = () => creatorMode()!=='missing';
 const label = (row: PageObservation) => (data.metadata.kind==='aggregate'?pageLanguage(row).toUpperCase()+' · ':'')+(row.category ?? t('Senza categoria idonea'));
 let data: Dataset, datasetFile: string, loadVersion = 0, connectionOffset = 0, creatorRows: CreatorRow[] = [];
-const connectionPageSize=24;
+const connectionPageSize=16;
 let connectionReviewed = false;
 let datasetController = new AbortController();
 let precomputed: DashboardSummaryData;
