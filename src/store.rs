@@ -1,7 +1,6 @@
 //! One immutable, relational publication for the complete selected census.
 //! JSON is an HTTP encoding and a lossless encoding of scientific attributes,
 //! not a second on-disk publication. Reviews live in their independent store.
-mod export;
 mod publication;
 mod query;
 mod resources;

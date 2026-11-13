@@ -85,6 +85,7 @@ const test = base.extend<{traffic: {editorial: string[]}}, {site: string}>({
 async function open(page: Page, site: string, filename: string): Promise<void> {
   await page.goto(`${site}/${filename}?dataset=fixture.json${filename === 'connections.html' ? '&page=1' : ''}`);
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
+  await expect(page.locator('#download, a[download], a[href*="api/export"]')).toHaveCount(0);
   // Cards hydrate after the index: inspect layout only when their controls are ready.
   if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(16);
 }

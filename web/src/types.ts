@@ -217,7 +217,6 @@ export interface UIElements {
   'creators-link': HTMLAnchorElement;
   'dataset': HTMLSelectElement;
   'dataset-date': HTMLSelectElement;
-  'download': HTMLAnchorElement;
   'deorphanize-link': HTMLAnchorElement;
   'features-paper': HTMLElement;
   'length': HTMLElement;

@@ -31,9 +31,7 @@ pub use canonical::{
     CSV_COLUMNS,
 };
 #[cfg(feature = "cli")]
-pub(crate) use canonical::{
-    file_signature, stage_export, visit_ordered_json, write_csv_row, CanonicalExport,
-};
+pub(crate) use canonical::{file_signature, stage_export, visit_ordered_json, CanonicalExport};
 #[cfg(feature = "cli")]
 use canonical::{python_json, write_atomic, write_sorted_json, CanonicalDigest};
 #[cfg(feature = "cli")]

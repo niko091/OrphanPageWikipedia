@@ -461,7 +461,6 @@ function selectedEntry(): ManifestEntry | undefined {
   return date==='latest'?choices[0]:choices.find(entry=>entry.date.startsWith(date));
 }
 function datasetLinks(entry: ManifestEntry) {
-  if($('download')){$('download')!.hidden=entry.kind==='aggregate';$('download')!.href='api/export?dataset='+encodeURIComponent(entry.file);}
   $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
   $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
   $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
@@ -475,7 +474,6 @@ function clearLanguageSelection() {
   document.body.dataset.loading='true';
   if($('dataset-date'))$('dataset-date')!.disabled=true;
   $('profile-apply')!.disabled=true;
-  $('download')!.hidden=true;
   $('candidate-cards')!.replaceChildren();$('candidate-info')!.textContent='';
   $('status')!.hidden=false;$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
   for(const [id,file] of [['articles-link','index.html'],['creators-link','creators.html'],['deorphanize-link','deorphanize.html']] as const)$(id)!.href=file;
@@ -557,7 +555,6 @@ function refreshCategoryChoices() {
 function renderDataset() {
   if(document.body.dataset.loading==='true')return;
   if(deorphanizePage&&$('dataset')!.value==='')return;
-  if($('download'))$('download')!.textContent=t('Scarica tutti i dati CSV');
   if($('dataset')) for(const option of $('dataset')!.children)if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
   if($('dataset-date'))$('dataset-date')!.children[0].textContent=t('Ultima disponibile');
   if($('creator-sort'))for(const child of $('creator-sort')!.children) {

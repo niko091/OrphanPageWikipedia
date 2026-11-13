@@ -88,7 +88,6 @@ const translations: Record<string, string> = {
   "Percentuale del gruppo per intervallo": "Within-group percentage per bin",
   "Numero di pagine per intervallo": "Page count per bin",
   "Percentuale cumulativa per gruppo": "Within-group cumulative percentage",
-  "Scarica tutti i dati CSV": "Download all data as CSV",
   "Caricamento dei dataset…": "Loading datasets…",
   "Indicatori generali": "Overview",
   "In quali categorie si trovano?": "Which categories contain orphans?",

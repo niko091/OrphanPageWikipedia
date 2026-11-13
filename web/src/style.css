@@ -555,10 +555,6 @@ dialog textarea {
   vertical-align: middle;
 }
 
-.toolbar #download {
-  margin-left: auto;
-}
-
 body[data-page="connections"] .toolbar select,body[data-page="connections"] #connection-copy-prompt {
   height: 42px;
   font-size: .85rem;
@@ -1105,9 +1101,6 @@ dialog textarea:focus-visible {
   }
   .toolbar select,.toolbar input,.list-controls input,.list-controls select {
     width: 100%;
-  }
-  .toolbar #download {
-    margin-left: 0;
   }
   .candidate-body {
     padding: 16px;

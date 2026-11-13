@@ -180,15 +180,6 @@ fn private_collection_staging_omits_file_transports_and_preserves_every_relation
     let original = Census::open(&w.db()).unwrap();
     let compact = Census::open(&destination).unwrap();
     compact.verify().unwrap();
-    let mut original_csv = Vec::new();
-    let mut compact_csv = Vec::new();
-    original
-        .export_csv(w.entries[0]["file"].as_str().unwrap(), &mut original_csv)
-        .unwrap();
-    compact
-        .export_csv(w.entries[0]["file"].as_str().unwrap(), &mut compact_csv)
-        .unwrap();
-    assert_eq!(original_csv, compact_csv);
     for (before, after) in w
         .entries
         .as_array()
@@ -545,15 +536,6 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
     request = w.request("articles");
     request.dataset = "all.json".into();
     assert_eq!(db.query(&request, &[]).unwrap()["total"], 126);
-    let mut csv = Vec::new();
-    db.export_csv(w.entries[0]["file"].as_str().unwrap(), &mut csv)
-        .unwrap();
-    dumps::export_csv(
-        &w.root.join(w.entries[0]["file"].as_str().unwrap()),
-        &w.root.join("expected.csv"),
-    )
-    .unwrap();
-    assert_eq!(csv, fs::read(w.root.join("expected.csv")).unwrap());
     assert!(db.resource("collection.sqlite").is_err());
     request.order = "title; DROP TABLE pages".into();
     assert!(db.query(&request, &[]).is_err());
@@ -724,7 +706,7 @@ fn startup_scan_is_optional_but_publication_metadata_and_default_verification_re
 }
 
 #[test]
-fn http_dashboard_queries_downloads_and_reviews_work_with_only_the_database() {
+fn http_dashboard_queries_and_reviews_work_with_only_the_database() {
     struct Server(std::process::Child);
     impl Drop for Server {
         fn drop(&mut self) {
@@ -802,8 +784,7 @@ fn http_dashboard_queries_downloads_and_reviews_work_with_only_the_database() {
         ))
         .send()
         .unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(response.text().unwrap().starts_with("page_id,title,"));
+    assert_eq!(response.status(), 404);
     let review = json!({"dataset":entry["file"],"language":"vec","source_id":101,"target_id":1,"status":"fixed","version":0});
     assert_eq!(
         client

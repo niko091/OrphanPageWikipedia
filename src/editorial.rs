@@ -12,7 +12,7 @@ use axum::{
     routing::any,
     Json, Router,
 };
-use http::{api, export_csv, page_query, response, static_file};
+use http::{api, page_query, response, static_file};
 use mysql::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -208,7 +208,6 @@ impl ReviewApplication {
         Router::new()
             .route("/api/reviews", any(api))
             .route("/api/pages", any(page_query))
-            .route("/api/export", any(export_csv))
             .route("/api/auth/{action}", any(auth))
             .fallback(static_file)
             .with_state(Arc::new(self))
