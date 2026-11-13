@@ -461,9 +461,9 @@ dependencies = [
 
 [[package]]
 name = "focaccia"
-version = "2.0.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ef16690750b6e9a238378f57d3c1325d42e2d82e29b7dfd75f6d387d753b050"
+checksum = "c114fe521cea82ffe5abaa600e828810e8b7a62cde9529da6ebfcd72b9812abe"
 
 [[package]]
 name = "foldhash"
