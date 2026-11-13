@@ -150,6 +150,7 @@ test('four pages load real assets, charts and prepared records', async ({page, s
 test('deorphanize requires a language after aggregate navigation and preserves specific editions',async({page,site,traffic})=>{
   for(const filename of ['index.html','creators.html']) {
     await open(page,site,filename);
+    await expect(page.locator('#dataset-date')).toBeVisible();
     await expect(page.locator('#dataset option[value="all"]')).toHaveCount(1);
     await page.locator('#dataset').selectOption('all');
     await expect(page.locator('body')).toHaveAttribute('data-loading','false');
@@ -158,7 +159,8 @@ test('deorphanize requires a language after aggregate navigation and preserves s
     await expect(page.locator('#dataset option[value="all"]')).toHaveCount(0);
     await expect(page.locator('#dataset option:checked')).toHaveText('Seleziona le lingue');
     await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(0);
-    await expect(page.locator('#dataset-date')).toBeDisabled();
+    await expect(page.locator('#dataset-date')).toHaveCount(0);
+    await expect(page.locator('[data-i18n="Data di estrazione"]')).toHaveCount(0);
     await page.locator('#ui-language-toggle').click();
     await expect(page.locator('#dataset option:checked')).toHaveText('Select Languages');
     await page.locator('#ui-language-toggle').click();

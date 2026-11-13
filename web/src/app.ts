@@ -455,7 +455,7 @@ function refreshDateChoices(preferred='latest') {
 }
 function selectedEntry(): ManifestEntry | undefined {
   const choices=languageEntries($('dataset')!.value);
-  const date=$('dataset-date')!.value;
+  const date=$('dataset-date')?.value??'latest';
   return date==='latest'?choices[0]:choices.find(entry=>entry.date.startsWith(date));
 }
 function datasetLinks(entry: ManifestEntry) {
@@ -471,7 +471,7 @@ function clearLanguageSelection() {
   ++profileRequestVersion;profileController.abort();
   closePrompt();lastError=null;
   document.body.dataset.loading='true';
-  $('dataset-date')!.disabled=true;
+  if($('dataset-date'))$('dataset-date')!.disabled=true;
   $('profile-apply')!.disabled=true;
   $('download')!.hidden=true;
   $('candidate-cards')!.replaceChildren();$('candidate-info')!.textContent='';
@@ -729,12 +729,12 @@ export const dashboardReady=(async()=>{
   $('dataset')!.value=deorphanizePage&&(!matching||matching.language==='all')?'':matching?.language??(languages.includes('all')?'all':languages[0]);
   refreshDateChoices(matching?.date.slice(0,10));
   $('dataset')!.addEventListener('change',async()=>{
-    const previous=$('dataset-date')!.value;
+    const previous=$('dataset-date')?.value??'latest';
     refreshDateChoices(previous);
     if(deorphanizePage&&$('dataset')!.value===''){clearLanguageSelection();return;}
     const entry=selectedEntry();if(entry)await load(entry).catch(fail);
   });
-  $('dataset-date')!.addEventListener('change',async()=>{
+  $('dataset-date')?.addEventListener('change',async()=>{
     const entry=selectedEntry();if(entry)await load(entry).catch(fail);
   });
   if(deorphanizePage&&$('dataset')!.value==='') {
