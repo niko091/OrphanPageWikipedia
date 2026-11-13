@@ -387,10 +387,12 @@ function renderConnections() {
   target.append(element('h2',t('Pagina da collegare')),wikiLink(page.title,pageLanguage(page)),element('p',t('Lingua: {language} · {category}',{language:pageLanguage(page).toUpperCase(),category:label(page)})));
   const record=data.link_candidates?.[pageKey(page)],count=record?.candidate_count;
   setConnectionCopyRequest(fixRequest(page,record));
-  const copyButton=$('connection-copy-prompt')!;
-  copyButton.disabled=!connectionCopyRequest;
-  copyButton.textContent=t('Prepara prompt e fonti');
-  copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
+  const copyButton=$('connection-copy-prompt');
+  if(copyButton) {
+    copyButton.disabled=!connectionCopyRequest;
+    copyButton.textContent=t('Prepara prompt e fonti');
+    copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
+  }
   const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
   const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed).sort(candidateOrder);
   connectionOffset=Math.min(connectionOffset,Math.max(0,Math.ceil(candidates.length/connectionPageSize)-1)*connectionPageSize);

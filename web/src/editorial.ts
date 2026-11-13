@@ -131,7 +131,8 @@ export async function loadSharedReviews(): Promise<void> {
     const reviews=await readReviews(file);
     if(version!==editorialContext.loadVersion||file!==editorialContext.datasetFile||request!==reviewReadVersion)return;
     editorialReviews=reviews;reviewsAvailable=true;
-    $('review-service-status')!.textContent=deorphanizePage?'':t('Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.');
+    const status=$('review-service-status');
+    if(status)status.textContent=deorphanizePage?'':t('Valutazioni condivise degli utenti; non verificate automaticamente su Wikipedia.');
   } catch(error) {
     if(version!==editorialContext.loadVersion||file!==editorialContext.datasetFile||request!==reviewReadVersion)return;
     reviewsAvailable=false;throw error;
