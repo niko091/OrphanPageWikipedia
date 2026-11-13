@@ -60,6 +60,7 @@ const translations: Record<string, string> = {
   "Nessuna pagina candidata disponibile per preparare il prompt.": "No candidate pages are available to prepare the prompt.",
   "Tutte le lingue": "All languages",
   "Seleziona": "Select",
+  "Seleziona le lingue": "Select Languages",
   "Seleziona una lingua per visualizzare le voci orfane.": "Select a language to view orphan articles.",
   "Interfaccia italiana: passa all’inglese": "Italian interface: switch to English",
   "Interfaccia inglese: passa all’italiano": "English interface: switch to Italian",

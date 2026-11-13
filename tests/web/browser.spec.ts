@@ -147,6 +147,32 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   expect(traffic.editorial).toEqual([]);
 });
 
+test('deorphanize requires a language after aggregate navigation and preserves specific editions',async({page,site,traffic})=>{
+  for(const filename of ['index.html','creators.html']) {
+    await open(page,site,filename);
+    await expect(page.locator('#dataset option[value="all"]')).toHaveCount(1);
+    await page.locator('#dataset').selectOption('all');
+    await expect(page.locator('body')).toHaveAttribute('data-loading','false');
+    await page.locator('#deorphanize-link').click();
+    await expect(page.locator('#dataset')).toHaveValue('');
+    await expect(page.locator('#dataset option[value="all"]')).toHaveCount(0);
+    await expect(page.locator('#dataset option:checked')).toHaveText('Seleziona le lingue');
+    await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(0);
+    await expect(page.locator('#dataset-date')).toBeDisabled();
+    await page.locator('#ui-language-toggle').click();
+    await expect(page.locator('#dataset option:checked')).toHaveText('Select Languages');
+    await page.locator('#ui-language-toggle').click();
+    await page.locator('#dataset').selectOption('lmo');
+    await expect(page.locator('body')).toHaveAttribute('data-loading','false');
+    await page.locator(filename==='index.html'?'#articles-link':'#creators-link').click();
+    await expect(page.locator('#dataset')).toHaveValue('lmo');
+    await page.locator('#deorphanize-link').click();
+    await expect(page.locator('#dataset')).toHaveValue('lmo');
+    await expect(page.locator('body')).toHaveAttribute('data-loading','false');
+  }
+  expect(traffic.editorial).toEqual([]);
+});
+
 test('article chart references stay readable in both languages and themes',async({page,site},testInfo)=>{
   await open(page,site,'index.html');
   for(const width of [1280,390])for(const theme of ['light','dark']) {

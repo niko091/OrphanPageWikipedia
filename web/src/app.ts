@@ -44,7 +44,7 @@ function applyTranslations() {
   for(const node of document.querySelectorAll<HTMLElement>('[data-i18n]'))node.textContent=t(node.dataset.i18n!);
   for(const attr of ['placeholder','aria-label','title'])for(const node of document.querySelectorAll(`[data-i18n-${attr}]`))node.setAttribute(attr,t(node.getAttribute('data-i18n-'+attr)!));
   if(deorphanizePage&&$('dataset'))for(const option of $('dataset')!.children) {
-    if((option as HTMLOptionElement).value==='')option.textContent=t('Seleziona');
+    if((option as HTMLOptionElement).value==='')option.textContent=t('Seleziona le lingue');
     if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
   }
   if(deorphanizePage&&datasetEntries.length&&$('dataset')!.value==='')$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
@@ -719,8 +719,9 @@ export const dashboardReady=(async()=>{
     if(!entry)throw new Error('Raccolta richiesta non disponibile');
     await load(entry);return;
   }
-  const languages=[...new Set(entries.map(entry=>entry.language))].sort();
-  if(deorphanizePage)$('dataset')!.append(new Option(t('Seleziona'),''));
+  const languages=[...new Set(entries.map(entry=>entry.language))].filter(language=>!deorphanizePage||language!=='all').sort();
+  if(!languages.length)throw new Error('Nessuna raccolta reale presente');
+  if(deorphanizePage)$('dataset')!.append(new Option(t('Seleziona le lingue'),''));
   if(languages.includes('all'))$('dataset')!.append(new Option(t('Tutte le lingue'),'all'));
   for(const language of languages)if(language!=='all')$('dataset')!.append(new Option(language.toUpperCase(),language));
   const matching=entries.find(entry=>entry.file===requested);
