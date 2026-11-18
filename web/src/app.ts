@@ -394,7 +394,9 @@ function renderConnections() {
     copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
   }
   const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
-  const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed).sort(candidateOrder);
+  const search=$('connection-search')!.value.trim().normalize().toLowerCase();
+  const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed&&
+    (!search||candidate.title.normalize().toLowerCase().includes(search))).sort(candidateOrder);
   connectionOffset=Math.min(connectionOffset,Math.max(0,Math.ceil(candidates.length/connectionPageSize)-1)*connectionPageSize);
   $('connection-open')!.setAttribute('aria-pressed',String(!connectionReviewed));
   $('connection-reviewed')!.setAttribute('aria-pressed',String(connectionReviewed));
@@ -403,7 +405,11 @@ function renderConnections() {
     :count===0?t('Nessuna pagina candidata individuata con le corrispondenze disponibili.'):t('{n} pagine in questa lista · {shown} visualizzate.',{n:number(candidates.length),shown:number(Math.min(connectionPageSize,candidates.length-connectionOffset))})+(candidates.length?' · '+t('Risultati {from}–{to} · Pagina {page} di {pages}',{from:number(connectionOffset+1),to:number(Math.min(connectionOffset+connectionPageSize,candidates.length)),page:number(connectionOffset/connectionPageSize+1),pages:number(Math.ceil(candidates.length/connectionPageSize))}):'');
   const hidden=(record?.candidates?.length??0)-visible.length;
   if(hidden)$('connection-info')!.textContent+=' '+t('{n} collegamenti nascosti dai filtri.',{n:number(hidden)});
-  if(count&&candidates.length===0)box.append(element('p',t(connectionReviewed?'Nessuna valutazione in questa lista.':'Nessuna pagina da collegare in questa lista.')));
+  if(count&&candidates.length===0) {
+    const message=search?'Nessuna pagina corrisponde alla ricerca.':
+      connectionReviewed?'Nessuna valutazione in questa lista.':'Nessuna pagina da collegare in questa lista.';
+    box.append(element('p',t(message)));
+  }
   for(const candidate of candidates.slice(connectionOffset,connectionOffset+connectionPageSize)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
@@ -682,6 +688,7 @@ $('creator-previous')?.addEventListener('click',()=>stepListPage('creators',-1))
 $('candidate-previous')?.addEventListener('click',()=>stepListPage('cards',-1));
 $('connection-previous')?.addEventListener('click',()=>changeConnectionPage(connectionOffset-connectionPageSize));
 $('connection-next')?.addEventListener('click',()=>changeConnectionPage(connectionOffset+connectionPageSize));
+$('connection-search')?.addEventListener('input',()=>{if(data){connectionOffset=0;renderConnections();}});
 $('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionOffset=0;renderConnections();});
 $('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionOffset=0;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>stepListPage('cards',1));

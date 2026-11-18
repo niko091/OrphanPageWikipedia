@@ -472,7 +472,29 @@ dialog textarea {
   margin-top: 20px;
 }
 
-.connection-views { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-block: 1rem; }
+.connection-toolbar,.connection-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.connection-toolbar {
+  align-items: center;
+  margin-block: 1rem;
+}
+
+.connection-search {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-inline-start: auto;
+}
+
+.connection-search input {
+  flex: 1 1 12rem;
+  min-inline-size: 0;
+}
+
 .connection-views button[aria-pressed="true"] { font-weight: bold; border-color: var(--color-progressive, #36c); }
 .connection-list {
   margin-block-start: 16px;

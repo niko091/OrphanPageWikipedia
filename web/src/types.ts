@@ -164,6 +164,7 @@ export interface UIElements {
   'candidate-hide-link-disambiguation': HTMLInputElement;
   'candidate-hide-link-names': HTMLInputElement;
   'candidate-hide-link-redirects': HTMLInputElement;
+  'connection-search': HTMLInputElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;
   'auth-login': HTMLButtonElement;

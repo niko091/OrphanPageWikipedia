@@ -268,6 +268,8 @@ const translations: Record<string, string> = {
   "Pagina da collegare": "Page to connect",
   "Potenziali collegamenti in entrata": "Potential incoming links",
   "Collegamenti valutati": "Review Links",
+  "Cerca per titolo": "Search by title",
+  "Nessuna pagina corrisponde alla ricerca.": "No pages match your search.",
   "Liste dei collegamenti": "Connection lists",
   "{n} pagine in questa lista · {shown} visualizzate.": "{n} pages in this list · {shown} displayed.",
   "Nessuna valutazione in questa lista.": "No reviews in this list.",

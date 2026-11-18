@@ -146,6 +146,14 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await expect(page.locator('.connection-evidence').first()).toBeVisible();
   await expect(page.locator('#connection-title')).toHaveText('Analyzing and Categorizing Orphan Pages in Wikipedia');
   await expect(page.locator('#connection-target')).toContainText(title(1));
+  const search=page.getByRole('searchbox',{name:'Cerca per titolo'});
+  await expect(search).toBeVisible();
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
+  await page.setViewportSize({width:1280,height:844});
+  const searchBounds=await search.boundingBox(),reviewBounds=await page.locator('#connection-reviewed').boundingBox();
+  assert(searchBounds&&reviewBounds);
+  expect(searchBounds.x).toBeGreaterThan(reviewBounds.x+reviewBounds.width);
+  expect(Math.abs(searchBounds.y-reviewBounds.y)).toBeLessThanOrEqual(2);
   expect(traffic.editorial).toEqual([]);
 });
 
@@ -391,6 +399,12 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await expect(page.locator('#connection-candidates .review-badge')).toHaveCount(0);
   await page.locator('#connection-reviewed').click();
   await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
+  const search=page.getByRole('searchbox',{name:'Cerca per titolo'});
+  await search.fill('SENZA RISULTATI');
+  await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);
+  await expect(page.getByText('Nessuna pagina corrisponde alla ricerca.')).toBeVisible();
+  await search.fill(' SINTETICA 033 ');
+  await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toHaveCount(0);
   await page.getByRole('button', {name: 'Valuta coppia', exact: true}).click();
   await page.getByRole('button', {name: 'Fixato', exact: true}).click();
@@ -402,6 +416,10 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await page.locator('#review-close').click();
   await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);
   await page.locator('#connection-open').click();
+  await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
+  await search.fill('034');
+  await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);
+  await search.clear();
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
   await page.reload();
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toBeEnabled();
