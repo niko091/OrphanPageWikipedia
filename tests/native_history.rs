@@ -527,3 +527,61 @@ fn rejected_partition_checkpoint_does_not_approve_committed_partial_rows() {
         approved
     );
 }
+
+#[test]
+fn streamed_activity_matches_reference_for_ties_gaps_and_fractional_times() {
+    let workspace = Workspace::new(6);
+    let created = [
+        "2024-02-01 00:00:00",
+        "2024-03-01 00:00:00.12",
+        "2024-03-01 00:00:00.120000",
+        "2024-03-01 00:00:00.120001",
+        "2024-04-01 00:00:00",
+        "2024-06-01 00:00:00",
+    ];
+    let mut rows = Vec::new();
+    let mut edits = Vec::new();
+    for (index, at) in created.iter().enumerate() {
+        rows.push(revision(index as i64 + 1, 42, at));
+        edits.push((at.to_string(), 0));
+    }
+    for month in [1, 2] {
+        for day in [1, 2, 3, 4, 5, 28] {
+            // The parsed timestamp, rather than the raw lexical order, is
+            // authoritative even for edits written without zero padding.
+            edits.push((format!("2024-{month}-{day} 00:00:00"), day % 2));
+        }
+    }
+    edits.push(("2024-02-29 23:59:60.9".into(), 1));
+    edits.push(("2024-03-01 00:00:00.120000001".into(), 1));
+    for (index, (at, namespace)) in edits.iter().skip(created.len()).enumerate() {
+        let mut row = revision(999, 42, at);
+        row[31] = namespace.to_string();
+        row[60] = (10_000 + index).to_string();
+        row[61] = "1".into();
+        rows.push(row);
+    }
+    let file = workspace.partition("activity.tsv.bz2", &rows);
+    let manifest = workspace.manifest(json!({"activity.tsv.bz2": file}));
+    let result = workspace
+        .import(&manifest, HistoryOptions::default())
+        .unwrap();
+    let expected = orphanwiki::dumps::history_activity(
+        edits,
+        created.iter().map(|at| at.to_string()).collect(),
+    )
+    .unwrap();
+    for (index, (row, (main, other, months, bucket))) in result["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(expected)
+        .enumerate()
+    {
+        assert_eq!(row["creator_prior_edits_main_history"], main);
+        assert_eq!(row["creator_prior_edits_other_history"], other);
+        assert_eq!(row["creator_continuity_months_before_creation"], months);
+        assert_eq!(row["creator_continuity_bucket_before_creation"], bucket);
+        assert_eq!(row["creator_prior_articles"], [0, 1, 1, 3, 4, 5][index]);
+    }
+}

@@ -7,16 +7,12 @@ pub fn history_activity(
     events: Vec<(String, i32)>,
     creations: Vec<String>,
 ) -> Result<Vec<(usize, usize, usize, String)>, String> {
-    use chrono::{Datelike, NaiveDateTime};
+    use chrono::Datelike;
     use std::collections::HashMap;
 
-    fn parse(value: &str) -> Result<NaiveDateTime, String> {
-        NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
-            .map_err(|_| "invalid MediaWiki History timestamp".to_owned())
-    }
     let mut edits = events
         .into_iter()
-        .map(|(time, namespace)| parse(&time).map(|parsed| (parsed, namespace)))
+        .map(|(time, namespace)| parse_history_time(&time).map(|parsed| (parsed, namespace)))
         .collect::<Result<Vec<_>, _>>()?;
     edits.sort_unstable_by_key(|row| row.0);
     let mut month_counts = HashMap::<i32, usize>::new();
@@ -30,7 +26,7 @@ pub fn history_activity(
     let mut ordered_creations = creations
         .into_iter()
         .enumerate()
-        .map(|(index, value)| parse(&value).map(|creation| (index, creation)))
+        .map(|(index, value)| parse_history_time(&value).map(|creation| (index, creation)))
         .collect::<Result<Vec<_>, _>>()?;
     ordered_creations.sort_unstable_by_key(|(_, creation)| *creation);
     let mut result = (0..ordered_creations.len())
@@ -57,18 +53,26 @@ pub fn history_activity(
             }
             count
         });
-        let bucket = match active_months {
-            0 => "none",
-            1 => "one",
-            2 => "two",
-            3..=6 => "three_to_six",
-            7..=12 => "seven_to_twelve",
-            13..=24 => "thirteen_to_twenty_four",
-            _ => "over_twenty_four",
-        };
+        let bucket = history_continuity_bucket(active_months);
         result[index] = (main, earlier - main, active_months, bucket.to_owned());
     }
     Ok(result)
+}
+
+fn parse_history_time(value: &str) -> Result<chrono::NaiveDateTime, String> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|_| "invalid MediaWiki History timestamp".to_owned())
+}
+fn history_continuity_bucket(active_months: usize) -> &'static str {
+    match active_months {
+        0 => "none",
+        1 => "one",
+        2 => "two",
+        3..=6 => "three_to_six",
+        7..=12 => "seven_to_twelve",
+        13..=24 => "thirteen_to_twenty_four",
+        _ => "over_twenty_four",
+    }
 }
 
 #[cfg(feature = "cli")]
@@ -165,7 +169,7 @@ pub(super) fn history_files<'de, D: serde::Deserializer<'de>>(
 pub(super) struct HistoryScan<'a> {
     database: &'a str,
     pages: &'a std::collections::BTreeSet<i64>,
-    users: Option<&'a std::collections::BTreeSet<i64>>,
+    activity: Option<(&'a std::collections::BTreeSet<i64>, &'a str)>,
     options: HistoryOptions,
 }
 
@@ -317,30 +321,16 @@ pub(super) fn scan_history(
         crate::runtime::check_cancelled()?;
         use rusqlite::types::Value as Sql;
         use rusqlite::{params, OptionalExtension};
-        use sha2::Digest;
         use std::collections::{BTreeSet, HashMap};
         use std::io::{BufRead, BufReader};
-        let initial = scan.users.is_none();
+        let initial = scan.activity.is_none();
         let phase = if initial { "initial" } else { "activity" };
         crate::runtime::phase_tag("phase", serde_json::json!(phase));
         crate::runtime::phase_tag("partition", serde_json::json!(name));
         let digest = data["sha256_local"]
             .as_str()
             .ok_or("Checksum History mancante")?;
-        let suffix = if let Some(users) = scan.users {
-            // Python's default JSON separators are part of the existing identity.
-            let json = format!(
-                "[{}]",
-                users
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            crate::dumps::hex_digest(sha2::Sha256::digest(json.as_bytes()))
-        } else {
-            HISTORY_RULE.to_owned()
-        };
+        let suffix = scan.activity.map_or(HISTORY_RULE, |(_, digest)| digest);
         let identity = format!("{digest}:{suffix}");
         let previous: Option<String> = connection
             .query_row(
@@ -470,7 +460,10 @@ pub(super) fn scan_history(
                     }
                 } else if row[2] == "revision" && row[3] == "create" {
                     if let Some(user) = history_decimal(row[6]).ok().flatten() {
-                        if scan.users.is_some_and(|users| users.contains(&user)) {
+                        if scan
+                            .activity
+                            .is_some_and(|(users, _)| users.contains(&user))
+                        {
                             let Some(revision) = history_decimal(row[60])? else {
                                 continue;
                             };
@@ -600,41 +593,63 @@ pub(super) struct InitialRevision {
 }
 
 #[cfg(feature = "cli")]
-pub(super) fn history_records(
+fn visit_history_records(
     connection: &rusqlite::Connection,
     pages: &std::collections::BTreeSet<i64>,
     database: &str,
-) -> DumpResult<Vec<HistoryRecord>> {
+    mut visit: impl FnMut(HistoryRecord) -> DumpResult<()>,
+) -> DumpResult<()> {
     crate::runtime::phase("history.records", || {
-        crate::runtime::check_cancelled()?;
-        use std::collections::{HashMap, HashSet};
-        #[derive(Default)]
-        struct Events {
-            creates: usize,
-            first: String,
-            imported: bool,
-        }
-        let mut dates = HashMap::<i64, HashSet<Option<String>>>::new();
-        let mut query =
-            connection.prepare("SELECT DISTINCT page_id,created FROM history_creation")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(1)?;
-            dates
-                .entry(row.get(0)?)
-                .or_default()
-                .insert(history_timestamp(Some(&raw)));
-        }
-        let mut initial = HashMap::<i64, (usize, InitialRevision)>::new();
-        let mut query = connection.prepare("SELECT page_id,revision_id,at,user_id,hidden,groups,tags,registration,page_created,page_first,before_creation FROM history_initial ORDER BY page_id,at,revision_id")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            match initial.entry(row.get(0)?) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((
-                        1,
-                        InitialRevision {
+        let mut dates = connection.prepare(
+            "SELECT page_id,created FROM history_distinct_creation ORDER BY page_id,created",
+        )?;
+        let mut initial = connection.prepare(
+            "SELECT page_id,revision_id,at,user_id,hidden,groups,tags,registration,page_created,page_first,before_creation
+             FROM history_initial ORDER BY page_id,at,revision_id",
+        )?;
+        let mut events = connection.prepare(
+            "SELECT page_id, COUNT(CASE WHEN event='create' THEN 1 END),
+                    MIN(CASE WHEN event='create' THEN at END),
+                    MAX(event IN ('import','merge'))
+             FROM history_page_event GROUP BY page_id ORDER BY page_id",
+        )?;
+        let mut dates_rows = dates.query([])?;
+        let mut initial_rows = initial.query([])?;
+        let mut event_rows = events.query([])?;
+        let mut date_row = dates_rows.next()?;
+        let mut initial_row = initial_rows.next()?;
+        let mut event_row = event_rows.next()?;
+        for page in pages {
+            crate::runtime::check_cancelled()?;
+            let mut date = None;
+            let mut ambiguous_date = false;
+            while let Some(row) = date_row {
+                let id: i64 = row.get(0)?;
+                if id > *page {
+                    break;
+                }
+                if id == *page && !ambiguous_date {
+                    let normalized = history_timestamp(Some(row.get_ref(1)?.as_str()?));
+                    if let Some(previous) = &date {
+                        ambiguous_date = previous != &normalized;
+                    } else {
+                        date = Some(normalized);
+                    }
+                }
+                date_row = dates_rows.next()?;
+            }
+            let mut revision = None;
+            let mut ambiguous = false;
+            while let Some(row) = initial_row {
+                let id: i64 = row.get(0)?;
+                if id > *page {
+                    break;
+                }
+                if id == *page {
+                    if revision.is_some() {
+                        ambiguous = true;
+                    } else {
+                        revision = Some(InitialRevision {
                             revision: row.get(1)?,
                             at: row.get(2)?,
                             user: row.get(3)?,
@@ -645,39 +660,26 @@ pub(super) fn history_records(
                             created: row.get(8)?,
                             first: row.get(9)?,
                             before: row.get::<_, i64>(10)? != 0,
-                        },
-                    ));
+                        });
+                    }
                 }
+                initial_row = initial_rows.next()?;
             }
-        }
-        let mut events = HashMap::<i64, Events>::new();
-        let mut query = connection.prepare("SELECT page_id,event,at FROM history_page_event")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let event: String = row.get(1)?;
-            let entry = events.entry(row.get(0)?).or_default();
-            if event == "create" {
-                entry.creates += 1;
-                if entry.creates == 1 {
-                    entry.first = row.get(2)?;
+            let mut event = (0i64, None::<String>, false);
+            while let Some(row) = event_row {
+                let id: i64 = row.get(0)?;
+                if id > *page {
+                    break;
                 }
+                if id == *page {
+                    event = (row.get(1)?, row.get(2)?, row.get(3)?);
+                }
+                event_row = event_rows.next()?;
             }
-            entry.imported |= matches!(event.as_str(), "import" | "merge");
-        }
-        let mut records = Vec::with_capacity(pages.len());
-        for page in pages {
-            let dates = dates.remove(page).unwrap_or_default();
-            let created = if dates.len() == 1 {
-                dates.iter().next().cloned().flatten()
-            } else {
-                None
-            };
-            let date_status = if created.is_some() {
-                "reconstructed_history"
-            } else if dates.is_empty() {
-                "missing_history_creation"
-            } else {
-                "ambiguous_history_creation"
+            let (created, date_status) = match (date, ambiguous_date) {
+                (Some(Some(date)), false) => (Some(date), "reconstructed_history"),
+                (None, _) => (None, "missing_history_creation"),
+                _ => (None, "ambiguous_history_creation"),
             };
             let mut record = HistoryRecord {
                 page_id: *page,
@@ -702,14 +704,13 @@ pub(super) fn history_records(
                 creator_is_bot_now: None,
                 creation_tags_history: None,
             };
-            if let Some((count, revision)) = initial.remove(page) {
-                if count > 1 {
+            if let Some(revision) = revision {
+                if ambiguous {
                     record.creator_attribution = "history_ambiguous_initial_revisions";
                 } else {
                     let at = revision.at.as_str();
                     record.first_revision_id = Some(revision.revision);
                     record.article_created_at = history_timestamp(Some(at));
-                    let event = events.remove(page).unwrap_or_default();
                     let mismatch =
                         |date: Option<&str>| date.is_some_and(|s| !s.is_empty() && s != at);
                     let attribution = if record.article_created_at.is_none()
@@ -717,9 +718,9 @@ pub(super) fn history_records(
                         || mismatch(revision.first.as_deref())
                     {
                         "history_inconsistent_creation_dates"
-                    } else if event.imported || revision.before || event.creates > 1 {
+                    } else if event.2 || revision.before || event.0 > 1 {
                         "history_imported_or_ambiguous"
-                    } else if event.creates > 0 && event.first != at {
+                    } else if event.0 > 0 && event.1.as_deref() != Some(at) {
                         "history_create_event_mismatch"
                     } else if revision.hidden || revision.user.is_none() {
                         "history_hidden_or_unregistered_creator"
@@ -746,109 +747,208 @@ pub(super) fn history_records(
                     }
                 }
             }
-            records.push(record);
+            visit(record)?;
         }
-        Ok(records)
+        Ok(())
     })
 }
 
 #[cfg(feature = "cli")]
-pub(super) fn history_creator_metrics(
+fn prepare_history_targets(
     connection: &rusqlite::Connection,
-    records: &mut [HistoryRecord],
+    pages: &std::collections::BTreeSet<i64>,
+    database: &str,
+) -> DumpResult<(std::collections::BTreeSet<i64>, String)> {
+    use rusqlite::params;
+    use sha2::Digest;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TEMP TABLE history_distinct_creation(
+            page_id INTEGER NOT NULL, created TEXT NOT NULL, PRIMARY KEY(page_id,created)
+        ) WITHOUT ROWID;
+        INSERT OR IGNORE INTO history_distinct_creation SELECT page_id,created FROM history_creation;
+        CREATE TEMP TABLE history_targets(
+            user_id INTEGER NOT NULL, created TEXT NOT NULL, page_id INTEGER NOT NULL,
+            PRIMARY KEY(user_id,created,page_id)
+        ) WITHOUT ROWID;
+        CREATE TEMP TABLE history_metrics(
+            page_id INTEGER PRIMARY KEY, prior_main INTEGER, prior_other INTEGER NOT NULL,
+            months INTEGER NOT NULL, prior_articles INTEGER NOT NULL
+        );",
+    )?;
+    let mut insert = transaction.prepare("INSERT INTO history_targets VALUES(?,?,?)")?;
+    let mut users = std::collections::BTreeSet::new();
+    visit_history_records(&transaction, pages, database, |record| {
+        if let Some(user) = record.creator_user_id {
+            users.insert(user);
+            if let Some(date) = record.page_created_at {
+                insert.execute(params![user, date, record.page_id])?;
+            }
+        }
+        Ok(())
+    })?;
+    drop(insert);
+    transaction.commit()?;
+    // Preserve the existing checkpoint identity, including Python's separators.
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"[");
+    for (index, user) in users.iter().enumerate() {
+        if index > 0 {
+            digest.update(b", ");
+        }
+        digest.update(user.to_string().as_bytes());
+    }
+    digest.update(b"]");
+    Ok((users, crate::dumps::hex_digest(digest.finalize())))
+}
+
+#[cfg(feature = "cli")]
+#[derive(Default)]
+struct HistoryActivity {
+    main: usize,
+    other: usize,
+    month: Option<i32>,
+    count: usize,
+    preceding: usize,
+}
+
+#[cfg(feature = "cli")]
+impl HistoryActivity {
+    fn month(time: chrono::NaiveDateTime) -> i32 {
+        use chrono::Datelike;
+        time.year() * 12 + time.month() as i32
+    }
+
+    fn add(&mut self, at: chrono::NaiveDateTime, namespace: i32) {
+        if namespace == 0 {
+            self.main += 1;
+        } else {
+            self.other += 1;
+        }
+        let month = Self::month(at);
+        if self.month != Some(month) {
+            self.preceding = if self.month == Some(month - 1) && self.count >= 5 {
+                self.preceding + 1
+            } else {
+                0
+            };
+            self.month = Some(month);
+            self.count = 0;
+        }
+        self.count += 1;
+    }
+
+    fn completed_months(&self, creation: chrono::NaiveDateTime) -> usize {
+        let month = Self::month(creation);
+        match self.month {
+            Some(last) if last == month => self.preceding,
+            Some(last) if last == month - 1 && self.count >= 5 => self.preceding + 1,
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+fn history_creator_metrics(
+    connection: &rusqlite::Connection,
     users: &std::collections::BTreeSet<i64>,
 ) -> DumpResult<()> {
     crate::runtime::phase("history.creator_metrics", || {
-        crate::runtime::check_cancelled()?;
-        use std::collections::{BTreeMap, HashSet};
-        let mut by_user = BTreeMap::<i64, Vec<usize>>::new();
-        for (index, record) in records.iter().enumerate() {
-            if let Some(user) = record.creator_user_id {
-                by_user.entry(user).or_default().push(index);
-            }
-        }
-        let finish = |user: i64,
-                      edits: Vec<(String, i32)>,
-                      records: &mut [HistoryRecord]|
-         -> DumpResult<()> {
-            let indices = by_user
-                .get(&user)
-                .ok_or("Attività History priva di autore attribuito")?;
-            let mut group = Vec::new();
-            let mut dates = Vec::new();
-            for &index in indices {
-                let record = &mut records[index];
-                if let Some(date) = record.page_created_at.as_deref() {
-                    group.push(index);
-                    dates.push(date.replace('T', " ").trim_end_matches("+00:00").to_owned());
-                } else {
-                    record.creator_history_status = "observed_surviving_history";
+        use rusqlite::{functions::FunctionFlags, params};
+        // Order by the parsed timestamp, including fractions and leap seconds.
+        // Invalid timestamps sort first and invalidate only this user's dated
+        // targets. SQLite sorts within the indexed user prefix on disk.
+        connection.create_scalar_function(
+            "history_time_key",
+            1,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                Ok(parse_history_time(ctx.get_raw(0).as_str()?).ok().map(|at| {
+                    let at = at.and_utc();
+                    let mut key = [0; 12];
+                    key[..8].copy_from_slice(&((at.timestamp() as u64) ^ (1 << 63)).to_be_bytes());
+                    key[8..].copy_from_slice(&at.timestamp_subsec_nanos().to_be_bytes());
+                    key.to_vec()
+                }))
+            },
+        )?;
+        let transaction = connection.unchecked_transaction()?;
+        {
+            let mut edit_query = transaction.prepare(
+                "SELECT user_id,at,namespace FROM history_edit
+                 ORDER BY user_id,history_time_key(at)",
+            )?;
+            let mut target_query = transaction.prepare(
+                "SELECT user_id,created,page_id FROM history_targets ORDER BY user_id,created,page_id",
+            )?;
+            let mut insert =
+                transaction.prepare("INSERT INTO history_metrics VALUES(?,?,?,?,?)")?;
+            let mut edits = edit_query.query([])?;
+            let mut targets = target_query.query([])?;
+            let next_edit = |rows: &mut rusqlite::Rows<'_>| -> DumpResult<_> {
+                crate::runtime::check_cancelled()?;
+                let Some(row) = rows.next()? else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    row.get::<_, i64>(0)?,
+                    parse_history_time(row.get_ref(1)?.as_str()?).ok(),
+                    row.get::<_, i32>(2)?,
+                )))
+            };
+            let mut edit = next_edit(&mut edits)?;
+            let mut target = targets.next()?;
+            for &user in users {
+                if edit.is_some_and(|(id, _, _)| id < user) {
+                    return Err("Attività History priva di autore attribuito".into());
                 }
-            }
-            match history_activity(edits, dates) {
-                Ok(summaries) => {
-                    for (index, (main, other, months, bucket)) in group.into_iter().zip(summaries) {
-                        let record = &mut records[index];
-                        record.creator_prior_edits_main_history = Some(main);
-                        record.creator_prior_edits_other_history = Some(other);
-                        record.creator_continuity_months_before_creation = Some(months);
-                        record.creator_continuity_bucket_before_creation = Some(bucket);
-                        record.creator_history_status = "observed_surviving_history";
+                let invalid = edit.is_some_and(|(id, at, _)| id == user && at.is_none());
+                let mut activity = HistoryActivity::default();
+                let mut previous_date = None;
+                let mut prior_articles = 0;
+                let mut articles = 0;
+                while let Some(row) = target {
+                    if row.get::<_, i64>(0)? != user {
+                        break;
                     }
-                }
-                Err(_) => {
-                    for index in group {
-                        records[index].creator_history_status = "invalid_history_timestamp";
+                    if !invalid {
+                        let date = row.get_ref(1)?.as_str()?;
+                        let creation =
+                            parse_history_time(date.replace('T', " ").trim_end_matches("+00:00"))?;
+                        while let Some((id, Some(at), namespace)) = edit {
+                            if id != user || at >= creation {
+                                break;
+                            }
+                            activity.add(at, namespace);
+                            edit = next_edit(&mut edits)?;
+                        }
+                        if previous_date != Some(creation) {
+                            prior_articles = articles;
+                            previous_date = Some(creation);
+                        }
+                        insert.execute(params![
+                            row.get::<_, i64>(2)?,
+                            activity.main,
+                            activity.other,
+                            activity.completed_months(creation),
+                            prior_articles
+                        ])?;
+                        articles += 1;
+                    } else {
+                        insert.execute(params![row.get::<_, i64>(2)?, None::<usize>, 0, 0, 0])?;
                     }
+                    target = targets.next()?;
+                }
+                while edit.is_some_and(|(id, _, _)| id == user) {
+                    edit = next_edit(&mut edits)?;
                 }
             }
-            Ok(())
-        };
-        let mut query = connection
-            .prepare("SELECT user_id,at,namespace FROM history_edit ORDER BY user_id,at")?;
-        let mut rows = query.query([])?;
-        let mut previous = None;
-        let mut edits = Vec::new();
-        let mut finished = HashSet::new();
-        while let Some(row) = rows.next()? {
-            let user = row.get::<_, i64>(0)?;
-            if let Some(previous) = previous.filter(|&previous| previous != user) {
-                finish(previous, std::mem::take(&mut edits), records)?;
-                finished.insert(previous);
-            }
-            previous = Some(user);
-            edits.push((row.get(1)?, row.get(2)?));
-        }
-        if let Some(previous) = previous {
-            finish(previous, edits, records)?;
-            finished.insert(previous);
-        }
-        for &user in users {
-            if !finished.contains(&user) {
-                finish(user, Vec::new(), records)?;
+            if edit.is_some() || target.is_some() {
+                return Err("Attività History priva di autore attribuito".into());
             }
         }
-        for indices in by_user.values() {
-            let mut dates = indices
-                .iter()
-                .filter_map(|&index| {
-                    let record = &records[index];
-                    (record.creator_history_status == "observed_surviving_history")
-                        .then(|| record.page_created_at.as_deref().map(str::to_owned))
-                        .flatten()
-                })
-                .collect::<Vec<_>>();
-            dates.sort();
-            for &index in indices {
-                let record = &mut records[index];
-                if record.creator_history_status == "observed_surviving_history" {
-                    if let Some(date) = record.page_created_at.as_deref() {
-                        record.creator_prior_articles =
-                            Some(dates.partition_point(|prior| prior.as_str() < date));
-                    }
-                }
-            }
-        }
+        transaction.commit()?;
+        connection.execute_batch("DROP TABLE history_targets")?;
         Ok(())
     })
 }
@@ -988,12 +1088,14 @@ pub fn import_history(
                 &HistoryScan {
                     database: &database,
                     pages: &pages,
-                    users: None,
+                    activity: None,
                     options,
                 },
             )?;
         }
-        let mut records = history_records(&connection, &pages, &database)?;
+        eprintln!("MediaWiki History {database}: ricostruzione delle creazioni e attribuzioni");
+        let (users, users_digest) = prepare_history_targets(&connection, &pages, &database)?;
+
         let snapshot =
             history_timestamp(file("user_groups").and_then(|data| data["job_updated"].as_str()))
                 .map(Ok)
@@ -1030,56 +1132,6 @@ pub fn import_history(
                 bots.entry(row.get(0)?).or_default().push(row.get(1)?);
             }
         }
-        for record in &mut records {
-            if let Some(user) = record.creator_user_id.filter(|_| has_bots) {
-                let (mut bot, mut unknown) = (false, false);
-                for expiry in bots.get(&user).into_iter().flatten() {
-                    if let Some(expiry) = expiry {
-                        let parsed = if expiry.len() == 14
-                            && expiry.bytes().all(|b| b.is_ascii_digit())
-                            && !expiry.starts_with("0000")
-                        {
-                            chrono::NaiveDateTime::parse_from_str(expiry, "%Y%m%d%H%M%S")
-                                .ok()
-                                .and_then(|dt| {
-                                    history_timestamp(Some(
-                                        &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                                    ))
-                                })
-                        } else {
-                            None
-                        };
-                        if let Some(expiry) = parsed {
-                            bot |= expiry > snapshot;
-                        } else {
-                            unknown = true;
-                        }
-                    } else {
-                        bot = true;
-                    }
-                }
-                if bot || !unknown {
-                    record.creator_is_bot_now = Some(bot);
-                    record.creator_account_type = Some(if bot { "bot" } else { "no_bot_flag" });
-                }
-            }
-            if let (Some(created), Some(registered)) = (
-                record.page_created_at.as_deref(),
-                record.creator_registered_at.as_deref(),
-            ) {
-                let parse = |date: &str| chrono::DateTime::parse_from_rfc3339(date);
-                let micros = (parse(created)? - parse(registered)?)
-                    .num_microseconds()
-                    .ok_or("Intervallo History fuori limite")?;
-                if micros >= 0 {
-                    record.creator_tenure_days = Some(micros as f64 / 1_000_000.0 / 86400.0);
-                }
-            }
-        }
-        let users = records
-            .iter()
-            .filter_map(|r| r.creator_user_id)
-            .collect::<BTreeSet<_>>();
         for (name, data) in &files {
             scan_history(
                 &connection,
@@ -1088,7 +1140,7 @@ pub fn import_history(
                 &HistoryScan {
                     database: &database,
                     pages: &pages,
-                    users: Some(&users),
+                    activity: Some((&users, &users_digest)),
                     options,
                 },
             )?;
@@ -1101,7 +1153,9 @@ pub fn import_history(
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)",
         )?;
-        history_creator_metrics(&connection, &mut records, &users)?;
+        eprintln!("MediaWiki History {database}: conteggio attività precedente alla creazione");
+        history_creator_metrics(&connection, &users)?;
+        drop(users);
         let history_files = files
             .iter()
             .map(|(name, data)| ((*name).clone(), data["sha256_local"].clone()))
@@ -1113,17 +1167,94 @@ pub fn import_history(
         "experience_scope":"public surviving revisions strictly before reconstructed page creation; prior articles restricted to the census",
         "continuity_rule":"consecutive completed precreation calendar months with at least five edits; Vital Signs stability adaptation",
         "group_scope":"nonempty reconstructed historical group list at first revision; blank means unknown","history_files":history_files});
+        eprintln!("MediaWiki History {database}: scrittura del supplemento");
         write_atomic(output, |file| {
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
             writer.write_all(b"{\"metadata\":")?;
             serde_json::to_writer(&mut writer, &metadata)?;
             writer.write_all(b",\"pages\":[")?;
-            for (index, record) in records.iter().enumerate() {
-                if index > 0 {
+            let mut metrics = connection.prepare(
+                "SELECT prior_main,prior_other,months,prior_articles FROM history_metrics WHERE page_id=?"
+            )?;
+            let mut first = true;
+            visit_history_records(&connection, &pages, &database, |mut record| {
+                if record.creator_user_id.is_some() {
+                    record.creator_history_status = "observed_surviving_history";
+                    if record.page_created_at.is_some() {
+                        let counts = metrics.query_row([record.page_id], |row| {
+                            Ok((
+                                row.get::<_, Option<usize>>(0)?,
+                                row.get::<_, usize>(1)?,
+                                row.get::<_, usize>(2)?,
+                                row.get::<_, usize>(3)?,
+                            ))
+                        })?;
+                        let (main, other, months, articles) = counts;
+                        if let Some(main) = main {
+                            record.creator_prior_edits_main_history = Some(main);
+                            record.creator_prior_edits_other_history = Some(other);
+                            record.creator_continuity_months_before_creation = Some(months);
+                            record.creator_continuity_bucket_before_creation =
+                                Some(history_continuity_bucket(months).to_owned());
+                            record.creator_prior_articles = Some(articles);
+                        } else {
+                            record.creator_history_status = "invalid_history_timestamp";
+                        }
+                    }
+                }
+
+                if let Some(user) = record.creator_user_id.filter(|_| has_bots) {
+                    let (mut bot, mut unknown) = (false, false);
+                    for expiry in bots.get(&user).into_iter().flatten() {
+                        if let Some(expiry) = expiry {
+                            let parsed = if expiry.len() == 14
+                                && expiry.bytes().all(|b| b.is_ascii_digit())
+                                && !expiry.starts_with("0000")
+                            {
+                                chrono::NaiveDateTime::parse_from_str(expiry, "%Y%m%d%H%M%S")
+                                    .ok()
+                                    .and_then(|dt| {
+                                        history_timestamp(Some(
+                                            &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                                        ))
+                                    })
+                            } else {
+                                None
+                            };
+                            if let Some(expiry) = parsed {
+                                bot |= expiry > snapshot;
+                            } else {
+                                unknown = true;
+                            }
+                        } else {
+                            bot = true;
+                        }
+                    }
+                    if bot || !unknown {
+                        record.creator_is_bot_now = Some(bot);
+                        record.creator_account_type = Some(if bot { "bot" } else { "no_bot_flag" });
+                    }
+                }
+                if let (Some(created), Some(registered)) = (
+                    record.page_created_at.as_deref(),
+                    record.creator_registered_at.as_deref(),
+                ) {
+                    let parse = |date: &str| chrono::DateTime::parse_from_rfc3339(date);
+                    let micros = (parse(created)? - parse(registered)?)
+                        .num_microseconds()
+                        .ok_or("Intervallo History fuori limite")?;
+                    if micros >= 0 {
+                        record.creator_tenure_days = Some(micros as f64 / 1_000_000.0 / 86400.0);
+                    }
+                }
+
+                if !first {
                     writer.write_all(b",")?;
                 }
-                serde_json::to_writer(&mut writer, record)?;
-            }
+                first = false;
+                serde_json::to_writer(&mut writer, &record)?;
+                Ok(())
+            })?;
             writer.write_all(b"]}\n")?;
             writer.flush()?;
             Ok(())
@@ -1139,9 +1270,9 @@ pub fn import_history(
         }
         eprintln!(
             "Cronologia da dump: {} voci; {}",
-            records.len(),
+            pages.len(),
             output.display()
         );
-        Ok(records.len())
+        Ok(pages.len())
     })
 }
