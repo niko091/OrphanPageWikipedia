@@ -18,6 +18,8 @@ pub use history::{import_history, HistoryOptions};
 mod quality;
 #[cfg(feature = "cli")]
 pub use quality::infer_quality;
+#[cfg(feature = "cli")]
+pub(crate) use quality::scan_editorial_content;
 pub use quality::QualityExtractor;
 #[cfg(feature = "cli")]
 mod download;
@@ -53,11 +55,11 @@ use publication::{
 #[cfg(feature = "cli")]
 mod transports;
 #[cfg(feature = "cli")]
-pub(crate) use transports::editorial_shortlist;
-#[cfg(feature = "cli")]
 pub use transports::prepare_dashboard_exports;
 #[cfg(feature = "cli")]
 use transports::{add_article_preview, write_summary_files};
+#[cfg(feature = "cli")]
+pub(crate) use transports::{editorial_reference, editorial_title};
 #[cfg(feature = "cli")]
 mod supplements;
 #[cfg(feature = "cli")]

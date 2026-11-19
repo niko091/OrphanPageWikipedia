@@ -1,14 +1,14 @@
 import {createExplorer} from './explorer.js';
 import {wikimediaAPI} from './wikimedia.js';
 import {configureProfile,clearProfileCache,recentWikipediaEdits,readProfileTopics} from './profile.js';
-import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink} from './editorial.js';
+import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, referenceCount, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink} from './editorial.js';
 import {createCharts} from './charts.js';
 import type {PageObservation, Candidate, CandidateRecord, Dataset, ManifestEntry, Provider, CreatorRow, DashboardModule, DashboardSummaryData, RecentEdit, InterestReport} from './types.js';
 import {ARTICLE_INDEX_FIELDS} from './types.js';
 import {$, element, creatorsPage, connectionsPage, deorphanizePage} from './dom.js';
 import {t, number, readPreference, savePreference, uiLanguage, setUILanguage} from './i18n.js';
 import {validateDataset, readConnections, readSummary, validateManifest, canonicalJSON} from './datasets.js';
-import {isRecord} from './validation.js';
+import {isRecord,validEditorialRanking} from './validation.js';
 import {calculateReport, setCalculator} from './reports.js';
 
 declare const nativeModuleUrl: string;
@@ -288,7 +288,7 @@ async function hydrateVisibleCards(requests: VisibleCardRequest[],request: numbe
           !Array.isArray(fullRecord.candidates))throw new Error('Osservazioni compatte non valide');
         const candidates: unknown[]=fullRecord.candidates;
         if(canonicalJSON(candidates.map(candidate=>isRecord(candidate)?candidate.page_id:null))!==canonicalJSON(record.candidate_ids)||
-          candidates.some(candidate=>!isRecord(candidate)||typeof candidate.title!=='string'||!candidate.title.trim()||
+          candidates.some(candidate=>!isRecord(candidate)||!validEditorialRanking(candidate)||typeof candidate.title!=='string'||!candidate.title.trim()||
             (candidate.out_degree!=null&&(!Number.isSafeInteger(candidate.out_degree)||Number(candidate.out_degree)<0))||
             (candidate.dead_end!=null&&typeof candidate.dead_end!=='boolean')||!Array.isArray(candidate.evidence)||candidate.evidence.length!==1||
             candidate.evidence.some((edge: unknown)=>!isRecord(edge)||typeof edge.language!=='string'||
@@ -386,17 +386,21 @@ function renderConnections() {
   const target=$('connection-target')!;target.replaceChildren();
   target.append(element('h2',t('Pagina da collegare')),wikiLink(page.title,pageLanguage(page)),element('p',t('Lingua: {language} · {category}',{language:pageLanguage(page).toUpperCase(),category:label(page)})));
   const record=data.link_candidates?.[pageKey(page)],count=record?.candidate_count;
-  setConnectionCopyRequest(fixRequest(page,record));
+  const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
+  const search=$('connection-search')!.value.trim().normalize().toLowerCase();
+  const matched=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed&&
+    (!search||candidate.title.normalize().toLowerCase().includes(search))).sort(candidateOrder);
+  const others=$('connection-others')!;
+  const canNarrow=!connectionReviewed&&matched.some(candidate=>candidate.local_mention===true)&&matched.some(candidate=>candidate.local_mention!==true);
+  $('connection-others-label')!.hidden=!canNarrow;
+  const candidates=canNarrow&&!others.checked?matched.filter(candidate=>candidate.local_mention===true):matched;
+  setConnectionCopyRequest(fixRequest(page,record && {...record,candidates:connectionReviewed?visible:candidates}));
   const copyButton=$('connection-copy-prompt');
   if(copyButton) {
     copyButton.disabled=!connectionCopyRequest;
     copyButton.textContent=t('Prepara prompt e fonti');
     copyButton.title=t('Prepara il prompt della voce e il wikitesto delle prime cinque candidate disponibili');
   }
-  const visible=(record?.candidates||[]).filter(candidate=>!hiddenSuggestedLink(page,candidate));
-  const search=$('connection-search')!.value.trim().normalize().toLowerCase();
-  const candidates=visible.filter(candidate=>closedEdge(page,candidate.page_id)===connectionReviewed&&
-    (!search||candidate.title.normalize().toLowerCase().includes(search))).sort(candidateOrder);
   connectionOffset=Math.min(connectionOffset,Math.max(0,Math.ceil(candidates.length/connectionPageSize)-1)*connectionPageSize);
   $('connection-open')!.setAttribute('aria-pressed',String(!connectionReviewed));
   $('connection-reviewed')!.setAttribute('aria-pressed',String(connectionReviewed));
@@ -413,6 +417,7 @@ function renderConnections() {
   for(const candidate of candidates.slice(connectionOffset,connectionOffset+connectionPageSize)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
+    if(candidate.local_mention===true)header.append(element('p',t('Titolo dell’orfana nel testo locale'),'muted'));
     if(candidate.dead_end===true)header.append(element('span','Dead-end page','dead-end-badge'));
     const review=reviewedEdge(page,candidate.page_id);
     if(review)header.append(reviewBadge(review));
@@ -422,7 +427,7 @@ function renderConnections() {
     const local=element('p');local.append(wikiLink(candidate.title,pageLanguage(page)),element('span',' → '),wikiLink(page.title,pageLanguage(page)));proposed.append(local);body.append(proposed);
     const evidenceList=candidate.evidence||[];
     const evidenceDetails=element('details',null,'connection-details');
-    evidenceDetails.append(element('summary',t('Collegamenti nelle altre lingue ({n})',{n:number(evidenceList.length)})));
+    evidenceDetails.append(element('summary',t('Edizioni di riferimento ({n})',{n:number(referenceCount(candidate))})));
     for(const evidence of evidenceList) {
       const existing=element('div',null,'connection-evidence');existing.append(element('h3',t('Collegamento esistente in {language}',{language:evidence.language.toUpperCase()})));
       const line=element('p');line.append(wikiLink(evidence.source_title,evidence.language),element('span',' → '),wikiLink(evidence.target_title,evidence.language));existing.append(line);evidenceDetails.append(existing);
@@ -688,6 +693,7 @@ $('creator-previous')?.addEventListener('click',()=>stepListPage('creators',-1))
 $('candidate-previous')?.addEventListener('click',()=>stepListPage('cards',-1));
 $('connection-previous')?.addEventListener('click',()=>changeConnectionPage(connectionOffset-connectionPageSize));
 $('connection-next')?.addEventListener('click',()=>changeConnectionPage(connectionOffset+connectionPageSize));
+$('connection-others')?.addEventListener('change',()=>{if(data){connectionOffset=0;renderConnections();}});
 $('connection-search')?.addEventListener('input',()=>{if(data){connectionOffset=0;renderConnections();}});
 $('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionOffset=0;renderConnections();});
 $('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionOffset=0;renderConnections();});

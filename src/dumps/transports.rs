@@ -185,20 +185,30 @@ pub(crate) struct EditorialCandidate<'a> {
 }
 
 #[cfg(feature = "cli")]
+pub(crate) fn editorial_title(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        !text
+            .trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+            .is_empty()
+    })
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn editorial_reference(edge: &serde_json::Value, language: &str) -> bool {
+    edge["language"]
+        .as_str()
+        .is_some_and(|code| code != language && crate::wiki_database(code, None).is_ok())
+        && editorial_title(&edge["source_title"])
+        && editorial_title(&edge["target_title"])
+}
+
+#[cfg(feature = "cli")]
 pub(crate) fn editorial_shortlist<'a>(
     record: &'a serde_json::Value,
     target: i64,
     language: &str,
 ) -> DumpResult<(Vec<EditorialCandidate<'a>>, Vec<i64>)> {
     use serde_json::Value;
-    // Python str.strip also treats these four C0 separators as whitespace.
-    let nonempty = |value: &Value| {
-        value.as_str().is_some_and(|text| {
-            !text
-                .trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
-                .is_empty()
-        })
-    };
     let mut selected = Vec::with_capacity(10);
     let mut ids = Vec::with_capacity(10);
     let mut sizes = [0; 2];
@@ -213,7 +223,10 @@ pub(crate) fn editorial_shortlist<'a>(
         let Some(id) = candidate["page_id"].as_i64().filter(|id| *id > 0) else {
             continue;
         };
-        if sizes[group] >= 5 || id == target || ids.contains(&id) || !nonempty(&candidate["title"])
+        if sizes[group] >= 5
+            || id == target
+            || ids.contains(&id)
+            || !editorial_title(&candidate["title"])
         {
             continue;
         }
@@ -226,12 +239,7 @@ pub(crate) fn editorial_shortlist<'a>(
             if !edge.is_object() {
                 return Err("Evidenza non valida".into());
             }
-            if !edge["language"]
-                .as_str()
-                .is_some_and(|code| code != language && crate::wiki_database(code, None).is_ok())
-                || !nonempty(&edge["source_title"])
-                || !nonempty(&edge["target_title"])
-            {
+            if !editorial_reference(edge, language) {
                 continue;
             }
             selected.push(EditorialCandidate {

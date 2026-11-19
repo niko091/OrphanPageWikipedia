@@ -535,7 +535,19 @@ pub fn infer_quality(
             .ok_or("Lingua del grafo mancante")?;
         let database = crate::wiki_database(language, graph["database"].as_str())?;
         let manifest: ContentManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
-        let downloads = super::collection_download_root(manifest_path)?;
+        let mut downloads = super::collection_download_root(manifest_path)?;
+        // The publication pass still needs the same compressed XML for local mentions.
+        if let Some(root) = &downloads {
+            let owner: Value =
+                serde_json::from_reader(std::fs::File::open(root.join(".owner.json"))?)?;
+            if owner["editorial_ranking"] == crate::store::EDITORIAL_RANKING
+                && owner["languages"]
+                    .as_array()
+                    .is_some_and(|editions| editions.len() > 1)
+            {
+                downloads = None;
+            }
+        }
         if graph["source"] != format!("Wikimedia SQL dumps / {database}")
             || graph["complete"] != true
             || manifest.source != "mediawiki_content_current"
@@ -846,4 +858,58 @@ pub fn infer_quality(
         }
         Ok(metadata)
     })
+}
+
+/// Replay the verified current-content partitions without fetching or saving text.
+#[cfg(feature = "cli")]
+pub(crate) fn scan_editorial_content(
+    manifest: &serde_json::Value,
+    language: &str,
+    database: &str,
+    release: &str,
+    required: bool,
+    mut visit: impl FnMut(i64, i64, &str) -> DumpResult<()>,
+) -> DumpResult<()> {
+    if manifest["language"] != language
+        || manifest["content_release"] != release
+        || manifest["database"] != database
+        || manifest["source"] != "mediawiki_content_current"
+        || manifest["complete"] != true
+    {
+        return Err("Manifest XML non valido per le menzioni locali".into());
+    }
+    for record in manifest["files"]
+        .as_object()
+        .filter(|files| !files.is_empty())
+        .ok_or("Partizioni XML mancanti")?
+        .values()
+    {
+        let path = std::path::Path::new(record["path"].as_str().ok_or("Percorso XML mancante")?);
+        // Explicit dashboard conversion can reuse any XML still present locally.
+        if !required && !path.try_exists()? {
+            continue;
+        }
+        let signature = file_signature(path)?;
+        let digest = record["sha256_publisher"]
+            .as_str()
+            .ok_or("Checksum XML mancante")?;
+        if record["sha256_local"] != digest
+            || Some(signature.0) != record["bytes"].as_u64()
+            || super::file_sha256(path)? != digest
+        {
+            return Err("Partizione XML modificata prima della verifica delle menzioni".into());
+        }
+        scan_content(path, database, |page, _| {
+            if page.namespace == 0 && !page.redirect {
+                if let Some(text) = page.text {
+                    visit(page.id, page.revision, &text)?;
+                }
+            }
+            Ok(())
+        })?;
+        if file_signature(path)? != signature {
+            return Err("Partizione XML modificata durante la lettura".into());
+        }
+    }
+    Ok(())
 }

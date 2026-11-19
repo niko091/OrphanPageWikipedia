@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs::File, io::BufReader, path::Path};
 
 pub const RULE: &str = "relational_census_v1";
+pub(crate) const EDITORIAL_RANKING: &str = "local_title_distinct_languages_v1";
 const PAGE_SIZE: i64 = 25;
 
 fn read(path: &Path) -> DumpResult<Value> {

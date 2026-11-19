@@ -27,6 +27,12 @@ impl Census {
             candidate["title"] = json!(row.get::<_, String>(2)?);
             // Read existing census metadata for UI filters; never rewrite the collection.
             candidate["category"] = json!(row.get::<_, Option<String>>(3)?);
+            if short && candidate.get("reference_count").is_none() {
+                // Previously published compact cards also carry only their first reference.
+                let mut refs=self.db.prepare_cached("SELECT count(DISTINCT e.reference_language) FROM evidence e JOIN texts a ON a.id=e.source_title_id JOIN texts b ON b.id=e.target_title_id WHERE e.language=? AND e.target=? AND e.source=? AND trim(a.value)!='' AND trim(b.value)!=''")?;
+                let count: i64 = refs.query_row(params![language, id, source], |r| r.get(0))?;
+                candidate["reference_count"] = json!(count);
+            }
             let join = if short {
                 " JOIN shortlists s ON s.language=e.language AND s.target=e.target AND s.source=e.source AND s.evidence_position=e.position"
             } else {

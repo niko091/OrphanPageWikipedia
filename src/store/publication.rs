@@ -74,6 +74,7 @@ pub fn publish(folder: &Path, destination: &Path, identity: &Value) -> DumpResul
             CREATE INDEX creator_articles ON creators(dataset,articles,key);
             CREATE INDEX creator_totals ON creators(dataset,total,key);")?;
         let tx = db.transaction()?;
+        tx.execute_batch("CREATE TEMP TABLE support(language TEXT,target INTEGER,source INTEGER,editions INTEGER,first_edge INTEGER,PRIMARY KEY(language,source,target)) WITHOUT ROWID")?;
         let mut manifest = Vec::new();
         let mut languages = BTreeSet::new();
         let mut releases = None;
@@ -264,6 +265,16 @@ pub fn publish(folder: &Path, destination: &Path, identity: &Value) -> DumpResul
         if unknown != 0 {
             return Err("Evidenze di una lingua esterna alla raccolta".into());
         }
+        if languages.len() > 1 {
+            for language in &languages {
+                annotate_local_mentions(
+                    &tx,
+                    language,
+                    identity["editorial_ranking"] == EDITORIAL_RANKING,
+                )?;
+            }
+        }
+        rank_shortlists(&tx)?;
         for (path, signature) in signatures {
             if dumps::file_signature(&path)? != signature {
                 return Err("Fonte modificata durante la pubblicazione".into());
@@ -582,8 +593,6 @@ fn import_member(
         crate::runtime::check_cancelled()?;
         let id: i64 = row.get(0)?;
         let mut record: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
-        let (shortlist, ids) = dumps::editorial_shortlist(&record, id, language)?;
-        let shortlist = serde_json::to_value(shortlist)?;
         let candidates = record
             .as_object_mut()
             .ok_or("Candidate non valide")?
@@ -615,6 +624,25 @@ fn import_member(
                 .ok_or("Candidata non valida")?
                 .remove("evidence")
                 .ok_or("Evidenze mancanti")?;
+            let edges = edges.as_array().ok_or("Evidenze non valide")?;
+            let mut references = BTreeSet::new();
+            let mut first_edge = None;
+            for (index, edge) in edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| dumps::editorial_reference(edge, language))
+            {
+                references.insert(edge["language"].as_str().ok_or("Lingua mancante")?);
+                first_edge.get_or_insert(index);
+            }
+            candidate["reference_count"] = json!(references.len());
+            // These are properties of this publication's XML, never an inherited assertion.
+            let fields = candidate.as_object_mut().ok_or("Candidata non valida")?;
+            fields.remove("local_mention");
+            fields.remove("mention_revision");
+            let first_edge = first_edge.filter(|_| dumps::editorial_title(&candidate["title"]));
+            tx.prepare_cached("INSERT INTO support VALUES(?,?,?,?,?)")?
+                .execute(params![language, id, source, references.len(), first_edge])?;
             let title = intern(
                 tx,
                 &mut title_cache,
@@ -637,12 +665,7 @@ fn import_member(
                     title,
                     encode(&candidate)?
                 ])?;
-            for (position, edge) in edges
-                .as_array()
-                .ok_or("Evidenze non valide")?
-                .iter()
-                .enumerate()
-            {
+            for (position, edge) in edges.iter().enumerate() {
                 let reference = edge["language"]
                     .as_str()
                     .filter(|s| *s != language)
@@ -681,21 +704,198 @@ fn import_member(
                     ])?;
             }
         }
-        for (position, source) in ids.iter().enumerate() {
-            let selected = &shortlist[position]["evidence"][0];
-            let edges = candidates
-                .iter()
-                .find(|c| c["page_id"] == *source)
-                .and_then(|c| c["evidence"].as_array())
-                .ok_or("Evidenza shortlist mancante")?;
-            let edge = edges
-                .iter()
-                .position(|e| e == selected)
-                .ok_or("Evidenza shortlist non corrispondente")?;
-            tx.prepare_cached("INSERT INTO shortlists VALUES(?,?,?,?,?)")?
-                .execute(params![language, id, source, position, edge])?;
-        }
     }
     signatures.push((path, source.signature));
     Ok(approved)
+}
+
+fn rank_shortlists(db: &Connection) -> DumpResult<()> {
+    // Keep one valid reference in each compact card, but rank against all
+    // distinct supporting editions before applying the existing per-group cap.
+    db.execute_batch("INSERT INTO shortlists(language,target,source,position,evidence_position)
+        SELECT language,target,source,position,first_edge FROM (
+          SELECT c.language,c.target,c.source,s.first_edge,
+            row_number() OVER (PARTITION BY c.language,c.target ORDER BY
+              json_extract(c.data,'$.local_mention') IS 1 DESC,s.editions DESC,
+              json_extract(c.data,'$.dead_end') IS 1 DESC,c.position) AS position,
+            row_number() OVER (PARTITION BY c.language,c.target,json_extract(c.data,'$.dead_end') IS 1 ORDER BY
+              json_extract(c.data,'$.local_mention') IS 1 DESC,s.editions DESC,c.position) AS group_position
+          FROM candidates c JOIN support s USING(language,target,source) WHERE s.first_edge IS NOT NULL
+        ) WHERE group_position<=5;
+        DROP TABLE support;")?;
+    Ok(())
+}
+
+fn annotate_local_mentions(db: &Connection, language: &str, required: bool) -> DumpResult<()> {
+    if !db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM candidates WHERE language=?)",
+        [language],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let input:Option<(String,String)>=db.query_row(
+        "SELECT p.data,d.metadata FROM provenance p JOIN datasets d USING(language) WHERE p.language=? AND p.kind='content'",
+        [language],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((manifest, metadata)) = input else {
+        if required {
+            return Err("Manifest XML mancante per le menzioni locali".into());
+        }
+        return Ok(());
+    };
+    let metadata: Value = serde_json::from_str(&metadata)?;
+    let mut targets = db.prepare("SELECT c.target,p.title FROM support c JOIN pages p ON p.language=c.language AND p.id=c.target WHERE c.language=? AND c.source=? ORDER BY c.target")?;
+    let mut update = db.prepare("UPDATE candidates SET data=json_set(data,'$.local_mention',json(?),'$.mention_revision',?) WHERE language=? AND source=? AND target=?")?;
+    let syntax = regex::Regex::new(
+        r#"(?is)<!--.*?(?:-->|$)|https?://[^\s<>{}\[\]]+|\{\{|\}\}|\[\[|\]\]|\[|\]|</?[a-z](?:[^>'"]|"[^"]*"|'[^']*')*>|\{\||\|\}"#,
+    )?;
+    dumps::scan_editorial_content(
+        &serde_json::from_str(&manifest)?,
+        language,
+        &crate::wiki_database(language, metadata["database"].as_str())?,
+        metadata["quality"]["content_release"]
+            .as_str()
+            .ok_or("Release XML mancante")?,
+        required,
+        |source, revision, text| {
+            let mut rows = targets.query(params![language, source])?;
+            let Some(mut row) = rows.next()? else {
+                return Ok(());
+            };
+            let body = editorial_body(text, &syntax);
+            loop {
+                let target: i64 = row.get(0)?;
+                let title: String = row.get(1)?;
+                let title = title.replace('_', " ").to_lowercase();
+                let mentioned = !title.is_empty()
+                    && body.match_indices(&title).any(|(i, _)| {
+                        !body[..i]
+                            .chars()
+                            .next_back()
+                            .is_some_and(char::is_alphanumeric)
+                            && !body[i + title.len()..]
+                                .chars()
+                                .next()
+                                .is_some_and(char::is_alphanumeric)
+                    });
+                update.execute(params![
+                    if mentioned { "true" } else { "false" },
+                    revision,
+                    language,
+                    source,
+                    target
+                ])?;
+                let Some(next) = rows.next()? else { break };
+                row = next;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Conservative literal spans. A separator prevents a match across removed markup.
+fn editorial_body(text: &str, syntax: &regex::Regex) -> String {
+    let mut body = String::new();
+    let mut closing = Vec::<String>::new();
+    let mut cursor = 0;
+    for token in syntax.find_iter(text) {
+        if closing.is_empty() {
+            body.push_str(&text[cursor..token.start()].to_lowercase());
+            body.push('\0');
+        }
+        cursor = token.end();
+        if token.as_str().starts_with("<!--") {
+            continue;
+        }
+        let mark = token.as_str().to_ascii_lowercase();
+        // Inside literal or extension elements, delimiters have no effect.
+        if let Some(tag) = closing.last().filter(|s| s.starts_with("</")) {
+            if mark.trim_end_matches('>').trim_end() == tag {
+                closing.pop();
+            }
+            continue;
+        }
+        if closing.last() == Some(&mark) {
+            closing.pop();
+            continue;
+        }
+        match mark.as_str() {
+            "{{" => closing.push("}}".into()),
+            "[[" => closing.push("]]".into()),
+            "[" => closing.push("]".into()),
+            "{|" => closing.push("|}".into()),
+            _ if mark.starts_with('<') && !mark.starts_with("</") && !mark.ends_with("/>") => {
+                let name = mark[1..]
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or("");
+                if matches!(
+                    name,
+                    "ref"
+                        | "references"
+                        | "nowiki"
+                        | "pre"
+                        | "source"
+                        | "syntaxhighlight"
+                        | "math"
+                        | "gallery"
+                        | "code"
+                        | "templatedata"
+                        | "timeline"
+                        | "graph"
+                        | "score"
+                ) {
+                    closing.push(format!("</{name}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if closing.is_empty() {
+        body.push_str(&text[cursor..].to_lowercase());
+    }
+    body
+}
+
+#[test]
+fn shortlist_ranks_before_applying_limits_and_keeps_all_pairs() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE candidates(language,target,source,position,data);
+        CREATE TEMP TABLE support(language,target,source,editions,first_edge);
+        CREATE TABLE shortlists(language,target,source,position,evidence_position);",
+    )
+    .unwrap();
+    for source in 1..=12 {
+        db.execute(
+            "INSERT INTO candidates VALUES('vec',20,?,?,?)",
+            params![
+                source,
+                source,
+                json!({"dead_end":source<=6,"local_mention":source==6||source==12}).to_string()
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO support VALUES('vec',20,?,?,0)",
+            params![source, if source == 11 || source == 12 { 2 } else { 1 }],
+        )
+        .unwrap();
+    }
+    rank_shortlists(&db).unwrap();
+    let mut query = db
+        .prepare("SELECT source FROM shortlists ORDER BY position")
+        .unwrap();
+    let ids = query
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ids, [12, 6, 11, 1, 2, 3, 4, 7, 8, 9]);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM candidates", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        12
+    );
 }

@@ -36,6 +36,7 @@ export interface ReferenceEdge {
 export interface Candidate {
   category?: string | null;
   page_id: number; title: string; out_degree?: number | null;
+  local_mention?: boolean | null; mention_revision?: number | null; reference_count?: number;
   dead_end?: boolean | null; evidence?: ReferenceEdge[];
 }
 export interface PromptCandidate extends Candidate { references: ReferenceEdge[]; }
@@ -164,6 +165,7 @@ export interface UIElements {
   'candidate-hide-link-disambiguation': HTMLInputElement;
   'candidate-hide-link-names': HTMLInputElement;
   'candidate-hide-link-redirects': HTMLInputElement;
+  'connection-others': HTMLInputElement;
   'connection-search': HTMLInputElement;
   'auth-menu': HTMLDetailsElement;
   'auth-toggle': HTMLElement;

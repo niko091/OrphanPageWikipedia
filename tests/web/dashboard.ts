@@ -385,4 +385,14 @@ await test('closing a preparation aborts pending documents and never restores st
   assert.equal(node('llm-prompt-text').value,'');assert.equal(node('llm-prompt').open,false);
   assert.equal(node('llm-prompt-copy').disabled,true);assert.equal(storage.size,0);
 });
+
+await test('prompt selection ranks local mentions then distinct supporting editions before the five-candidate limit',()=>{
+  const base=recordFor(1).candidates![0],edge=base.evidence![0];
+  const candidates=Array.from({length:9},(_,i)=>({...base,page_id:10+i,title:title(10+i),dead_end:i<6,
+    local_mention:i>=7,evidence:i===6||i===8?[edge,{...edge,language:'fr'}]:[edge,edge]}));
+  const request=editorial.fixRequest(dataset.pages[0],{candidate_count:9,candidates});
+  assert.deepEqual(request?.review?.sources.map(source=>source.page_id),[18,17,16,10,11]);
+  assert.equal(editorial.referenceCount(candidates[0]),1);
+  assert.equal(editorial.referenceCount({...candidates[8],evidence:[edge],reference_count:2}),2);
+});
 console.log('Current relational modules verified; layout and SQL interactions are covered by Playwright.');

@@ -121,6 +121,36 @@ fn clear_collection_area(folder: &Path, role: &str, identity: &Value) -> Pipelin
     Ok(())
 }
 
+fn content_command(options: &PipelineOptions) -> Vec<String> {
+    let mut command = arguments(
+        "fetch-content",
+        &[
+            ("languages-file", path_text(&options.languages_file)),
+            ("content-release", options.content_release.clone()),
+            ("root", path_text(&options.dump_root)),
+        ],
+    );
+    if let Some(mirror) = &options.dump_mirror {
+        append_options(&mut command, &[("mirror", path_text(mirror))]);
+    }
+    command
+}
+
+fn content_checkpoint(
+    options: &PipelineOptions,
+    state: &StepState,
+    language: &str,
+    database: &str,
+    manifest: &Path,
+) -> bool {
+    let inputs = json!({"language":language,"database":database,"release":options.content_release,"dump_root":path_text(&options.dump_root)});
+    read_json(manifest)
+        .and_then(|meta| fetched_outputs(manifest, &meta))
+        .is_ok_and(|files| {
+            state.reason(&format!("content-fetch:{language}"), &inputs, &files) == "verified_reuse"
+        })
+}
+
 pub(super) fn collection_workflow(
     options: &PipelineOptions,
     steps: &mut impl Steps,
@@ -129,10 +159,10 @@ pub(super) fn collection_workflow(
         return workflow(options, steps);
     };
     if options.plan {
-        steps.log(&format!("PUBBLICAZIONE database {}; dump consumati per tabella/partizione; staging eliminati dopo l'ultimo utilizzo verificato",destination.display()))?;
+        steps.log(&format!("PUBBLICAZIONE database {}; dump SQL e History consumati dopo l'importazione, XML multilingue conservati fino alla verifica delle menzioni locali",destination.display()))?;
         return workflow(options, steps);
     }
-    let identity = json!({"rule":crate::store::RULE,"languages":options.selected,"sql_release":options.sql_release,
+    let identity = json!({"rule":crate::store::RULE,"editorial_ranking":crate::store::EDITORIAL_RANKING,"languages":options.selected,"sql_release":options.sql_release,
         "history_release":options.history_release,"content_release":options.content_release,
         "languages_sha256":dumps::file_sha256(&options.languages_file)?,"topics_sha256":dumps::file_sha256(&options.model_config)?,
         "categories_sha256":dumps::file_sha256(&options.root.join("config/categories.json"))?,
@@ -230,6 +260,21 @@ pub(super) fn collection_workflow(
         })()
         .unwrap_or(false)
     };
+    if ready && private.selected.len() > 1 {
+        let state = StepState::open(private.dump_root.join("pipeline-state.json"))?;
+        for (language, database) in &private.selected {
+            let manifest = private
+                .dump_root
+                .join(database)
+                .join(format!("content-{}.json", private.content_release));
+            if !content_checkpoint(&private, &state, language, database, &manifest) {
+                steps.run(
+                    &format!("ripristino XML per le menzioni {language}"),
+                    &with_languages(content_command(&private), std::slice::from_ref(language)),
+                )?;
+            }
+        }
+    }
     if ready {
         steps.log("SALTA elaborazione: pubblicazione pronta con file e manifest verificati")?;
     } else {
@@ -267,18 +312,9 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             ("root", path_text(&options.dump_root)),
         ],
     );
-    let mut content = arguments(
-        "fetch-content",
-        &[
-            ("languages-file", path_text(&options.languages_file)),
-            ("content-release", options.content_release.clone()),
-            ("root", path_text(&options.dump_root)),
-        ],
-    );
+    let content = content_command(options);
     if let Some(mirror) = &options.dump_mirror {
-        for command in [&mut fetch, &mut content] {
-            append_options(command, &[("mirror", path_text(mirror))]);
-        }
+        append_options(&mut fetch, &[("mirror", path_text(mirror))]);
     }
     if options.plan {
         let mut sql = with_languages(fetch, &languages);
@@ -548,7 +584,11 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                     "model_sha256":dumps::file_sha256(&options.root.join("config/quality.json"))?,"quality_revision_rule":"selected_official_xml_revision_v1"});
                 Ok(state.reason(&format!("quality:{language}"),&inputs,std::slice::from_ref(&quality))=="verified_reuse")
             })().unwrap_or(false);
-            if options.force || !reusable {
+            if options.force
+                || !reusable
+                || (options.selected.len() > 1
+                    && !content_checkpoint(options, &state, language, database, &manifest))
+            {
                 steps.run(
                     &format!("contenuto corrente verificato {language}"),
                     &with_languages(content.clone(), std::slice::from_ref(language)),
@@ -596,7 +636,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             )?;
         }
         state.save(&key, inputs, std::slice::from_ref(&quality))?;
-        if options.collection_database.is_some() {
+        if options.collection_database.is_some() && options.selected.len() == 1 {
             remove_downloads(&manifest, &metadata, &options.dump_root)?;
         }
     }

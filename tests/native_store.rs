@@ -517,6 +517,11 @@ fn relational_queries_preserve_full_census_missing_values_filters_and_every_edge
         "Page 101"
     );
     assert_eq!(
+        card["candidate_record"]["candidates"][0]["reference_count"],
+        1
+    );
+    assert!(card["candidate_record"]["candidates"][0]["local_mention"].is_null());
+    assert_eq!(
         card["candidate_record"]["candidates"][0]["category"],
         "Musica"
     );

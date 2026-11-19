@@ -25,7 +25,10 @@ export const candidateReasons: Record<string, string> = {missing_item:'Identific
 export function cardTitle(tag: keyof HTMLElementTagNameMap, title: string, language: string) {
   const heading=element(tag,null,'candidate-title');heading.append(wikiLink(title,language));return heading;
 }
-export const candidateOrder=(a: Candidate, b: Candidate)=>Number(b.dead_end===true)-Number(a.dead_end===true)||a.title.localeCompare(b.title)||a.page_id-b.page_id;
+export const referenceCount=(candidate: Candidate)=>candidate.reference_count ??
+  new Set(candidate.evidence?.filter(edge=>edge.source_title?.trim()&&edge.target_title?.trim()).map(edge=>edge.language)).size;
+export const candidateOrder=(a: Candidate, b: Candidate)=>
+  Number(b.local_mention===true)-Number(a.local_mention===true)||referenceCount(b)-referenceCount(a)||Number(b.dead_end===true)-Number(a.dead_end===true)||a.title.localeCompare(b.title)||a.page_id-b.page_id;
 function fixPrompt(page: PageObservation, candidates: PromptCandidate[], total: number, single=false) {
   const language=editorialContext.pageLanguage(page);
   const url=(title: string,code=language)=>`https://${code}.wikipedia.org/wiki/${encodeURIComponent(title.replaceAll(' ','_'))}`;

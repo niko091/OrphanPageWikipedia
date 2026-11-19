@@ -164,11 +164,14 @@ impl FakeSteps {
             if languages.len() > 1 {
                 metadata["comparison"] = json!({"status":"compared","reference_languages":languages.iter().filter(|l|*l!=language).collect::<Vec<_>>()});
             }
+            let candidates:Vec<_>=languages.iter().filter(|other|*other!=language).take(1).map(|other|
+                json!({"page_id":2,"title":"B","dead_end":true,"evidence":[{"language":other,"source_title":"B","target_title":"A"}]})
+            ).collect();
             let file = format!("{language}-result-{}.json", self.generation);
             write(
                 &folder.join(&file),
                 &json!({"metadata":metadata,"pages":[{"page_id":1,"title":"A","orphan":true},{"page_id":2,"title":"B","orphan":false}],
-                "link_candidates":{"1":{"status":"compared","candidate_count":0,"candidates":[]}}}),
+                "link_candidates":{"1":{"status":"compared","candidate_count":candidates.len(),"candidates":candidates}}}),
             );
             let private = folder.join(format!("private-{}", runtime::unique_id()));
             let names = dumps::prepare_dashboard_exports(&folder.join(&file), &private, None, None)
@@ -324,10 +327,24 @@ impl Steps for FakeSteps {
                     let root = PathBuf::from(value("--root")).join(&database);
                     std::fs::create_dir_all(&root).unwrap();
                     let path = root.join("content.xml");
-                    std::fs::write(&path, "synthetic XML archive").unwrap();
+                    let body = if language == "vec" {
+                        "Nel testo: a."
+                    } else {
+                        "Alpha [[A]] {{T|{{A}}}} &lt;!-- A --&gt; &lt;nowiki&gt;A&lt;/nowiki&gt;"
+                    };
+                    let xml = format!(
+                        r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/"><siteinfo><dbname>{database}</dbname></siteinfo><page><title>B</title><id>2</id><ns>0</ns><revision><id>42</id><text>{body}</text></revision></page></mediawiki>"#
+                    );
+                    let mut encoder = bzip2::write::BzEncoder::new(
+                        File::create(&path).unwrap(),
+                        bzip2::Compression::default(),
+                    );
+                    encoder.write_all(xml.as_bytes()).unwrap();
+                    encoder.finish().unwrap();
+                    let digest = dumps::file_sha256(&path).unwrap();
                     write(
                         &root.join("content-2026-10-01.json"),
-                        &json!({"language":language,"database":database,"complete":true,"content_release":"2026-10-01","files":{"content.xml":{"path":path}}}),
+                        &json!({"language":language,"database":database,"complete":true,"source":"mediawiki_content_current","content_release":"2026-10-01","files":{"content.xml":{"path":path,"sha256_local":digest,"sha256_publisher":digest,"bytes":path.metadata().unwrap().len()}}}),
                     );
                 }
             }
@@ -427,7 +444,29 @@ fn relational_collection_is_atomic_resumable_and_removes_only_its_own_files() {
         .iter()
         .any(|c| c[0] == "fetch-dumps" || c[0] == "import-dumps" || c[0] == "topics"));
     let db = crate::store::Census::open(&destination).unwrap();
-    assert_eq!(db.manifest().unwrap().as_array().unwrap().len(), 3);
+    let published = db.manifest().unwrap();
+    assert_eq!(published.as_array().unwrap().len(), 3);
+    for entry in published
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] != "aggregate")
+    {
+        for dir in ["cards_dir", "connections_dir"] {
+            let resource = db
+                .resource(&format!("{}/1.json", entry[dir].as_str().unwrap()))
+                .unwrap();
+            let record = if dir == "cards_dir" {
+                &resource["candidate_record"]
+            } else {
+                &resource["link_candidates"]["1"]
+            };
+            let candidate = &record["candidates"][0];
+            assert_eq!(candidate["local_mention"], entry["language"] == "vec");
+            assert_eq!(candidate["mention_revision"], 42);
+            assert_eq!(candidate["reference_count"], 1);
+        }
+    }
     let approved = std::fs::read(&destination).unwrap();
     assert_eq!(
         std::fs::read_to_string(&collected).unwrap(),
@@ -533,6 +572,57 @@ fn publication_retry_rejects_changed_export_bytes_before_reusing_the_ready_check
         .unwrap()
         .verify()
         .unwrap();
+}
+
+#[test]
+fn offline_conversion_uses_only_available_verified_xml_and_preserves_the_previous_database() {
+    let mut f = Fixture::new();
+    f.options.selected.push(("lmo".into(), "lmowiki".into()));
+    f.run().unwrap();
+    let database = f.root.join("offline.sqlite");
+    std::fs::remove_file(f.options.dump_root.join("lmowiki/content.xml")).unwrap();
+    crate::store::publish(
+        &f.options.output_dir,
+        &database,
+        &json!({"conversion":true}),
+    )
+    .unwrap();
+    let db = crate::store::Census::open(&database).unwrap();
+    for entry in db
+        .manifest()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] != "aggregate")
+    {
+        let card = db
+            .resource(&format!("{}/1.json", entry["cards_dir"].as_str().unwrap()))
+            .unwrap();
+        let candidate = &card["candidate_record"]["candidates"][0];
+        assert_eq!(candidate["reference_count"], 1);
+        assert_eq!(
+            candidate["local_mention"],
+            if entry["language"] == "vec" {
+                json!(true)
+            } else {
+                Value::Null
+            }
+        );
+    }
+    let original = dumps::file_sha256(&database).unwrap();
+    std::fs::write(
+        f.options.dump_root.join("vecwiki/content.xml"),
+        "modified archive",
+    )
+    .unwrap();
+    assert!(crate::store::publish(
+        &f.options.output_dir,
+        &database,
+        &json!({"conversion":true})
+    )
+    .is_err());
+    assert_eq!(dumps::file_sha256(&database).unwrap(), original);
 }
 
 #[test]

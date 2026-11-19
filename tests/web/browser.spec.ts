@@ -534,3 +534,40 @@ test('database alone serves paginated articles, creators and cards on desktop an
     expect(queries.some(value=>record(value)&&value.kind==='cards'&&value.offset===16)).toBe(true);
     expect(traffic.editorial).toEqual([]);
 });
+
+test('Connect shows attested local mentions first and reveals other candidates on demand',async({page,site,traffic})=>{
+  await page.route('**/data/**/1.json',async route=>{
+    const response=await route.fetch();
+    const detail:unknown=await response.json();
+    assert(record(detail)&&record(detail.link_candidates)&&record(detail.link_candidates['1']));
+    const result=detail.link_candidates['1'];
+    assert(Array.isArray(result.candidates)&&record(result.candidates[0]));
+    const base=result.candidates[0];
+    result.candidates=[{...base,page_id:41,title:title(41),local_mention:false,mention_revision:50,reference_count:1},
+      {...base,page_id:42,title:title(42),local_mention:true,mention_revision:51,reference_count:1}];
+    result.candidate_count=2;
+    await route.fulfill({response,json:detail});
+  });
+  await open(page,site,'connections.html');
+  const cards=page.locator('.connection-card'),toggle=page.locator('#connection-others');
+  await expect(cards).toHaveCount(1);
+  await expect(cards.first()).toContainText(title(42));
+  for(const width of [390,1280]) {
+    await page.setViewportSize({width,height:844});
+    for(const theme of ['dark','light']) {
+      await page.locator('html').evaluate((node,mode)=>{node.dataset.theme=mode;},theme);
+      await expect(toggle).toBeVisible();
+      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
+    }
+  }
+  await toggle.focus();await page.keyboard.press('Space');
+  await expect(cards).toHaveCount(2);
+  await expect(cards.first()).toContainText(title(42));
+  await page.locator('#ui-language-toggle').click();
+  await expect(cards.first()).toContainText('Orphan title found in local text');
+  await expect(page.getByLabel('Include candidates without a verified mention')).toBeChecked();
+  await page.locator('#connection-search').fill(title(41));
+  await expect(cards).toHaveCount(1);
+  await expect(cards.first()).toContainText(title(41));
+  expect(traffic.editorial).toEqual([]);
+});

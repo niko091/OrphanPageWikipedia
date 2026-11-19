@@ -1,5 +1,5 @@
 import type {ManifestEntry, ConnectionMetadata, Dataset, DashboardSummaryData} from './types.js';
-import {isRecord} from './validation.js';
+import {isRecord,validEditorialRanking} from './validation.js';
 
 export function validateManifest(value: unknown): ManifestEntry[] {
   if(!Array.isArray(value)||!value.length)throw new Error('Nessuna raccolta presente');
@@ -41,7 +41,8 @@ export async function readConnections(entry: ManifestEntry,signal?: AbortSignal)
     detail.metadata!==undefined||detail.connection_identity!==shared.connection_identity||detail.census_page_count!==shared.census_page_count||
     !Array.isArray(detail.pages)||detail.pages.length!==1||!isRecord(detail.pages[0])||String(detail.pages[0].page_id)!==pageID||
     detail.pages[0].orphan!==true||!isRecord(detail.link_candidates)||!isRecord(detail.link_candidates[pageID])||
-    !Array.isArray(detail.link_candidates[pageID].candidates))throw new Error('Metadati dei collegamenti non validi');
+    !Array.isArray(detail.link_candidates[pageID].candidates)||
+    detail.link_candidates[pageID].candidates.some(candidate=>!isRecord(candidate)||!validEditorialRanking(candidate)))throw new Error('Metadati dei collegamenti non validi');
   const dataset={metadata:shared.metadata,pages:detail.pages,link_candidates:detail.link_candidates,census_page_count:shared.census_page_count} as Dataset;
   validateDataset(dataset);return dataset;
 }

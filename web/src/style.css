@@ -485,13 +485,12 @@ dialog textarea {
 
 .connection-search {
   flex-direction: row;
-  flex-wrap: wrap;
   align-items: center;
   margin-inline-start: auto;
 }
 
 .connection-search input {
-  flex: 1 1 12rem;
+  inline-size: 12rem;
   min-inline-size: 0;
 }
 
