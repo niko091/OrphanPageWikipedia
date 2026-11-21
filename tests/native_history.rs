@@ -295,6 +295,15 @@ fn reconstruction_attribution_current_flags_and_strict_activity_boundaries() {
     let result = workspace
         .import(&manifest, HistoryOptions::default())
         .unwrap();
+    let persistent_indexes: i64 = workspace
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='history_edit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persistent_indexes, 0);
     let pages = result["pages"].as_array().unwrap();
     assert_eq!(pages.len(), 15);
     assert_eq!(pages[0]["creator_prior_edits_main_history"], 5);

@@ -857,7 +857,8 @@ fn history_creator_metrics(
         use rusqlite::{functions::FunctionFlags, params};
         // Order by the parsed timestamp, including fractions and leap seconds.
         // Invalid timestamps sort first and invalidate only this user's dated
-        // targets. SQLite sorts within the indexed user prefix on disk.
+        // targets. Use SQLite's external sort so the persistent checkpoint
+        // database does not need to grow by an index over all revisions.
         connection.create_scalar_function(
             "history_time_key",
             1,
@@ -1150,9 +1151,6 @@ pub fn import_history(
                 super::remove_consumed_download(root, data)?;
             }
         }
-        connection.execute_batch(
-            "CREATE INDEX IF NOT EXISTS history_edit_user_time ON history_edit(user_id,at)",
-        )?;
         eprintln!("MediaWiki History {database}: conteggio attività precedente alla creazione");
         history_creator_metrics(&connection, &users)?;
         drop(users);
