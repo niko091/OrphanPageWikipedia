@@ -352,6 +352,7 @@ function closeProposalDialog() {
   proposalSession=null;
   $('proposal-dialog')!.close();
   $('proposal-rows')!.replaceChildren();
+  $('proposal-outcome-rows')!.replaceChildren();
   $('proposal-target')!.replaceChildren();
   $('proposal-status')!.textContent='';
   if(session.opener.isConnected)session.opener.focus();
@@ -368,6 +369,18 @@ function showProposals(review: ReviewContext,mode: ProposalMode,opener: HTMLButt
 }
 
 const proposalActions=['ADD LINK','BEFORE','AFTER','REPLACE'];
+const outcomeLabels: Record<string,string>={
+  unavailable:'Una fonte richiesta non è stata verificata.',
+  package_limit:'Il pacchetto supera il limite di invio del servizio.',
+  context_limit:'Lift Wing ha rifiutato il pacchetto per dimensione.',
+  no_suggestion:'Il modello non ha fornito una proposta o un motivo.',
+  insufficient_evidence:'Il modello non ha individuato prove sufficienti.',
+  no_placement:'Il modello non ha individuato un punto d’inserimento adatto.',
+  already_linked:'Il collegamento risulta già presente.',
+  missing_anchor:'La stringa proposta manca nel wikitesto verificato.',
+  ambiguous_anchor:'La stringa proposta compare più volte nel wikitesto verificato.',
+  invalid_edit:'La modifica proposta non rispetta il formato o i vincoli editoriali.',
+};
 const positiveId=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
 const count=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0;
 
@@ -388,6 +401,7 @@ function renderProposals(value: unknown,session: ProposalSession) {
       !/^[a-z][a-z0-9-]{0,19}$/.test(row.reference_language)||row.reference_language==='all'||
       typeof row.reference_title!=='string'||!row.reference_title.trim()||
       (row.action==='ADD LINK'?row.wikitext!==null:typeof row.wikitext!=='string'||!row.wikitext.trim())||
+      (row.link_text!==undefined&&(row.action!=='ADD LINK'||typeof row.link_text!=='string'||!row.link_text.trim()||!row.anchor.includes(row.link_text)))||
       (mode==='preview'?(row.source_revision_id!==null||row.reference_revision_id!==null):
         (!positiveId(row.source_revision_id)||!positiveId(row.reference_revision_id))))throw invalid();
     const source=sources.get(row.source_id)!;
@@ -403,19 +417,43 @@ function renderProposals(value: unknown,session: ProposalSession) {
     reference.append(wikiLink(row.reference_title,row.reference_language,positiveId(row.reference_revision_id)?row.reference_revision_id:null),element('small',row.reference_language.toUpperCase()));
     const anchor=element('td');anchor.append(element('code',row.anchor));
     const edit=element('td');edit.append(element('strong',row.action));
+    if(typeof row.link_text==='string'&&row.link_text!==row.anchor) {
+      const span=element('small');span.append(document.createTextNode(t('Testo da collegare')+' '),element('code',row.link_text));edit.append(span);
+    }
     if(typeof row.wikitext==='string') {
       const pre=element('pre');pre.append(element('code',row.wikitext));edit.append(pre);
     }
     tr.append(identity,reference,anchor,edit);
     return tr;
   });
+  const details=$('proposal-outcomes')!;
+  const outcomeRows: HTMLElement[]=[];
+  const outcomes=new Map<number,string>();
+  if(value.outcomes!==undefined) {
+    if(!Array.isArray(value.outcomes))throw invalid();
+    for(const row of value.outcomes as unknown[]) {
+      if(!isRecord(row)||!positiveId(row.source_id)||!sources.has(row.source_id)||proposed.has(row.source_id)||
+        outcomes.has(row.source_id)||typeof row.reason!=='string'||!Object.hasOwn(outcomeLabels,row.reason))throw invalid();
+      outcomes.set(row.source_id,outcomeLabels[row.reason]);
+    }
+    for(const source of sources.values()) {
+      const reason=outcomes.get(source.page_id);
+      if(reason) {
+        const item=element('li');item.append(wikiLink(source.title,review.language),element('span',' — '+t(reason)));
+        outcomeRows.push(item);
+      }
+    }
+  }
+  $('proposal-outcome-rows')!.replaceChildren(...outcomeRows);
+  details.hidden=!outcomeRows.length;
+  details.open=!rows.length;
   $('proposal-rows')!.replaceChildren(...rows);
   $('proposal-table')!.hidden=!rows.length;
   const notes=[sent.size===0?t('Nessuna coppia inviata a Lift Wing.'):rows.length===0?
     t(value.discarded?'Nessuna proposta ha superato i controlli.':'Nessuna proposta per le coppie analizzate.'):
     t('Verifica il testo su Wikipedia prima di applicare le proposte.')];
   if(value.unavailable)notes.push(t('Coppie con fonti non verificabili: {n}.',{n:value.unavailable}));
-  if(value.oversized)notes.push(t('Coppie con fonti troppo lunghe per il modello: {n}.',{n:value.oversized}));
+  if(value.oversized)notes.push(t('Coppie oltre il limite di invio o di contesto: {n}.',{n:value.oversized}));
   if(value.discarded&&rows.length)notes.push(t('Proposte scartate dai controlli: {n}.',{n:value.discarded}));
   $('proposal-status')!.textContent=notes.join(' ');
   if(sent.size) {
@@ -434,7 +472,7 @@ export async function submitProposals() {
   const timer=setTimeout(()=>controller.abort(),60_000);
   const status=$('proposal-status')!,retry=$('proposal-retry')!;
   status.textContent=t(mode==='preview'?'Preparazione dell’anteprima…':'Lettura delle revisioni e generazione con Lift Wing…');
-  $('proposal-table')!.hidden=true;$('proposal-reviews')!.hidden=true;retry.hidden=true;
+  $('proposal-table')!.hidden=true;$('proposal-reviews')!.hidden=true;$('proposal-outcomes')!.hidden=true;retry.hidden=true;
   try {
     const response=await fetch('api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:review.dataset,language:review.language,

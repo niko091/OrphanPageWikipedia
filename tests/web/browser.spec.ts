@@ -421,7 +421,9 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       const response=await route.fetch();
       const body: unknown=await response.json();
       assert(record(body));
-      await route.fulfill({response,json:++attempted===1?{}:{...body,proposals:[]}});
+      assert(Array.isArray(body.sent_source_ids));
+      const outcomes=body.sent_source_ids.map((source_id: unknown)=>({source_id,reason:'insufficient_evidence'}));
+      await route.fulfill({response,json:++attempted===1?{}:{...body,proposals:[],outcomes}});
     });
     await open(page,site,'deorphanize.html');
     await page.getByRole('button',{name:'Fix this',exact:true}).first().click();
@@ -429,6 +431,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await page.locator('#proposal-retry').click();
     await expect(page.locator('#proposal-status')).toContainText('Nessuna proposta per le coppie analizzate');
     await expect(page.locator('#proposal-table')).not.toBeVisible();
+    await expect(page.locator('#proposal-outcomes li').first()).toContainText('Il modello non ha individuato prove sufficienti.');
     await expect(page.locator('#proposal-review-rows .review-row')).not.toHaveCount(0);
   });
 });
