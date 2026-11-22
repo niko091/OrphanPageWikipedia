@@ -1,6 +1,6 @@
-import type {PageObservation, ReferenceEdge, Candidate, PromptCandidate, CandidateRecord, PromptSource, PromptDocument, ReviewStatus, EditorialReview, ReviewContext, PromptRequest, Provider, ProposalMode, Dataset} from './types.js';
+import type {PageObservation, ReferenceEdge, Candidate, PromptCandidate, CandidateRecord, PromptSource, PromptDocument, EditorialReview, ReviewContext, PromptRequest, Provider, ProposalMode, Dataset} from './types.js';
 import {$, element, deorphanizePage} from './dom.js';
-import {t, number, uiLanguage} from './i18n.js';
+import {t, number, locale, uiLanguage} from './i18n.js';
 import {isRecord} from './validation.js';
 interface EditorialContext {
  readonly data: Dataset; readonly datasetFile: string; readonly loadVersion: number;
@@ -8,7 +8,6 @@ interface EditorialContext {
  readonly llmProvider: string; readonly llmProviders: Record<string,Provider>;
  pageLanguage: (page: PageObservation) => string; pageKey: (page: PageObservation) => string;
  hiddenSuggestedLink: (page: PageObservation,candidate: Candidate) => boolean;
- userPage: (username: string,language: string) => string;
  validUsername: (value: unknown) => value is string;
  loadAuth: () => Promise<void>; renderDataset: () => void; fail: (error: unknown) => void;
  wikimediaAPI: (url: URL,signal?: AbortSignal,onWait?: (seconds: number) => void) => Promise<unknown>;
@@ -85,7 +84,8 @@ let reviewSurface: {rows: HTMLElement; status: HTMLElement; proposal?: {
   sources: ReviewContext['sources']; reasons: ReadonlyMap<number,string>; tables: ReadonlyMap<number,HTMLElement>;
 }} | null=null;
 let reviewSaveController: AbortController | null=null;
-const reviewLabels: Record<ReviewStatus,string>={fixed:'Fixato',not_fixed:'Non fixato',bad_link:'Bad link'};
+const reviewLabels={fixed:'Fixato',bad_link:'Bad link'} as const;
+let reviewTooltipId=0;
 export function reviewedEdge(page: PageObservation,sourceID: number): EditorialReview | undefined {
   return editorialReviews.get(reviewKey(editorialContext.pageLanguage(page),sourceID,page.page_id));
 }
@@ -107,13 +107,33 @@ function parseReview(value: unknown): EditorialReview {
   return {language:value.language,source_id:value.source_id,target_id:value.target_id,
     status:value.status,version:value.version,updated_at:value.updated_at,reviewer:typeof value.reviewer==='string'?value.reviewer:undefined};
 }
-export function reviewBadge(review: EditorialReview): HTMLElement {
-  const badge=element('span',t('Valutazione condivisa: {status}',{status:t(reviewLabels[review.status])}),'review-badge');
-  if(review.reviewer) {
-    const link=element('a',review.reviewer);link.href=editorialContext.userPage(review.reviewer,review.language);link.target='_blank';link.rel='noopener noreferrer';
-    badge.append(element('span',' · '+t('Valutazione di ')),link);
-  }
-  return badge;
+export function reviewBadge(review: EditorialReview | undefined): HTMLElement | null {
+  if(!review||review.status==='not_fixed')return null;
+  const badge=element('span',review.status==='fixed'?'Fixed':'Bad Link','review-badge');
+  badge.dataset.status=review.status;
+  badge.tabIndex=0;
+  return withReviewTooltip(badge,review);
+}
+function withReviewTooltip(control: HTMLSpanElement | HTMLButtonElement,review: EditorialReview): HTMLElement {
+  const wrapper=element('span',null,'review-tooltip-anchor');
+  const tooltip=element('span',null,'review-tooltip');
+  tooltip.id=`review-tooltip-${++reviewTooltipId}`;
+  tooltip.setAttribute('role','tooltip');
+  const trigger='disabled' in control&&control.disabled?wrapper:control;
+  if(trigger===wrapper)wrapper.tabIndex=0;
+  trigger.setAttribute('aria-describedby',tooltip.id);
+  const date=new Intl.DateTimeFormat(locale(),{dateStyle:'medium',timeZone:'UTC'}).format(new Date(review.updated_at));
+  tooltip.append(element('span',review.reviewer?t('Valutazione di {name}',{name:review.reviewer}):t('Autore non disponibile')),
+    element('span',t('Data: {date}',{date})));
+  const showTooltip=()=>{
+    tooltip.hidden=false;
+    const {top,bottom}=wrapper.getBoundingClientRect(),spaceBelow=window.innerHeight-bottom;
+    tooltip.toggleAttribute('data-above',tooltip.offsetHeight>spaceBelow&&top>spaceBelow);
+  };
+  wrapper.addEventListener('pointerenter',showTooltip);
+  trigger.addEventListener('focus',showTooltip);
+  wrapper.append(control,tooltip);
+  return wrapper;
 }
 async function readReviews(dataset: string): Promise<Map<string,EditorialReview>> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
@@ -170,12 +190,13 @@ function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'b
     box.append(row);
     if(!reviewable.has(source.page_id))continue;
     const review=editorialReviews.get(reviewKey(context.language,source.page_id,context.target_id));
-    row.append(review?reviewBadge(review):element('p',t('Non ancora valutata')));
     const actions=element('div',null,'review-actions');
     for(const status of ['fixed','bad_link'] as const) {
       const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||!canReview;
+      button.dataset.status=status;
       button.setAttribute('aria-pressed',String(review?.status===status));
-      button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
+      button.addEventListener('click',()=>{void saveReview(context,source,status);});
+      actions.append(review?.status===status?withReviewTooltip(button,review):button);
       if(focus?.source===source.page_id&&focus.status===status&&!button.disabled)focusButton=button;
     }
     row.append(actions);

@@ -505,6 +505,56 @@ previewTest.describe('local Wikimedia proposals preview', () => {
   });
 });
 
+test('review badges keep the article title readable and disclose review details',async({page,site},testInfo)=>{
+  let status: 'fixed' | 'bad_link'='fixed';
+  const reviewer='Revisore sintetico con un nome molto lungo';
+  await page.route(/\/api\/reviews\?dataset=fixture\.json$/,route=>route.fulfill({json:{
+    format:'editorial_reviews_v1',reviews:[{language:'vec',source_id:33,target_id:1,status,version:1,
+      updated_at:'2026-10-01T00:00:00Z',reviewer}],
+  }}));
+  for(const [value,label,width,theme] of [['fixed','Fixed',390,'light'],['bad_link','Bad Link',1280,'dark']] as const) {
+    status=value;
+    await page.setViewportSize({width,height:844});
+    await open(page,site,'connections.html');
+    await page.locator('html').evaluate((node,mode)=>{node.dataset.theme=mode;},theme);
+    await page.locator('#connection-reviewed').click();
+    const card=page.locator('#connection-candidates .connection-card');
+    const heading=card.getByRole('heading',{name:title(33),exact:true});
+    const articleLink=heading.getByRole('link');
+    const badge=card.locator('.review-badge');
+    const tooltip=card.getByRole('tooltip',{includeHidden:true});
+    await expect(badge).toHaveText(label);
+    expect(await articleLink.evaluate(link=>link.getClientRects().length)).toBe(1);
+    const headingBox=await heading.boundingBox(),badgeBox=await badge.boundingBox();
+    assert(headingBox&&badgeBox);
+    expect(badgeBox.x).toBeGreaterThanOrEqual(headingBox.x+headingBox.width);
+    expect(Math.abs((badgeBox.y+badgeBox.height/2)-(headingBox.y+headingBox.height/2))).toBeLessThan(1);
+    await expect(tooltip).toBeHidden();
+    await badge.hover();
+    await expect(tooltip).toBeVisible();
+    await expect(tooltip).toContainText(`Valutazione di ${reviewer}`);
+    await expect(tooltip).toContainText('Data: 1 ott 2026');
+    await expect(tooltip).toBeInViewport({ratio:1});
+    await page.screenshot({path:testInfo.outputPath(`badge-${theme}-${width}.png`)});
+    await tooltip.hover();
+    await expect(tooltip).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(tooltip).toBeHidden();
+    await articleLink.hover();
+    await articleLink.focus();
+    await page.keyboard.press('Tab');
+    await expect(badge).toBeFocused();
+    await expect(badge).toHaveAccessibleDescription(new RegExp(reviewer));
+    await expect(tooltip).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(tooltip).toBeHidden();
+    await expect(badge).toBeFocused();
+  }
+  await page.locator('#ui-language-toggle').click();
+  await page.locator('#connection-candidates .review-badge').hover();
+  await expect(page.getByRole('tooltip')).toContainText('Date: 1 Oct 2026');
+});
+
 test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic},testInfo) => {
   await open(page, site, 'deorphanize.html');
   expect(traffic.editorial).toEqual([]);
@@ -533,26 +583,45 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
     await expect(page.locator('#review-close')).toBeInViewport();
     await page.locator('#review-dialog').screenshot({path:testInfo.outputPath(`review-${width}-${theme}.png`)});
   }
-  await page.getByRole('button', {name: 'Fixato', exact: true}).click();
-  await expect(page.getByRole('button', {name: 'Fixato', exact: true})).toHaveAttribute('aria-pressed', 'true');
+  const reviewDialog=page.locator('#review-dialog');
+  const fixed=reviewDialog.getByRole('button',{name:'Fixato',exact:true});
+  const badLink=reviewDialog.getByRole('button',{name:'Bad link',exact:true});
+  await fixed.click();
+  await expect(fixed).toHaveAttribute('aria-pressed','true');
+  await expect(fixed).toHaveCSS('background-color','rgb(32, 61, 50)');
+  await expect(badLink).toHaveAttribute('aria-pressed','false');
+  await expect(badLink).toHaveCSS('background-color','rgb(16, 20, 24)');
+  await expect(reviewDialog.locator('.review-badge')).toHaveCount(0);
+  await fixed.hover();
+  await expect(reviewDialog.getByRole('tooltip')).toContainText('Data:');
+  await page.keyboard.press('Escape');
+  await expect(reviewDialog.getByRole('tooltip')).toHaveCount(0);
+  await reviewDialog.screenshot({path:testInfo.outputPath('review-fixed-390-dark.png')});
   await page.locator('#review-close').click();
   await open(page, site, 'connections.html');
   await expect(page.locator('#connection-candidates .review-badge')).toHaveCount(0);
   await page.locator('#connection-reviewed').click();
-  await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
+  await expect(page.locator('#connection-candidates .review-badge')).toHaveText('Fixed');
   const search=page.getByRole('searchbox',{name:'Cerca per titolo'});
   await search.fill('SENZA RISULTATI');
   await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);
   await expect(page.getByText('Nessuna pagina corrisponde alla ricerca.')).toBeVisible();
   await search.fill(' SINTETICA 033 ');
-  await expect(page.locator('#connection-candidates .review-badge')).toContainText('Fixato');
+  await expect(page.locator('#connection-candidates .review-badge')).toHaveText('Fixed');
   await expect(page.getByRole('button', {name: 'Fix this', exact: true})).toHaveCount(0);
+  await page.setViewportSize({width:1280,height:844});
+  await page.locator('html').evaluate(node=>{node.dataset.theme='light';});
   await page.getByRole('button', {name: 'Valuta coppia', exact: true}).click();
-  await page.getByRole('button', {name: 'Fixato', exact: true}).click();
+  await fixed.click();
   await expect(page.locator('#review-rows button[aria-pressed="true"]')).toHaveCount(0);
-  await page.getByRole('button', {name: 'Bad link', exact: true}).click();
-  await expect(page.getByRole('button', {name: 'Bad link', exact: true})).toHaveAttribute('aria-pressed', 'true');
-  await page.getByRole('button', {name: 'Bad link', exact: true}).click();
+  await badLink.click();
+  await expect(badLink).toHaveAttribute('aria-pressed','true');
+  await expect(badLink).toHaveCSS('background-color','rgb(254, 231, 230)');
+  await expect(fixed).toHaveCSS('background-color','rgb(248, 249, 250)');
+  await expect(reviewDialog.locator('.review-badge')).toHaveCount(0);
+  await page.locator('#review-title').hover();
+  await reviewDialog.screenshot({path:testInfo.outputPath('review-bad-link-1280-light.png')});
+  await badLink.click();
   await expect(page.locator('#review-rows button[aria-pressed="true"]')).toHaveCount(0);
   await page.locator('#review-close').click();
   await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(0);

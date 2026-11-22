@@ -427,11 +427,14 @@ function renderConnections() {
   }
   for(const candidate of candidates.slice(connectionOffset,connectionOffset+connectionPageSize)) {
     const card=element('article',null,'candidate-card connection-card'),body=element('div',null,'candidate-body');
-    const header=element('div',null,'candidate-header');header.append(cardTitle('h2',candidate.title,pageLanguage(page)));
+    const header=element('div',null,'candidate-header'),heading=cardTitle('h2',candidate.title,pageLanguage(page));
+    const badge=reviewBadge(reviewedEdge(page,candidate.page_id));
+    if(badge) {
+      const titleRow=element('div',null,'connection-reviewed-heading');
+      titleRow.append(heading,badge);header.append(titleRow);
+    } else header.append(heading);
     if(candidate.local_mention===true)header.append(element('p',t('Titolo dell’orfana nel testo locale'),'muted'));
     if(candidate.dead_end===true)header.append(element('span','Dead-end page','dead-end-badge'));
-    const review=reviewedEdge(page,candidate.page_id);
-    if(review)header.append(reviewBadge(review));
     body.append(header);
     const proposed=element('div',null,'connection-proposed');
     proposed.append(element('h3',t('Collegamento da valutare in {language}',{language:pageLanguage(page).toUpperCase()})));
@@ -649,6 +652,13 @@ $('llm-prompt-close')?.addEventListener('click',closePrompt);
 $('llm-prompt-finished')?.addEventListener('click',()=>{if(activePromptReview)void showReview(activePromptReview);});
 $('review-close')?.addEventListener('click',closeReview);
 $('review-dialog')?.addEventListener('cancel',event=>{event.preventDefault();closeReview();});
+document.addEventListener('keydown',event=>{
+  if(event.key!=='Escape'||event.defaultPrevented)return;
+  for(const tooltip of document.querySelectorAll<HTMLElement>('.review-tooltip-anchor:is(:hover,:focus-visible,:has(:focus-visible)) .review-tooltip:not([hidden])')) {
+    tooltip.hidden=true;
+    event.preventDefault();
+  }
+});
 $('llm-prompt')?.addEventListener('cancel',event=>{event.preventDefault();closePrompt();});
 $('proposal-close')?.addEventListener('click',closePrompt);
 $('proposal-retry')?.addEventListener('click',()=>{void submitProposals();});
@@ -723,7 +733,7 @@ configureEditorial({
  get data(){return data;}, get datasetFile(){return datasetFile;}, get loadVersion(){return loadVersion;},
  get authEnabled(){return authEnabled;}, get authUsername(){return authUsername;},
  get llmProvider(){return llmProvider;}, get llmProviders(){return llmProviders;},
- pageLanguage,pageKey,hiddenSuggestedLink,userPage,validUsername,loadAuth,renderDataset,wikimediaAPI,fail
+ pageLanguage,pageKey,hiddenSuggestedLink,validUsername,loadAuth,renderDataset,wikimediaAPI,fail
 });
 export const dashboardReady=(async()=>{
   await loadAuth();

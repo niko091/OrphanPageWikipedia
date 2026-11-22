@@ -64,7 +64,6 @@ const articleText="Testo integrale à ł. [[Voce sintetica 001]]\n== Relazioni =
 editorial.configureEditorial({data:dataset,datasetFile:entry.file,loadVersion:1,authEnabled:false,authUsername:null,
   llmProvider:'qwen',llmProviders:{qwen:{name:'Qwen',url:'https://chat.qwen.ai/'}},
   pageLanguage:()=>dataset.metadata.language,pageKey:page=>String(page.page_id),hiddenSuggestedLink:()=>false,
-  userPage:(name,language)=>`https://${language}.wikipedia.org/wiki/User:${encodeURIComponent(name)}`,
   validUsername:(value):value is string=>typeof value==='string'&&value.length>0,
   loadAuth:async()=>{},renderDataset:()=>{},fail:error=>{throw error;},
   wikimediaAPI:async(url,signal)=>{
@@ -308,7 +307,8 @@ await test('review buttons toggle either selection off and preserve shared versi
   const source=context.sources[0];let version=0;
   respond=async()=>new Response(JSON.stringify({format:'editorial_reviews_v1',reviews:[]}));
   await editorial.loadSharedReviews();editorial.showReview(context);
-  const buttons=()=>node('review-rows').children[0].children.at(-1)!.children;
+  const buttons=()=>node('review-rows').children[0].children.at(-1)!.children
+    .map(control=>control.className==='review-tooltip-anchor'?control.children[0]:control);
   assert.deepEqual(buttons().map(button=>button.textContent),['Fixato','Bad link']);
   const sequence=['fixed','fixed','bad_link','fixed','fixed','bad_link','bad_link'] as const;
   const expected=['fixed','not_fixed','bad_link','fixed','not_fixed','bad_link','not_fixed'];

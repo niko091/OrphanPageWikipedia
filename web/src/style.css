@@ -13,6 +13,10 @@
   --subtle: #eaecf0;
   --warning-surface: #fef6e7;
   --warning-text: #705000;
+  --success-surface: #dff2eb;
+  --success-text: #195d40;
+  --error-surface: #fee7e6;
+  --error-text: #9f262c;
   --shadow: #20212208;
   font: 16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Lato,Helvetica,Arial,sans-serif;
   color: var(--text);
@@ -442,8 +446,12 @@ dialog textarea {
 }
 
 .review-actions button[aria-pressed="true"] {
-  outline: 2px solid var(--teal);
-  outline-offset: 2px;
+  border-color: currentColor;
+}
+
+.review-tooltip-anchor {
+  display: inline-flex;
+  position: relative;
 }
 
 .proposal-preview {
@@ -503,10 +511,68 @@ dialog textarea {
 }
 
 .review-badge {
-  font-size: 0.85rem;
+  font-size: .85rem;
+  font-weight: 600;
+  line-height: 1.25;
+  border-radius: 2px;
+  padding-block: 3px 1px;
+  padding-inline: 6px;
+  cursor: help;
+  white-space: nowrap;
+}
+
+@supports (text-box: trim-both cap alphabetic) {
+  .review-badge {
+    text-box: trim-both cap alphabetic;
+    padding-block: 5px;
+  }
+}
+
+.review-badge[data-status="fixed"],.review-actions button[data-status="fixed"][aria-pressed="true"] {
+  background: var(--success-surface);
+  color: var(--success-text);
+}
+
+.review-badge[data-status="bad_link"],.review-actions button[data-status="bad_link"][aria-pressed="true"] {
+  background: var(--error-surface);
+  color: var(--error-text);
+}
+
+.review-tooltip {
+  position: absolute;
+  z-index: 1;
+  inset-block-start: 100%;
+  inset-inline-start: 0;
+  inline-size: max-content;
+  max-inline-size: min(14rem,65vw);
+  padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 2px;
-  padding: 4px 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: .85rem;
+  overflow-wrap: anywhere;
+  visibility: hidden;
+}
+
+.review-tooltip > span {
+  display: block;
+}
+
+.review-tooltip[data-above] {
+  inset-block-start: auto;
+  inset-block-end: 100%;
+}
+
+.review-tooltip-anchor:is(:hover,:focus-visible,:has(:focus-visible)) .review-tooltip {
+  visibility: visible;
+}
+
+.connection-card:has(.review-tooltip-anchor:hover .review-tooltip:not([hidden]),
+  .review-badge:focus-visible + .review-tooltip:not([hidden])) {
+  position: relative;
+  z-index: 1;
+  overflow: visible;
 }
 
 .prompt-actions button:last-child {
@@ -566,6 +632,33 @@ dialog textarea {
 
 .connection-card .candidate-title {
   font-size: 1.15rem;
+}
+
+.connection-card .candidate-header:has(.connection-reviewed-heading) {
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.connection-reviewed-heading {
+  display: flex;
+  flex: 0 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  min-inline-size: 0;
+  gap: 4px 12px;
+}
+
+.connection-reviewed-heading .candidate-title {
+  max-inline-size: 100%;
+}
+
+.connection-reviewed-heading .review-tooltip-anchor {
+  margin-inline-start: auto;
+}
+
+.connection-reviewed-heading .review-tooltip {
+  inset-inline-start: auto;
+  inset-inline-end: 0;
 }
 
 .connection-proposed,.connection-evidence {
@@ -804,6 +897,10 @@ body[data-page="connections"] #candidate-hidden-options { inset-inline-start: 0;
   --subtle: #27292d;
   --warning-surface: #3d3219;
   --warning-text: #f8d080;
+  --success-surface: #203d32;
+  --success-text: #94dfba;
+  --error-surface: #4b2327;
+  --error-text: #ffc1bd;
   --shadow: #00000033;
 }
 
@@ -811,7 +908,7 @@ input,select {
   color: var(--text);
 }
 
-a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible {
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,.review-badge:focus-visible,.review-tooltip-anchor:focus-visible {
   outline: 2px solid var(--teal);
   outline-offset: 3px;
 }
