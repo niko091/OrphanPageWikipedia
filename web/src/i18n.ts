@@ -58,7 +58,6 @@ const translations: Record<string, string> = {
   "Verifica il testo su Wikipedia prima di applicare le proposte.": "Check the text on Wikipedia before applying any suggestions.",
   "Coppie con fonti non verificabili: {n}.": "Pairs with unverifiable sources: {n}.",
   "Coppie oltre il limite di invio o di contesto: {n}.": "Pairs over the upload or context limit: {n}.",
-  "Motivi per coppia": "Reasons by pair",
   "Testo da collegare": "Text to link",
   "Una fonte richiesta non è stata verificata.": "A required source could not be verified.",
   "Il pacchetto supera il limite di invio del servizio.": "The package exceeds the service's upload limit.",

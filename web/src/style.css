@@ -426,6 +426,15 @@ dialog textarea {
   padding: 16px 0;
 }
 
+.review-row > p:has(+ .review-reason) {
+  margin-block-end: 4px;
+}
+
+.review-reason {
+  margin-block-start: 0;
+  color: var(--muted);
+}
+
 .review-actions {
   display: flex;
   flex-wrap: wrap;

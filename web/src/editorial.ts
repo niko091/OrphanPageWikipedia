@@ -81,7 +81,7 @@ const reviewKey=(language: string,source: number,target: number)=>`${language}:$
 export let editorialReviews=new Map<string,EditorialReview>(),reviewsAvailable=false;
 export let reviewContext: ReviewContext | null=null,activePromptReview: ReviewContext | null=null;
 let reviewVersion=0,reviewReadVersion=0,reviewSaving=false;
-let reviewSurface: {rows: HTMLElement; status: HTMLElement} | null=null;
+let reviewSurface: {rows: HTMLElement; status: HTMLElement; proposal?: {sources: ReviewContext['sources']; reasons: ReadonlyMap<number,string>}} | null=null;
 let reviewSaveController: AbortController | null=null;
 const reviewLabels: Record<ReviewStatus,string>={fixed:'Fixato',not_fixed:'Non fixato',bad_link:'Bad link'};
 export function reviewedEdge(page: PageObservation,sourceID: number): EditorialReview | undefined {
@@ -150,15 +150,21 @@ export function closeReview() {
 function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'bad_link'}) {
   if(!reviewContext||!reviewSurface)return;
   const context=reviewContext;
-  const box=reviewSurface.rows;box.replaceChildren();
+  const {rows:box,proposal}=reviewSurface;box.replaceChildren();
+  const reviewable=new Set(context.sources.map(source=>source.page_id));
+  reviewSurface.status.hidden=reviewable.size===0;
   reviewSurface.status.textContent=message||t(editorialContext.authEnabled!==false&&!editorialContext.authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
     'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; riclicca la valutazione selezionata per annullarla.':
     'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.');
   let focusButton: HTMLButtonElement | undefined;
-  for(const source of reviewContext.sources) {
+  for(const source of proposal?.sources??context.sources) {
     const row=element('article',null,'review-row');
-    const identity=element('p');identity.append(wikiLink(source.title,reviewContext.language),element('span',' → '),wikiLink(reviewContext.target_title,reviewContext.language));row.append(identity);
-    const review=editorialReviews.get(reviewKey(reviewContext.language,source.page_id,reviewContext.target_id));
+    const identity=element('p');identity.append(wikiLink(source.title,context.language),element('span',' → '),wikiLink(context.target_title,context.language));row.append(identity);
+    const reason=proposal?.reasons.get(source.page_id);
+    if(reason)row.append(element('p',t(reason),'review-reason'));
+    box.append(row);
+    if(!reviewable.has(source.page_id))continue;
+    const review=editorialReviews.get(reviewKey(context.language,source.page_id,context.target_id));
     row.append(review?reviewBadge(review):element('p',t('Non ancora valutata')));
     const actions=element('div',null,'review-actions');
     for(const status of ['fixed','bad_link'] as const) {
@@ -167,7 +173,7 @@ function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'b
       button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
       if(focus?.source===source.page_id&&focus.status===status&&!button.disabled)focusButton=button;
     }
-    row.append(actions);box.append(row);
+    row.append(actions);
   }
   focusButton?.focus();
 }
@@ -352,8 +358,6 @@ function closeProposalDialog() {
   proposalSession=null;
   $('proposal-dialog')!.close();
   $('proposal-rows')!.replaceChildren();
-  $('proposal-outcome-rows')!.replaceChildren();
-  $('proposal-target')!.replaceChildren();
   $('proposal-status')!.textContent='';
   if(session.opener.isConnected)session.opener.focus();
   else $('candidate-search')?.focus();
@@ -362,7 +366,6 @@ function closeProposalDialog() {
 function showProposals(review: ReviewContext,mode: ProposalMode,opener: HTMLButtonElement) {
   closePrompt();
   proposalSession={review,mode,opener};
-  $('proposal-target')!.replaceChildren(wikiLink(review.target_title,review.language));
   $('proposal-preview')!.hidden=mode!=='preview';
   $('proposal-dialog')!.showModal();
   void submitProposals();
@@ -426,8 +429,6 @@ function renderProposals(value: unknown,session: ProposalSession) {
     tr.append(identity,reference,anchor,edit);
     return tr;
   });
-  const details=$('proposal-outcomes')!;
-  const outcomeRows: HTMLElement[]=[];
   const outcomes=new Map<number,string>();
   if(value.outcomes!==undefined) {
     if(!Array.isArray(value.outcomes))throw invalid();
@@ -436,17 +437,7 @@ function renderProposals(value: unknown,session: ProposalSession) {
         outcomes.has(row.source_id)||typeof row.reason!=='string'||!Object.hasOwn(outcomeLabels,row.reason))throw invalid();
       outcomes.set(row.source_id,outcomeLabels[row.reason]);
     }
-    for(const source of sources.values()) {
-      const reason=outcomes.get(source.page_id);
-      if(reason) {
-        const item=element('li');item.append(wikiLink(source.title,review.language),element('span',' — '+t(reason)));
-        outcomeRows.push(item);
-      }
-    }
   }
-  $('proposal-outcome-rows')!.replaceChildren(...outcomeRows);
-  details.hidden=!outcomeRows.length;
-  details.open=!rows.length;
   $('proposal-rows')!.replaceChildren(...rows);
   $('proposal-table')!.hidden=!rows.length;
   const notes=[sent.size===0?t('Nessuna coppia inviata a Lift Wing.'):rows.length===0?
@@ -456,10 +447,10 @@ function renderProposals(value: unknown,session: ProposalSession) {
   if(value.oversized)notes.push(t('Coppie oltre il limite di invio o di contesto: {n}.',{n:value.oversized}));
   if(value.discarded&&rows.length)notes.push(t('Proposte scartate dai controlli: {n}.',{n:value.discarded}));
   $('proposal-status')!.textContent=notes.join(' ');
-  if(sent.size) {
+  if(sent.size||outcomes.size) {
     reviewContext={...review,sources:review.sources.filter(source=>sent.has(source.page_id))};
-    reviewSurface={rows:$('proposal-review-rows')!,status:$('proposal-review-status')!};
-    $('proposal-reviews')!.hidden=false;
+    reviewSurface={rows:$('proposal-review-rows')!,status:$('proposal-review-status')!,
+      proposal:{sources:review.sources.filter(source=>sent.has(source.page_id)||outcomes.has(source.page_id)),reasons:outcomes}};
     renderReviews();
   }
 }
@@ -472,7 +463,7 @@ export async function submitProposals() {
   const timer=setTimeout(()=>controller.abort(),60_000);
   const status=$('proposal-status')!,retry=$('proposal-retry')!;
   status.textContent=t(mode==='preview'?'Preparazione dell’anteprima…':'Lettura delle revisioni e generazione con Lift Wing…');
-  $('proposal-table')!.hidden=true;$('proposal-reviews')!.hidden=true;$('proposal-outcomes')!.hidden=true;retry.hidden=true;
+  $('proposal-table')!.hidden=true;$('proposal-review-status')!.hidden=true;retry.hidden=true;
   try {
     const response=await fetch('api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:review.dataset,language:review.language,

@@ -241,7 +241,6 @@ export interface UIElements {
   'llm-provider': HTMLSelectElement;
   'proposal-dialog': HTMLDialogElement;
   'proposal-close': HTMLButtonElement;
-  'proposal-outcomes': HTMLDetailsElement;
   'proposal-retry': HTMLButtonElement;
   'metrics': HTMLElement;
   'origin-section': HTMLElement;

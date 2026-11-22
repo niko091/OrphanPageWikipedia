@@ -390,6 +390,9 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await expect(page.locator('#proposal-rows')).toContainText(`[[${title(1)}]]`);
     const pairs=page.locator('#proposal-review-rows .review-row');
     await expect(pairs).toHaveCount(2);
+    const skipped=pairs.filter({has:page.getByRole('link',{name:title(34),exact:true})});
+    await expect(skipped.locator('p').nth(1)).toHaveText('Il modello non ha individuato un punto d’inserimento adatto.');
+    await expect(pairs.first().locator('.review-reason')).toHaveCount(0);
     expect(submissions).toEqual([{dataset:'fixture.json',language:'vec',target_id:1,source_ids:[33,34],ui_language:'it'}]);
     expect(traffic.editorial).toEqual([]);
     for(const width of [1280,390])for(const theme of ['light','dark']) {
@@ -404,10 +407,11 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await expect(trigger).toBeFocused();
     await expect(page.locator('#proposal-rows tr')).toHaveCount(0);
     await trigger.click();
-    const badLink=pairs.filter({hasText:title(34)}).getByRole('button',{name:'Bad link'});
+    const badLink=skipped.getByRole('button',{name:'Bad link'});
     await badLink.click();
     await expect(badLink).toHaveAttribute('aria-pressed','true');
     await expect(badLink).toBeFocused();
+    await expect(skipped.locator('.review-reason')).toBeVisible();
     await page.locator('#proposal-close').click();
     await open(page,site,'deorphanize.html');
     await trigger.click();
@@ -415,24 +419,41 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     expect(submissions.at(-1)).toMatchObject({source_ids:[33]});
   });
 
-  previewTest('distinguishes retry and a valid result with zero suggestions', async ({page,site}) => {
+  previewTest('shows zero-suggestion reasons under each pair after retry', async ({page,site},testInfo) => {
     let attempted=0;
     await page.route('**/api/editorial/proposals',async route=>{
       const response=await route.fetch();
       const body: unknown=await response.json();
       assert(record(body));
-      assert(Array.isArray(body.sent_source_ids));
-      const outcomes=body.sent_source_ids.map((source_id: unknown)=>({source_id,reason:'insufficient_evidence'}));
-      await route.fulfill({response,json:++attempted===1?{}:{...body,proposals:[],outcomes}});
+      assert.deepEqual(body.sent_source_ids,[34,35]);
+      const outcomes=[{source_id:34,reason:'insufficient_evidence'},{source_id:35,reason:'unavailable'}];
+      await route.fulfill({response,json:++attempted===1?{}:{...body,sent_source_ids:[34],unavailable:1,proposals:[],outcomes}});
     });
     await open(page,site,'deorphanize.html');
-    await page.getByRole('button',{name:'Fix this',exact:true}).first().click();
-    await expect(page.locator('#proposal-status')).toContainText('Proposte non disponibili');
+    await page.locator('#ui-language-toggle').click();
+    const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(2),exact:true})});
+    await card.getByRole('button',{name:'Fix this',exact:true}).click();
+    await expect(page.locator('#proposal-status')).toContainText('Suggestions are temporarily unavailable');
     await page.locator('#proposal-retry').click();
-    await expect(page.locator('#proposal-status')).toContainText('Nessuna proposta per le coppie analizzate');
+    await expect(page.locator('#proposal-status')).toContainText('No suggestions for the pairs analyzed');
     await expect(page.locator('#proposal-table')).not.toBeVisible();
-    await expect(page.locator('#proposal-outcomes li').first()).toContainText('Il modello non ha individuato prove sufficienti.');
-    await expect(page.locator('#proposal-review-rows .review-row')).not.toHaveCount(0);
+    const dialog=page.getByRole('dialog',{name:'Link suggestions'});
+    const reviews=dialog.getByRole('region',{name:'Review candidate page pairs'});
+    await expect(dialog.locator('#proposal-title:first-child + #proposal-reviews')).toBeVisible();
+    const pairs=reviews.locator('.review-row');
+    await expect(pairs).toHaveCount(2);
+    const sent=pairs.filter({has:page.getByRole('link',{name:title(34),exact:true})});
+    const unavailable=pairs.filter({has:page.getByRole('link',{name:title(35),exact:true})});
+    await expect(sent.locator('p').nth(1)).toHaveText('The model did not find enough evidence.');
+    await expect(sent.getByRole('button',{name:'Bad link'})).toBeEnabled();
+    await expect(unavailable.locator('p').nth(1)).toHaveText('A required source could not be verified.');
+    await expect(unavailable.getByRole('button')).toHaveCount(0);
+    await page.locator('html').evaluate(node=>{node.dataset.theme='dark';});
+    for(const width of [1280,390]) {
+      await page.setViewportSize({width,height:844});
+      await expect(page.locator('#proposal-close')).toBeInViewport();
+      await dialog.screenshot({path:testInfo.outputPath(`proposal-reasons-${width}.png`)});
+    }
   });
 });
 
