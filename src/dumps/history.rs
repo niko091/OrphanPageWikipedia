@@ -258,10 +258,10 @@ impl HistoryBuffer {
     }
     fn progress(&self, database: &str, name: &str, phase: &str, elapsed: f64, done: bool) {
         crate::runtime::phase_counts(Some(self.scanned as u64), None);
-        eprintln!("MediaWiki History {database}: {name} {phase}, {} righe lette; {} righe utili; {} creazioni duplicate in cache; {} commit; {elapsed:.1}s, SQLite {:.1}s; {:.0} righe/s; {} creazioni finali; {} append scratch; {} byte scratch SQLite; buffer massimo {}{}",
+        eprintln!("MediaWiki History {database}: {name} {phase}, {} rows scanned; {} retained; {} duplicate creation cache hits; {} commits; {elapsed:.1}s, SQLite {:.1}s; {:.0} rows/s; {} final creations; {} scratch appends; {} SQLite scratch bytes; peak buffer {}{}",
             self.scanned, self.retained + self.rows.len(), self.cache_hits, self.commits,
             self.sqlite_seconds, self.scanned as f64 / elapsed.max(0.001), self.creation_rows, self.scratch_rows, self.scratch_bytes, self.max_buffer,
-            if done { "; COMPLETATO" } else { "" });
+            if done { "; DONE" } else { "" });
     }
 }
 
@@ -341,7 +341,7 @@ pub(super) fn scan_history(
             .optional()?;
         if previous.as_deref() == Some(&identity) {
             eprintln!(
-                "MediaWiki History {}: {name} {phase}, SALTA checkpoint completo",
+                "REUSE MediaWiki History {}: {name} {phase}, complete checkpoint",
                 scan.database
             );
             return Ok(());
@@ -1056,7 +1056,10 @@ pub fn import_history(
         if pages.is_empty() {
             return Err("Staging SQL incompleto".into());
         }
-        eprintln!("MediaWiki History {database}: cache SQLite {} MiB; commit ogni circa {} record; batch Rust fino a 5000 per tipo",options.cache_mib,options.commit_rows);
+        eprintln!(
+            "MediaWiki History {database}: SQLite cache {} MiB; commit about every {} records; Rust batches up to 5000 per type",
+            options.cache_mib, options.commit_rows
+        );
         for (name, data) in &files {
             let path =
                 std::path::Path::new(data["path"].as_str().ok_or("Percorso History mancante")?);
@@ -1094,7 +1097,7 @@ pub fn import_history(
                 },
             )?;
         }
-        eprintln!("MediaWiki History {database}: ricostruzione delle creazioni e attribuzioni");
+        eprintln!("MediaWiki History {database}: reconstructing creation and attribution");
         let (users, users_digest) = prepare_history_targets(&connection, &pages, &database)?;
 
         let snapshot =
@@ -1151,7 +1154,7 @@ pub fn import_history(
                 super::remove_consumed_download(root, data)?;
             }
         }
-        eprintln!("MediaWiki History {database}: conteggio attività precedente alla creazione");
+        eprintln!("MediaWiki History {database}: counting pre-creation activity");
         history_creator_metrics(&connection, &users)?;
         drop(users);
         let history_files = files
@@ -1165,7 +1168,7 @@ pub fn import_history(
         "experience_scope":"public surviving revisions strictly before reconstructed page creation; prior articles restricted to the census",
         "continuity_rule":"consecutive completed precreation calendar months with at least five edits; Vital Signs stability adaptation",
         "group_scope":"nonempty reconstructed historical group list at first revision; blank means unknown","history_files":history_files});
-        eprintln!("MediaWiki History {database}: scrittura del supplemento");
+        eprintln!("MediaWiki History {database}: writing supplement");
         write_atomic(output, |file| {
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
             writer.write_all(b"{\"metadata\":")?;
@@ -1264,10 +1267,12 @@ pub fn import_history(
                 DROP TABLE history_edit; DROP TABLE history_creation;
                 COMMIT; PRAGMA incremental_vacuum;",
             )?;
-            eprintln!("PULIZIA History {database}: tabelle di lavoro eliminate dopo il supplemento completo");
+            eprintln!(
+                "CLEANUP History {database}: staging tables removed after supplement completion"
+            );
         }
         eprintln!(
-            "Cronologia da dump: {} voci; {}",
+            "History supplement: {} pages; {}",
             pages.len(),
             output.display()
         );

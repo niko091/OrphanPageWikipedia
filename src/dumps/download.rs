@@ -609,7 +609,7 @@ impl<T: DumpHttp> DumpClient<T> {
                 histories.push((name, url, size));
             }
             println!(
-                "{language}: {} SQL, {} partizioni History, {:.2} GiB compressi",
+                "{language}: {} SQL dumps, {} History partitions, {:.2} GiB compressed",
                 selected.len(),
                 history_names.len(),
                 total as f64 / 1024f64.powi(3)
@@ -627,7 +627,7 @@ impl<T: DumpHttp> DumpClient<T> {
                     record["mirror"] = json!(true);
                 }
                 records.insert(table.into(), record);
-                println!("Dump {database}: {name} verificato");
+                println!("VERIFIED {database} dump: {name}");
             }
             for (name, url, size) in histories {
                 let path = root.join(database).join(history_release).join(name);
@@ -648,14 +648,14 @@ impl<T: DumpHttp> DumpClient<T> {
                     record["mirror"] = json!(true);
                 }
                 records.insert(name.clone(), record);
-                println!("Dump {database}: {name} verificato");
+                println!("VERIFIED {database} dump: {name}");
             }
             let manifest = json!({"language":language,"database":database,"sql_release":sql_release,"history_release":history_release,"sql_status_url":status_url,"history_index_url":history_url,"files":records});
             let destination = root
                 .join(database)
                 .join(format!("manifest-{sql_release}-{history_release}.json"));
             Self::write_json(&destination, &manifest)?;
-            println!("Manifest verificato: {}", destination.display());
+            println!("VERIFIED manifest: {}", destination.display());
             results.push(manifest);
         }
         Ok(results)
@@ -726,7 +726,7 @@ impl<T: DumpHttp> DumpClient<T> {
                 return Err("Nessun file di contenuto nel manifest ufficiale".into());
             }
             println!(
-                "Contenuto {language}: {} partizioni, {total} byte",
+                "{language} XML content: {} partitions, {total} bytes",
                 selected.len()
             );
             if !plan {

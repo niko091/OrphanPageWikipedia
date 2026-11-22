@@ -592,7 +592,7 @@ pub fn predict_imported_topics(
             }
             predicted += count;
             if processed % 100000 < results.len() {
-                println!("Temi SQL {language}: {processed}/{expected} voci");
+                println!("SQL topics {language}: {processed}/{expected} pages");
             }
         }
         if link.is_some() || cat.is_some() {
@@ -871,7 +871,7 @@ pub fn run_topics(
             wikis.push(json!({"language":languages[position],"seconds":elapsed,
             "census_pages":metadata["predicted_pages"].as_u64().ok_or("Conteggio predetto mancante")?+metadata["missing_pages"].as_u64().ok_or("Conteggio mancante")?,
             "predicted_pages":metadata["predicted_pages"],"timing":metadata["timing"]}));
-            println!("Temi salvati: {}; {elapsed:.1}s", output.display());
+            println!("Topics saved: {}; {elapsed:.1}s", output.display());
         }
         report["completed_languages"] = json!(completed);
         report["deferred_languages"] = json!(deferred);
@@ -882,7 +882,7 @@ pub fn run_topics(
             &report,
         )?;
         if !deferred.is_empty() {
-            println!("Rinviate senza campionamento: {}", deferred.join(" "));
+            println!("Deferred without sampling: {}", deferred.join(" "));
         }
         Ok(report)
     })

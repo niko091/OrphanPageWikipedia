@@ -389,7 +389,10 @@ fn standalone_combined_import_and_selected_history_reuse_existing_sql_stage() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("SALTA checkpoint completo"));
+    assert!(String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+        line.starts_with("REUSE MediaWiki History vecwiki: ")
+            && line.ends_with(", complete checkpoint")
+    }));
     assert_eq!(fs::read(&raw).unwrap(), before_raw);
     assert_eq!(
         fs::read(workspace.0.join("refreshed/vec-history.json")).unwrap(),

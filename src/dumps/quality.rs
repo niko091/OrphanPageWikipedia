@@ -679,7 +679,7 @@ pub fn infer_quality(
                     hash == digest && Some(*size) == record["bytes"].as_u64()
                 })
             {
-                eprintln!("CHECKPOINT XML {name}: verified_reuse (archivio già consumato)");
+                eprintln!("REUSE XML {name}: verified checkpoint, archive consumed");
                 continue;
             }
             let signature = file_signature(path)?;
@@ -687,7 +687,7 @@ pub fn infer_quality(
                 return Err("Checksum contenuto XML errato".into());
             }
             if previous == Some((digest.to_owned(), signature.0, signature.1)) {
-                eprintln!("CHECKPOINT XML {name}: verified_reuse");
+                eprintln!("REUSE XML {name}: verified checkpoint");
                 if let Some(root) = &downloads {
                     super::remove_consumed_download(root, record)?;
                 }

@@ -65,11 +65,7 @@ pub(crate) fn remove_owned_file(root: &std::path::Path, path: &std::path::Path) 
         return Err("Il file da eliminare non appartiene all'area di lavoro".into());
     }
     std::fs::remove_file(path)?;
-    eprintln!(
-        "PULIZIA {}: {} byte liberati",
-        path.display(),
-        metadata.len()
-    );
+    eprintln!("CLEANUP {}: {} bytes freed", path.display(), metadata.len());
     Ok(())
 }
 

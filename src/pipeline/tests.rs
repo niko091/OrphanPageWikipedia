@@ -726,10 +726,20 @@ fn complete_sequence_and_verified_resume_use_native_commands_only() {
             "analyze"
         ]
     );
+    assert!(f
+        .steps
+        .logs
+        .iter()
+        .any(|line| line == "CHECKPOINT vec quality: no saved checkpoint"));
     let raw = signature(&f.options.import_dir.join("vec-raw.json"));
     f.reset();
     f.run().unwrap();
     assert!(f.steps.calls.is_empty(), "{:?}", f.steps.calls);
+    assert!(f
+        .steps
+        .logs
+        .iter()
+        .any(|line| line == "REUSE vec topics: complete model checkpoint, unchanged graph"));
     assert_eq!(signature(&f.options.import_dir.join("vec-raw.json")), raw);
 }
 
@@ -958,6 +968,7 @@ fn runner_streams_logs_samples_resources_and_reconciles_failed_worker_groups() {
     let script = r#"#!/bin/sh
 shift
 shift
+if [ "$1" = "ok" ]; then exit 0; fi
 sleep 30 &
 printf '%s' "$!" > worker.pid
 printf 'child stdout\n'
@@ -973,6 +984,7 @@ exit 7
     let settings = runner.trace.clone();
     let result = runtime::with_tracing(settings, || {
         runtime::phase("pipeline", || {
+            runner.run("vec quality", &["ok".into()])?;
             runner.run("synthetic failure", &["mock".into()])
         })
     });
@@ -980,14 +992,12 @@ exit 7
     runner.finish(&result).unwrap();
     let report = read_json(runner.report_path.as_ref().unwrap()).unwrap();
     assert_eq!(report["status"], "failed");
-    assert_eq!(report["steps"][0]["returncode"], 7);
-    assert!(
-        report["steps"][0]["sampled_peak_tree_rss_bytes"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-    assert!(report["steps"][0]["user_cpu_seconds"].as_f64().unwrap() >= 0.0);
+    let success = &report["steps"][0];
+    let failure = &report["steps"][1];
+    assert_eq!(success["returncode"], 0);
+    assert_eq!(failure["returncode"], 7);
+    assert!(failure["sampled_peak_tree_rss_bytes"].as_u64().unwrap() > 0);
+    assert!(failure["user_cpu_seconds"].as_f64().unwrap() >= 0.0);
     assert!(report["monitor_error"].is_null());
     let files = std::fs::read_dir(&f.options.log_dir)
         .unwrap()
@@ -1002,6 +1012,23 @@ exit 7
     .unwrap();
     assert!(log.contains("child stdout\n"));
     assert!(log.contains("child stderr\n"));
+    let messages = log
+        .lines()
+        .filter_map(|line| line.strip_prefix('[')?.split_once("] "))
+        .map(|(at, message)| {
+            let date = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S").unwrap();
+            assert_eq!(at, date.format("%Y-%m-%d %H:%M:%S").to_string());
+            message
+        })
+        .collect::<Vec<_>>();
+    let wall = success["wall_seconds"].as_f64().unwrap();
+    assert!(messages.contains(&r#"START vec quality: ["ok"]"#));
+    assert!(messages.contains(&format!("DONE vec quality {wall:.1}s").as_str()));
+    assert!(messages.contains(&"FAILED synthetic failure: exit code 7"));
+    assert!(messages.iter().any(|message| {
+        message.starts_with("RESOURCES synthetic failure: tree RSS ")
+            && message.ends_with(" (100%=1 core)")
+    }));
     let metrics = std::fs::read_to_string(
         files
             .iter()
@@ -1013,6 +1040,12 @@ exit 7
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
+    for event in &events {
+        let at = event["at"].as_str().unwrap();
+        assert_eq!(at.len(), 32);
+        assert!(at.ends_with("+00:00"));
+        assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok());
+    }
     assert!(events.iter().filter(|e| e["event"] == "sample").count() >= 3);
     assert!(events.iter().any(|e| e["event"] == "step_start"));
     assert!(events.iter().any(|e| e["event"] == "step_end"));
@@ -1228,7 +1261,7 @@ fn benchmark_runs_fresh_copies_and_rejects_mismatch_mutation_and_failure() {
             "sed 's/null/0/' \"$1/seed.json\" > \"$1/result.json\"",
             "Output differenti",
         ),
-        ("failed", "exit 7", "codice di uscita 7"),
+        ("failed", "exit 7", "exit code 7"),
         (
             "mutated",
             "printf changed > \"$2\"",

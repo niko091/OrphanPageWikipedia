@@ -81,7 +81,7 @@ impl Invocation {
         let index = orphanwiki::dumps::publish_comparison(&connection, &output)
             .map_err(|e| e.to_string())?;
         println!(
-            "Confronto pubblicato: {} edizioni; {}",
+            "Comparison published: {} editions; {}",
             index["members"].as_array().map_or(0, Vec::len),
             output.display()
         );

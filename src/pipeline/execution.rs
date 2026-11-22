@@ -68,14 +68,15 @@ pub(super) struct Reporter {
 
 impl Reporter {
     pub(super) fn bytes(&self, bytes: &[u8]) -> PipelineResult<()> {
-        let mut state = self.shared.lock().map_err(|_| "Logger non disponibile")?;
+        let mut state = self.shared.lock().map_err(|_| "Logger unavailable")?;
         state.log.write_all(bytes)?;
         std::io::stdout().lock().write_all(bytes)?;
         Ok(())
     }
 
     pub(super) fn log(&self, text: &str) -> PipelineResult<()> {
-        self.bytes(format!("{} {text}\n", timestamp()).as_bytes())
+        let now: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
+        self.bytes(format!("[{}] {text}\n", now.format("%Y-%m-%d %H:%M:%S")).as_bytes())
     }
 
     pub(super) fn event(&self, event: &str, fields: Value) -> PipelineResult<()> {
@@ -89,7 +90,7 @@ impl Reporter {
                 json!(self.started.elapsed().as_secs_f64()),
             ),
         ]);
-        let mut state = self.shared.lock().map_err(|_| "Metriche non disponibili")?;
+        let mut state = self.shared.lock().map_err(|_| "Metrics unavailable")?;
         serde_json::to_writer(&mut state.events, &value)?;
         state.events.write_all(b"\n")?;
         Ok(())
@@ -99,14 +100,14 @@ impl Reporter {
         let active = self
             .shared
             .lock()
-            .map_err(|_| "Metriche non disponibili")?
+            .map_err(|_| "Metrics unavailable")?
             .active
             .clone();
         let mut resources = runtime::resources(std::process::id(), self.include_controller_memory);
         resources["memory_cgroup"] = memory_group_usage();
         let now = Instant::now();
         let step = {
-            let mut state = self.shared.lock().map_err(|_| "Metriche non disponibili")?;
+            let mut state = self.shared.lock().map_err(|_| "Metrics unavailable")?;
             let percent = state
                 .last_cpu
                 .zip(resources["tree_cpu_seconds"].as_f64())
@@ -137,14 +138,14 @@ impl Reporter {
         let rss = resources["tree_rss_bytes"]
             .as_u64()
             .map(|n| format!("{:.1} MiB", n as f64 / 1048576.0))
-            .unwrap_or_else(|| "non disponibile".into());
+            .unwrap_or_else(|| "n/a".into());
         let cpu = resources["sampled_cpu_percent_one_core"]
             .as_f64()
             .map(|n| format!("{n:.1}%"))
-            .unwrap_or_else(|| "non disponibile".into());
+            .unwrap_or_else(|| "n/a".into());
         self.log(&format!(
-            "RISORSE {}: RSS albero {rss}; CPU {cpu} (100%=1 core)",
-            step.as_deref().unwrap_or("orchestrazione")
+            "RESOURCES {}: tree RSS {rss}; CPU {cpu} (100%=1 core)",
+            step.as_deref().unwrap_or("pipeline")
         ))
     }
 }
@@ -430,7 +431,7 @@ impl Runner {
         let peak = reporter
             .shared
             .lock()
-            .map_err(|_| "Metriche non disponibili")?
+            .map_err(|_| "Metrics unavailable")?
             .peak_rss;
         let mut report = self.metadata.clone();
         for (key, value) in [
@@ -448,10 +449,7 @@ impl Runner {
             report[key] = value;
         }
         reporter.event("run_end", report.clone())?;
-        let path = self
-            .report_path
-            .as_ref()
-            .ok_or("Percorso del report mancante")?;
+        let path = self.report_path.as_ref().ok_or("Missing report path")?;
         write_operational_report(path, &report)
     }
 }
@@ -519,14 +517,11 @@ impl Runner {
         runtime::phase("pipeline.step", || {
             runtime::phase_tag("step", json!(name));
             self.log(&format!(
-                "INIZIO {name}: {}",
+                "START {name}: {}",
                 serde_json::to_string(arguments)?
             ))?;
             if let Some(reporter) = &self.reporter {
-                let mut shared = reporter
-                    .shared
-                    .lock()
-                    .map_err(|_| "Metriche non disponibili")?;
+                let mut shared = reporter.shared.lock().map_err(|_| "Metrics unavailable")?;
                 shared.active = Some(name.into());
                 shared.step_peak_rss = None;
             }
@@ -558,7 +553,7 @@ impl Runner {
                     let output = child
                         .output
                         .as_ref()
-                        .ok_or("Pipe del processo mancante")?
+                        .ok_or("Missing process output pipe")?
                         .recv_timeout(Duration::from_millis(50));
                     match output {
                         Ok(Ok(bytes)) => {
@@ -584,7 +579,7 @@ impl Runner {
                         }
                     }
                 }
-                let status = exited.ok_or("Esito del processo mancante")?;
+                let status = exited.ok_or("Missing process exit status")?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt;
@@ -603,13 +598,10 @@ impl Runner {
             }
             let after = runtime::resources(std::process::id(), true);
             let usage_after = runtime::child_usage();
-            if let Some(reporter) = &self.reporter {
+            let wall = if let Some(reporter) = &self.reporter {
                 reporter.sample()?;
                 let peak = {
-                    let mut shared = reporter
-                        .shared
-                        .lock()
-                        .map_err(|_| "Metriche non disponibili")?;
+                    let mut shared = reporter.shared.lock().map_err(|_| "Metrics unavailable")?;
                     shared.active = None;
                     shared.step_peak_rss.take()
                 };
@@ -630,14 +622,17 @@ impl Runner {
                     "read_bytes":numeric_difference(&after,&before,"controller_reaped_read_bytes"),"write_bytes":numeric_difference(&after,&before,"controller_reaped_write_bytes")});
                 reporter.event("step_end", step.clone())?;
                 self.steps.push(step);
-            }
+                wall
+            } else {
+                started.elapsed().as_secs_f64()
+            };
             let returncode = result?;
             runtime::check_cancelled()?;
             if returncode != 0 {
-                self.log(&format!("ERRORE {name}: codice di uscita {returncode}"))?;
-                return Err(format!("{name}: codice di uscita {returncode}").into());
+                self.log(&format!("FAILED {name}: exit code {returncode}"))?;
+                return Err(format!("{name}: exit code {returncode}").into());
             }
-            self.log(&format!("COMPLETATO {name}"))?;
+            self.log(&format!("DONE {name} {wall:.1}s"))?;
             Ok(())
         })
     }

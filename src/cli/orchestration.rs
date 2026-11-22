@@ -14,7 +14,7 @@ impl Invocation {
         let (group, current) = orphanwiki::runtime::memory_ceiling()?;
         if current.is_some_and(|value| value <= maximum) {
             eprintln!(
-                "Limite RAM complessivo verificato: {} byte; cgroup {}",
+                "Verified total RAM limit: {} bytes; cgroup {}",
                 current.unwrap_or(maximum),
                 group.display()
             );
@@ -48,7 +48,9 @@ impl Invocation {
                 .args(std::env::args_os().skip(1))
                 .env("ORPHANWIKI_MEMORY_SCOPE", "1")
                 .current_dir(original_directory);
-            eprintln!("Avvio pipeline in un gruppo con RAM massima {maximum} byte, inclusi tutti i worker; swap disabilitata");
+            eprintln!(
+                "Starting pipeline with a {maximum}-byte RAM limit for all workers; swap disabled"
+            );
             Err(format!("Impossibile applicare il limite RAM tramite systemd-run: {}. Avviare in un servizio/cgroup con MemoryMax={maximum}; nessuna raccolta avviata", command.exec()))
         }
         #[cfg(not(target_os = "linux"))]

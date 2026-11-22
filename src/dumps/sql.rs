@@ -224,7 +224,7 @@ pub(super) fn load_sql_table(
             )
             .optional()?;
         if old.as_deref() == Some(digest) {
-            println!("CHECKPOINT SQL {table}: verified_reuse");
+            println!("REUSE SQL {table}: verified checkpoint");
             return Ok(());
         }
         {
@@ -369,7 +369,7 @@ pub(super) fn load_sql_table(
                     .ok_or("Transazione SQL non disponibile")?
                     .commit()?;
                 transaction = Some(connection.unchecked_transaction()?);
-                println!("Dump {table}: {count} righe");
+                println!("SQL {table}: {count} rows");
             }
             Ok(())
         })?;
@@ -380,7 +380,7 @@ pub(super) fn load_sql_table(
         let checkpoint = connection.unchecked_transaction()?;
         checkpoint.execute("INSERT INTO imported VALUES(?,?)", params![table, digest])?;
         checkpoint.commit()?;
-        println!("Dump {table}: {count} righe acquisite");
+        println!("SQL {table}: {count} rows imported");
         Ok(())
     })
 }
@@ -779,7 +779,7 @@ pub fn import_graph(
             writer.flush()?;
             Ok(())
         })?;
-        println!("Grafo da dump: {expected} voci; {}", output.display());
+        println!("SQL graph: {expected} pages; {}", output.display());
         Ok(expected)
     })
 }

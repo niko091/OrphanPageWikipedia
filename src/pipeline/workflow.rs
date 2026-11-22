@@ -23,6 +23,20 @@ pub(super) fn with_languages(mut arguments: Vec<String>, languages: &[String]) -
     arguments
 }
 
+fn checkpoint_message(reason: &str) -> &str {
+    match reason {
+        "forced" => "forced rerun",
+        "missing_checkpoint" => "no saved checkpoint",
+        "source_mismatch" => "sources changed",
+        "missing_output" => "output missing",
+        "output_mismatch" => "output changed",
+        "stage_table_mismatch" => "staging tables failed verification",
+        "definition_mismatch" => "History definition mismatch",
+        "verified_reuse" => "verified for reuse",
+        other => other,
+    }
+}
+
 /// Delete only verified downloads inside the pipeline's owned work area. Check
 /// every path before removing any; never accept a manifest pointing elsewhere.
 pub(super) fn remove_downloads(
@@ -159,7 +173,10 @@ pub(super) fn collection_workflow(
         return workflow(options, steps);
     };
     if options.plan {
-        steps.log(&format!("PUBBLICAZIONE database {}; dump SQL e History consumati dopo l'importazione, XML multilingue conservati fino alla verifica delle menzioni locali",destination.display()))?;
+        steps.log(&format!(
+            "PLAN database {}: remove SQL and History dumps after import, keep multi-edition XML through mention checks",
+            destination.display()
+        ))?;
         return workflow(options, steps);
     }
     let identity = json!({"rule":crate::store::RULE,"editorial_ranking":crate::store::EDITORIAL_RANKING,"languages":options.selected,"sql_release":options.sql_release,
@@ -222,9 +239,7 @@ pub(super) fn collection_workflow(
             .as_ref()
             == Some(&identity)
     {
-        steps.log(
-            "SALTA raccolta: database completo già pubblicato per queste release e configurazioni",
-        )?;
+        steps.log("REUSE collection: published database matches releases and configuration")?;
         cleanup()?;
         return Ok(());
     }
@@ -269,14 +284,14 @@ pub(super) fn collection_workflow(
                 .join(format!("content-{}.json", private.content_release));
             if !content_checkpoint(&private, &state, language, database, &manifest) {
                 steps.run(
-                    &format!("ripristino XML per le menzioni {language}"),
+                    &format!("{language} XML recovery for mention checks"),
                     &with_languages(content_command(&private), std::slice::from_ref(language)),
                 )?;
             }
         }
     }
     if ready {
-        steps.log("SALTA elaborazione: pubblicazione pronta con file e manifest verificati")?;
+        steps.log("REUSE prepared exports: files and manifest verified")?;
     } else {
         workflow(&private, steps)?;
         dumps::DumpClient::<dumps::WikimediaHttp>::write_json(
@@ -286,13 +301,11 @@ pub(super) fn collection_workflow(
     }
     clear_collection_area(&private.import_dir, "imports", &identity)?;
     clear_collection_area(&private.work_dir, "staging", &identity)?;
-    steps.log(
-        "Grafi, supplementi e cache eliminati: restano solo i file necessari alla pubblicazione",
-    )?;
-    steps.log("Pubblicazione atomica del database relazionale completo")?;
+    steps.log("CLEANUP removed graphs, supplements and caches before publication")?;
+    steps.log("PUBLISH complete collection database atomically")?;
     crate::store::publish(&private.output_dir, destination, &identity)?;
     cleanup()?;
-    steps.log("Raccolta pubblicata; dump e intermedi temporanei eliminati")?;
+    steps.log("PUBLISHED collection, cleaned up dumps and staging files")?;
     Ok(())
 }
 
@@ -302,7 +315,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         .iter()
         .map(|(l, _)| l.clone())
         .collect::<Vec<_>>();
-    steps.log(&format!("LINGUE {}", languages.join(" ")))?;
+    steps.log(&format!("EDITIONS {}", languages.join(" ")))?;
     let mut fetch = arguments(
         "fetch-dumps",
         &[
@@ -321,8 +334,8 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         sql.push("--plan".into());
         let mut xml = with_languages(content, &languages);
         xml.push("--plan".into());
-        steps.run("piano dei download", &sql)?;
-        steps.run("piano contenuto corrente", &xml)?;
+        steps.run("SQL and History download plan", &sql)?;
+        steps.run("current-content XML plan", &xml)?;
         return Ok(());
     }
     std::fs::create_dir_all(&options.dump_root)?;
@@ -347,12 +360,12 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             let key = format!("fetch:{language}");
             let reason = state.reason(&key, &inputs, &outputs);
             steps.log(&format!(
-                "CHECKPOINT download {language}: {}",
-                if options.force { "forced" } else { reason }
+                "CHECKPOINT {language} downloads: {}",
+                checkpoint_message(if options.force { "forced" } else { reason })
             ))?;
             if !options.force && !outputs.is_empty() && reason == "verified_reuse" {
                 steps.log(&format!(
-                    "SALTA download {language}: file verificati e invariati"
+                    "REUSE {language} downloads: verified and unchanged"
                 ))?;
                 state.save(&key, inputs, &outputs)?;
             } else {
@@ -361,7 +374,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         }
         if !missing.is_empty() {
             steps.run(
-                &format!("download verificato: {}", missing.join(" ")),
+                &format!("{} downloads", missing.join(" ")),
                 &with_languages(fetch.clone(), &missing),
             )?;
         }
@@ -384,7 +397,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             });
             if options.force || !imported {
                 steps.run(
-                    &format!("download verificato {language}"),
+                    &format!("{language} downloads"),
                     &with_languages(fetch.clone(), std::slice::from_ref(language)),
                 )?;
             }
@@ -415,11 +428,13 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             imported_reason(&graph, &history, &stage, &manifest, &metadata, true)
         };
         steps.log(&format!(
-            "CHECKPOINT importazione {language}: {reason}; stato={saved}"
+            "CHECKPOINT {language} import: {}; saved: {}",
+            checkpoint_message(reason),
+            checkpoint_message(saved)
         ))?;
         if reason == "verified_reuse" {
             steps.log(&format!(
-                "SALTA importazione {language}: grafo, cronologia e checkpoint già completi"
+                "REUSE {language} import: complete graph, History and checkpoints"
             ))?;
         } else {
             let graph_reason = if options.force {
@@ -453,11 +468,11 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             }
             steps.run(
                 &format!(
-                    "{} {language}",
+                    "{language} {}",
                     if history_only {
-                        "aggiornamento cronologia"
+                        "History refresh"
                     } else {
-                        "importazione"
+                        "import"
                     }
                 ),
                 &command,
@@ -494,7 +509,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         let checkpoint = options.import_dir.join(format!("{language}-topics.json"));
         if !options.force && topics_match(&checkpoint, &graph, &hash, language, &model, count) {
             steps.log(&format!(
-                "SALTA temi {language}: checkpoint completo del modello e grafo invariato"
+                "REUSE {language} topics: complete model checkpoint, unchanged graph"
             ))?;
         } else {
             missing_topics.push(language.clone());
@@ -519,7 +534,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             ],
         );
         steps.run(
-            &format!("modello dei 64 temi: {}", missing_topics.join(" ")),
+            &format!("{} inference (64 topics)", missing_topics.join(" ")),
             &with_languages(command, &missing_topics),
         )?;
         for language in missing_topics {
@@ -557,16 +572,14 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             let reason = state.reason(&key, &inputs, &outputs);
             if !outputs.is_empty() && reason == "verified_reuse" {
                 state.save(&key, inputs, &outputs)?;
-                steps.log(&format!(
-                    "SALTA contenuto XML {language}: file verificati e invariati"
-                ))?;
+                steps.log(&format!("REUSE {language} XML: verified and unchanged"))?;
             } else {
                 missing_content.push(language.clone());
             }
         }
         if !missing_content.is_empty() {
             steps.run(
-                "contenuto corrente verificato",
+                "current-content XML",
                 &with_languages(content.clone(), &missing_content),
             )?;
         }
@@ -590,7 +603,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                     && !content_checkpoint(options, &state, language, database, &manifest))
             {
                 steps.run(
-                    &format!("contenuto corrente verificato {language}"),
+                    &format!("{language} current-content XML"),
                     &with_languages(content.clone(), std::slice::from_ref(language)),
                 )?;
             }
@@ -613,10 +626,13 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
             "model_sha256":dumps::file_sha256(&options.root.join("config/quality.json"))?,"quality_revision_rule":"selected_official_xml_revision_v1"});
         let key = format!("quality:{language}");
         let reason = state.reason(&key, &inputs, std::slice::from_ref(&quality));
-        steps.log(&format!("CHECKPOINT qualità {language}: {reason}"))?;
+        steps.log(&format!(
+            "CHECKPOINT {language} quality: {}",
+            checkpoint_message(if options.force { "forced" } else { reason })
+        ))?;
         if !options.force && reason == "verified_reuse" {
             steps.log(&format!(
-                "SALTA qualità {language}: supplemento verificato e invariato"
+                "REUSE {language} quality: supplement verified and unchanged"
             ))?;
         } else {
             let command = arguments(
@@ -631,7 +647,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                 ],
             );
             steps.run(
-                &format!("qualità {language}"),
+                &format!("{language} quality"),
                 &with_languages(command, std::slice::from_ref(language)),
             )?;
         }
@@ -675,7 +691,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
     }
     selected.sort();
     steps.log(&format!(
-        "LINGUE confronto incrementale: {}",
+        "EDITIONS in incremental comparison: {}",
         selected
             .iter()
             .map(|(l, _)| l.as_str())
@@ -691,7 +707,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         rules: &rules,
     };
     if !options.force && current_publication(&options.output_dir, &expected, true) {
-        steps.log("SALTA analisi/confronto: osservazioni e misure già aggiornate")?;
+        steps.log("REUSE analysis: observations and measures are current")?;
         return Ok(());
     }
     if !options.force && current_publication(&options.output_dir, &expected, false) {
@@ -710,7 +726,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                 ],
             );
             steps.run(
-                &format!("aggiornamento misure {language} senza ricalcolo del grafo"),
+                &format!("{language} measure refresh using the existing graph"),
                 &with_languages(command, &[language.into()]),
             )?;
         }
@@ -731,7 +747,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
         );
         command.push("--histories".into());
         command.extend(histories.iter().map(|p| path_text(p)));
-        steps.run("confronto interlingua", &command)?;
+        steps.run("cross-wiki comparison", &command)?;
     } else {
         let language = &selected[0].0;
         let stem = format!(
@@ -768,7 +784,7 @@ pub(super) fn workflow(options: &PipelineOptions, steps: &mut impl Steps) -> Pip
                 ),
             ],
         );
-        steps.run(&format!("analisi {language}"), &command)?;
+        steps.run(&format!("{language} analysis"), &command)?;
     }
     if !current_publication(&options.output_dir, &expected, true) {
         return Err("Elaborazione terminata senza pubblicazione completa verificabile".into());
