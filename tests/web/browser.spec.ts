@@ -379,8 +379,9 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await open(page,site,'deorphanize.html');
     await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
     expect(submissions).toEqual([]);
-    const trigger=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})})
-      .getByRole('button',{name:'Genera proposte con Wikimedia'});
+    const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})});
+    const trigger=card.getByRole('button',{name:'Fix this',exact:true});
+    await expect(card.locator('.candidate-footer .connect-button')).toHaveText('Connetti');
     await trigger.click();
     const dialog=page.getByRole('dialog',{name:'Proposte di collegamento'});
     await expect(dialog).toBeVisible();
@@ -423,7 +424,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       await route.fulfill({response,json:++attempted===1?{}:{...body,proposals:[]}});
     });
     await open(page,site,'deorphanize.html');
-    await page.getByRole('button',{name:'Genera proposte con Wikimedia'}).first().click();
+    await page.getByRole('button',{name:'Fix this',exact:true}).first().click();
     await expect(page.locator('#proposal-status')).toContainText('Proposte non disponibili');
     await page.locator('#proposal-retry').click();
     await expect(page.locator('#proposal-status')).toContainText('Nessuna proposta per le coppie analizzate');

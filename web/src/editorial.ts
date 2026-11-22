@@ -465,17 +465,17 @@ export function fixLink(request: PromptRequest | null) {
     disabled.title=t(editorialContext.data.metadata.demo?'Titolo sintetico: nessuna pagina Wikipedia associata.':'Nessuna pagina candidata disponibile per preparare il prompt.');
     return disabled;
   }
+  const link=element('button','Fix this','fix-link');
+  link.type='button';
   const mode=request.provider.proposals;
   if(mode&&request.review) {
     const review=request.review;
-    const button=element('button',t('Genera proposte con Wikimedia'),'fix-link');
-    button.type='button';
-    button.addEventListener('click',()=>showProposals(review,mode,button));
-    return button;
+    link.title=t('Genera proposte con Wikimedia');
+    link.addEventListener('click',()=>showProposals(review,mode,link));
+  } else {
+    link.title=t('Prepara prompt e wikitesto per {provider}',{provider:t(request.provider.name)});
+    link.addEventListener('click',()=>{void showPrompt(request).catch(editorialContext.fail);});
   }
-  const link=element('button','Fix this','fix-link');
-  link.type='button';link.title=t('Prepara prompt e wikitesto per {provider}',{provider:t(request.provider.name)});
-  link.addEventListener('click',()=>{void showPrompt(request).catch(editorialContext.fail);});
   return link;
 }
 
