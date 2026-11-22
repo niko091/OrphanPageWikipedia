@@ -426,7 +426,7 @@ dialog textarea {
   padding: 16px 0;
 }
 
-.review-row > p:has(+ .review-reason) {
+.review-row > p:has(+ .review-reason, + .review-proposal) {
   margin-block-end: 4px;
 }
 
@@ -461,6 +461,14 @@ dialog textarea {
 .proposal-content {
   min-block-size: 0;
   overflow: auto;
+}
+
+#proposal-status:empty {
+  display: none;
+}
+
+.review-proposal > p {
+  margin-block: 8px;
 }
 
 #proposal-dialog .prompt-actions {

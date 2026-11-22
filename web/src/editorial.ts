@@ -81,7 +81,9 @@ const reviewKey=(language: string,source: number,target: number)=>`${language}:$
 export let editorialReviews=new Map<string,EditorialReview>(),reviewsAvailable=false;
 export let reviewContext: ReviewContext | null=null,activePromptReview: ReviewContext | null=null;
 let reviewVersion=0,reviewReadVersion=0,reviewSaving=false;
-let reviewSurface: {rows: HTMLElement; status: HTMLElement; proposal?: {sources: ReviewContext['sources']; reasons: ReadonlyMap<number,string>}} | null=null;
+let reviewSurface: {rows: HTMLElement; status: HTMLElement; proposal?: {
+  sources: ReviewContext['sources']; reasons: ReadonlyMap<number,string>; tables: ReadonlyMap<number,HTMLElement>;
+}} | null=null;
 let reviewSaveController: AbortController | null=null;
 const reviewLabels: Record<ReviewStatus,string>={fixed:'Fixato',not_fixed:'Non fixato',bad_link:'Bad link'};
 export function reviewedEdge(page: PageObservation,sourceID: number): EditorialReview | undefined {
@@ -152,14 +154,17 @@ function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'b
   const context=reviewContext;
   const {rows:box,proposal}=reviewSurface;box.replaceChildren();
   const reviewable=new Set(context.sources.map(source=>source.page_id));
-  reviewSurface.status.hidden=reviewable.size===0;
-  reviewSurface.status.textContent=message||t(editorialContext.authEnabled!==false&&!editorialContext.authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
+  const canReview=editorialContext.authEnabled===false||Boolean(editorialContext.authUsername);
+  const reviewStatus=canReview&&reviewable.size>0?(message||t(reviewsAvailable?
     'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; riclicca la valutazione selezionata per annullarla.':
-    'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.');
+    'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.')):'';
+  reviewSurface.status.textContent=reviewStatus;reviewSurface.status.hidden=!reviewStatus;
   let focusButton: HTMLButtonElement | undefined;
   for(const source of proposal?.sources??context.sources) {
     const row=element('article',null,'review-row');
     const identity=element('p');identity.append(wikiLink(source.title,context.language),element('span',' → '),wikiLink(context.target_title,context.language));row.append(identity);
+    const table=proposal?.tables.get(source.page_id);
+    if(table)row.append(table);
     const reason=proposal?.reasons.get(source.page_id);
     if(reason)row.append(element('p',t(reason),'review-reason'));
     box.append(row);
@@ -168,7 +173,7 @@ function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'b
     row.append(review?reviewBadge(review):element('p',t('Non ancora valutata')));
     const actions=element('div',null,'review-actions');
     for(const status of ['fixed','bad_link'] as const) {
-      const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||editorialContext.authEnabled!==false&&!editorialContext.authUsername;
+      const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||!canReview;
       button.setAttribute('aria-pressed',String(review?.status===status));
       button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
       if(focus?.source===source.page_id&&focus.status===status&&!button.disabled)focusButton=button;
@@ -197,7 +202,7 @@ async function saveReview(context: ReviewContext,source: {page_id: number; title
         source_id:source.page_id,target_id:context.target_id,status:nextStatus,version:current?.version??0})});
     const payload: unknown=await response.json();
     if(version!==reviewVersion||context!==reviewContext)return;
-    if(response.status===401){await editorialContext.loadAuth();message=t('Accedi con Wikipedia per salvare la valutazione');return;}
+    if(response.status===401){await editorialContext.loadAuth();return;}
     if(!isRecord(payload)||(response.status!==409&&!response.ok))throw new Error('Salvataggio non riuscito');
     const review=parseReview(response.status===409?payload.current:payload.review);
     if(reviewKey(review.language,review.source_id,review.target_id)!==key)throw new Error('Valutazione non valida');
@@ -357,7 +362,6 @@ function closeProposalDialog() {
   if(!session)return;
   proposalSession=null;
   $('proposal-dialog')!.close();
-  $('proposal-rows')!.replaceChildren();
   $('proposal-status')!.textContent='';
   if(session.opener.isConnected)session.opener.focus();
   else $('candidate-search')?.focus();
@@ -387,6 +391,27 @@ const outcomeLabels: Record<string,string>={
 const positiveId=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
 const count=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0;
 
+function proposalTable(row: HTMLTableRowElement, page: HTMLElement, title: string, mode: ProposalMode) {
+  const table=element('table',null,'compact-table proposal-table');
+  const headers=table.createTHead().insertRow();
+  for(const label of ['Pagina da modificare','Pagina di provenienza','Stringa da cercare con Ctrl+F','Wikitesto proposto']) {
+    const heading=element('th',t(label));heading.scope='col';headers.append(heading);
+  }
+  table.createTBody().append(row);
+  const scroll=element('div',null,'table-scroll');scroll.tabIndex=0;
+  scroll.setAttribute('role','region');scroll.setAttribute('aria-label',`${t('Proposte di collegamento')} · ${title}`);
+  scroll.append(table);
+  const details=element('div',null,'review-proposal');details.append(scroll);
+  if(mode==='live'&&page instanceof HTMLAnchorElement) {
+    const url=new URL('/w/index.php',page.href);
+    url.searchParams.set('title',title.replaceAll(' ','_'));url.searchParams.set('action','edit');
+    const edit=element('a',t('Modifica su Wikipedia'));
+    edit.href=url.href;edit.target=page.target;edit.rel=page.rel;
+    const actions=element('p');actions.append(edit);details.append(actions);
+  }
+  return details;
+}
+
 function renderProposals(value: unknown,session: ProposalSession) {
   const {review,mode}=session;
   const sources=new Map(review.sources.map(source=>[source.page_id,source]));
@@ -396,9 +421,9 @@ function renderProposals(value: unknown,session: ProposalSession) {
     !count(value.oversized)||!count(value.discarded)||!value.sent_source_ids.every(id=>positiveId(id)&&sources.has(id)))throw invalid();
   const sent=new Set<number>(value.sent_source_ids);
   if(sent.size!==value.sent_source_ids.length||sent.size+value.unavailable+value.oversized!==sources.size)throw invalid();
-  const proposed=new Set<number>();
-  const rows=value.proposals.map((row: unknown)=>{
-    if(!isRecord(row)||!positiveId(row.source_id)||!sent.has(row.source_id)||proposed.has(row.source_id)||
+  const tables=new Map<number,HTMLElement>();
+  for(const row of value.proposals as unknown[]) {
+    if(!isRecord(row)||!positiveId(row.source_id)||!sent.has(row.source_id)||tables.has(row.source_id)||
       typeof row.action!=='string'||!proposalActions.includes(row.action)||typeof row.anchor!=='string'||!row.anchor.trim()||
       /[\r\n]/.test(row.anchor)||typeof row.reference_language!=='string'||row.reference_language===review.language||
       !/^[a-z][a-z0-9-]{0,19}$/.test(row.reference_language)||row.reference_language==='all'||
@@ -408,9 +433,8 @@ function renderProposals(value: unknown,session: ProposalSession) {
       (mode==='preview'?(row.source_revision_id!==null||row.reference_revision_id!==null):
         (!positiveId(row.source_revision_id)||!positiveId(row.reference_revision_id))))throw invalid();
     const source=sources.get(row.source_id)!;
-    proposed.add(row.source_id);
-    const tr=element('tr'),identity=element('th');
-    identity.scope='row';identity.append(wikiLink(source.title,review.language));
+    const tr=element('tr'),identity=element('th'),page=wikiLink(source.title,review.language);
+    identity.scope='row';identity.append(page);
     if(positiveId(row.source_revision_id)) {
       const revision=element('small');
       revision.append(wikiLink(t('Revisione {id}',{id:row.source_revision_id}),review.language,row.source_revision_id));
@@ -427,30 +451,27 @@ function renderProposals(value: unknown,session: ProposalSession) {
       const pre=element('pre');pre.append(element('code',row.wikitext));edit.append(pre);
     }
     tr.append(identity,reference,anchor,edit);
-    return tr;
-  });
+    tables.set(row.source_id,proposalTable(tr,page,source.title,mode));
+  }
   const outcomes=new Map<number,string>();
   if(value.outcomes!==undefined) {
     if(!Array.isArray(value.outcomes))throw invalid();
     for(const row of value.outcomes as unknown[]) {
-      if(!isRecord(row)||!positiveId(row.source_id)||!sources.has(row.source_id)||proposed.has(row.source_id)||
+      if(!isRecord(row)||!positiveId(row.source_id)||!sources.has(row.source_id)||tables.has(row.source_id)||
         outcomes.has(row.source_id)||typeof row.reason!=='string'||!Object.hasOwn(outcomeLabels,row.reason))throw invalid();
       outcomes.set(row.source_id,outcomeLabels[row.reason]);
     }
   }
-  $('proposal-rows')!.replaceChildren(...rows);
-  $('proposal-table')!.hidden=!rows.length;
-  const notes=[sent.size===0?t('Nessuna coppia inviata a Lift Wing.'):rows.length===0?
-    t(value.discarded?'Nessuna proposta ha superato i controlli.':'Nessuna proposta per le coppie analizzate.'):
-    t('Verifica il testo su Wikipedia prima di applicare le proposte.')];
+  const notes=[];
+  if(!sent.size)notes.push(t('Nessuna coppia inviata a Lift Wing.'));
   if(value.unavailable)notes.push(t('Coppie con fonti non verificabili: {n}.',{n:value.unavailable}));
   if(value.oversized)notes.push(t('Coppie oltre il limite di invio o di contesto: {n}.',{n:value.oversized}));
-  if(value.discarded&&rows.length)notes.push(t('Proposte scartate dai controlli: {n}.',{n:value.discarded}));
+  if(value.discarded)notes.push(t(tables.size?'Proposte scartate dai controlli: {n}.':'Nessuna proposta ha superato i controlli.',{n:value.discarded}));
   $('proposal-status')!.textContent=notes.join(' ');
   if(sent.size||outcomes.size) {
     reviewContext={...review,sources:review.sources.filter(source=>sent.has(source.page_id))};
     reviewSurface={rows:$('proposal-review-rows')!,status:$('proposal-review-status')!,
-      proposal:{sources:review.sources.filter(source=>sent.has(source.page_id)||outcomes.has(source.page_id)),reasons:outcomes}};
+      proposal:{sources:review.sources.filter(source=>sent.has(source.page_id)||outcomes.has(source.page_id)),reasons:outcomes,tables}};
     renderReviews();
   }
 }
@@ -463,7 +484,7 @@ export async function submitProposals() {
   const timer=setTimeout(()=>controller.abort(),60_000);
   const status=$('proposal-status')!,retry=$('proposal-retry')!;
   status.textContent=t(mode==='preview'?'Preparazione dell’anteprima…':'Lettura delle revisioni e generazione con Lift Wing…');
-  $('proposal-table')!.hidden=true;$('proposal-review-status')!.hidden=true;retry.hidden=true;
+  $('proposal-review-status')!.hidden=true;retry.hidden=true;
   try {
     const response=await fetch('api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:review.dataset,language:review.language,
