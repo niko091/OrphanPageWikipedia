@@ -19,16 +19,18 @@ async function stop(server: ChildProcess): Promise<void> {
   });
 }
 
-const test = base.extend<{traffic: {editorial: string[]}}, {site: string}>({
-  site: [async ({}, use) => {
+const test = base.extend<{traffic: {editorial: string[]}}, {site: string; proposalPreview: boolean}>({
+  proposalPreview: [false, {scope: 'worker', option: true}],
+  site: [async ({proposalPreview}, use) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orphanwiki-browser-'));
     let server: ChildProcess | undefined;
     try {
-      const {web}=prepareSite(directory);
+      const {web}=prepareSite(directory,proposalPreview);
       const data=path.join(web,'data');
       for(const name of fs.readdirSync(data))if(name!=='collection.sqlite')fs.rmSync(path.join(data,name),{recursive:true});
       server = spawn(executable, ['serve', '--web-root', web, '--database', path.join(directory, 'reviews.sqlite'),
-        '--bind', '127.0.0.1', '--port', '0'], {cwd: root, env, stdio: ['ignore', 'pipe', 'pipe']});
+        '--bind', '127.0.0.1', '--port', '0'], {cwd: root,
+        env:proposalPreview?{...env,ORPHANWIKI_LIFT_WING:'preview'}:env, stdio: ['ignore', 'pipe', 'pipe']});
       const process = server;
       let stderr = '';
       process.stderr?.on('data', (chunk: Buffer) => {stderr += chunk.toString();});
@@ -362,6 +364,72 @@ test('article search, filtering, sorting and pagination', async ({page, site}) =
   await page.locator('#article-search').fill('');
   await page.locator('#article-sort').selectOption('length-desc');
   await expect(page.locator('#article-rows tr').first()).toContainText(title(32));
+});
+
+const previewTest = test.extend<{}, {proposalPreview: boolean}>({
+  proposalPreview: true,
+});
+
+previewTest.describe('local Wikimedia proposals preview', () => {
+  previewTest('shows proposals and saves reviews for every submitted pair', async ({page,site,traffic},testInfo) => {
+    const submissions: unknown[]=[];
+    page.on('request',request=>{
+      if(new URL(request.url()).pathname==='/api/editorial/proposals')submissions.push(request.postDataJSON());
+    });
+    await open(page,site,'deorphanize.html');
+    await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
+    expect(submissions).toEqual([]);
+    const trigger=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})})
+      .getByRole('button',{name:'Genera proposte con Wikimedia'});
+    await trigger.click();
+    const dialog=page.getByRole('dialog',{name:'Proposte di collegamento'});
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByText('Anteprima locale. Le proposte sono simulate.')).toBeVisible();
+    await expect(page.locator('#proposal-rows tr')).toHaveCount(1);
+    await expect(page.locator('#proposal-rows')).toContainText(`[[${title(1)}]]`);
+    const pairs=page.locator('#proposal-review-rows .review-row');
+    await expect(pairs).toHaveCount(2);
+    expect(submissions).toEqual([{dataset:'fixture.json',language:'vec',target_id:1,source_ids:[33,34],ui_language:'it'}]);
+    expect(traffic.editorial).toEqual([]);
+    for(const width of [1280,390])for(const theme of ['light','dark']) {
+      await page.setViewportSize({width,height:844});
+      await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+      await expect(page.locator('#proposal-close')).toBeInViewport();
+      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1)).toBe(true);
+      await dialog.screenshot({path:testInfo.outputPath(`proposals-${width}-${theme}.png`)});
+    }
+    await page.keyboard.press('Escape');
+    await expect(dialog).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+    await expect(page.locator('#proposal-rows tr')).toHaveCount(0);
+    await trigger.click();
+    const badLink=pairs.filter({hasText:title(34)}).getByRole('button',{name:'Bad link'});
+    await badLink.click();
+    await expect(badLink).toHaveAttribute('aria-pressed','true');
+    await expect(badLink).toBeFocused();
+    await page.locator('#proposal-close').click();
+    await open(page,site,'deorphanize.html');
+    await trigger.click();
+    await expect(pairs).toHaveCount(1);
+    expect(submissions.at(-1)).toMatchObject({source_ids:[33]});
+  });
+
+  previewTest('distinguishes retry and a valid result with zero suggestions', async ({page,site}) => {
+    let attempted=0;
+    await page.route('**/api/editorial/proposals',async route=>{
+      const response=await route.fetch();
+      const body: unknown=await response.json();
+      assert(record(body));
+      await route.fulfill({response,json:++attempted===1?{}:{...body,proposals:[]}});
+    });
+    await open(page,site,'deorphanize.html');
+    await page.getByRole('button',{name:'Genera proposte con Wikimedia'}).first().click();
+    await expect(page.locator('#proposal-status')).toContainText('Proposte non disponibili');
+    await page.locator('#proposal-retry').click();
+    await expect(page.locator('#proposal-status')).toContainText('Nessuna proposta per le coppie analizzate');
+    await expect(page.locator('#proposal-table')).not.toBeVisible();
+    await expect(page.locator('#proposal-review-rows .review-row')).not.toHaveCount(0);
+  });
 });
 
 test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic},testInfo) => {

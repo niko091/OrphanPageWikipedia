@@ -18,7 +18,7 @@ function native(args: string[]): void {
 }
 
 // Private complete synthetic censuses. Nothing reads or modifies research data.
-export function prepareSite(directory: string): {web: string; datasets: Dataset[]; manifest: ManifestEntry[]} {
+export function prepareSite(directory: string, extraEditorialPair=false): {web: string; datasets: Dataset[]; manifest: ManifestEntry[]} {
   const web=path.join(directory,'web'),data=path.join(web,'data');
   fs.mkdirSync(data,{recursive:true});
   for(const page of ['index','creators','deorphanize','connections','about'])
@@ -32,7 +32,8 @@ export function prepareSite(directory: string): {web: string; datasets: Dataset[
         const id=index+1;
         return {page_id:id,title:title(id),wikibase_item:`Q${id}`,length_bytes:id===1?null:100+id,
           categories:['Categoria sintetica'],page_created_at:'2020-01-01T00:00:00Z',
-          links:id<=32?[]:[title(id===64?33:id+1),...(language==='lmo'?[title(id-32)]:[])]};
+          links:id<=32?[]:[title(id===64?33:id+1),...(language==='lmo'?[title(id-32)]:[]),
+            ...(extraEditorialPair&&language==='lmo'&&id===34?[title(1)]:[])]};
       })};
     const file=path.join(directory,`${language}-raw.json`);fs.writeFileSync(file,JSON.stringify(graph));return file;
   });

@@ -437,6 +437,54 @@ dialog textarea {
   outline-offset: 2px;
 }
 
+.proposal-preview {
+  border-inline-start: 3px solid var(--border);
+  padding-inline-start: 12px;
+}
+
+#proposal-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  max-block-size: 90dvh;
+  overflow: hidden;
+}
+
+.proposal-content {
+  min-block-size: 0;
+  overflow: auto;
+}
+
+#proposal-dialog .prompt-actions {
+  padding-block-start: 12px;
+}
+
+.proposal-table {
+  min-inline-size: 45rem;
+}
+
+.proposal-table th,.proposal-table td {
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.proposal-table td:last-child {
+  inline-size: 36%;
+}
+
+.proposal-table small {
+  display: block;
+  font-weight: normal;
+}
+
+.proposal-table pre {
+  margin: .35em 0 0;
+  white-space: pre-wrap;
+}
+
+#proposal-reviews {
+  margin-block: 1.25rem 0;
+}
+
 .review-badge {
   font-size: 0.85rem;
   border: 1px solid var(--border);

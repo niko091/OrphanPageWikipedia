@@ -58,7 +58,8 @@ export interface ManifestEntry {
   summary_file: string;
   cards_dir?: string; connections_dir?: string; connections_metadata_file?: string; profile_topics_dir?: string;
 }
-export interface Provider { name: string; url: string | null; }
+export type ProposalMode = 'live' | 'preview';
+export interface Provider { name: string; url: string | null; proposals?: ProposalMode; }
 export interface PromptSource { id: string; language: string; title: string; page_id?: number | null; }
 export interface PromptDocument {
   page_id: number; title: string; revision_id: number; timestamp: string;
@@ -238,6 +239,9 @@ export interface UIElements {
   'llm-prompt-text': HTMLTextAreaElement;
   'llm-prompt-title': HTMLElement;
   'llm-provider': HTMLSelectElement;
+  'proposal-dialog': HTMLDialogElement;
+  'proposal-close': HTMLButtonElement;
+  'proposal-retry': HTMLButtonElement;
   'metrics': HTMLElement;
   'origin-section': HTMLElement;
   'origins': HTMLElement;

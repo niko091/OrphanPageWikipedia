@@ -64,39 +64,10 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
             Ok(json!({"format": "editorial_reviews_v1", "reviews": reviews}))
         }
         Method::POST => {
-            let headers = request.headers();
-            let text = |name| {
-                headers
-                    .get(name)
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("")
-            };
-            let origin = text("origin");
-            let host = text("host");
-            let allowed = app
-                .oauth
-                .as_ref()
-                .map(|config| config.redirect_uri.origin().ascii_serialization());
-            if (!origin.is_empty()
-                && if let Some(allowed) = allowed {
-                    origin != allowed
-                } else {
-                    origin != format!("https://{host}") && origin != format!("http://{host}")
-                })
-                || matches!(text("sec-fetch-site"), "cross-site" | "same-site")
-            {
-                return Err(ReviewError::new(
-                    StatusCode::FORBIDDEN,
-                    "Origine non consentita",
-                ));
-            }
-            if text("content-type").split(';').next() != Some("application/json") {
-                return Err(ReviewError::new(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "JSON richiesto",
-                ));
-            }
-            let length = text("content-length").parse::<usize>().unwrap_or(0);
+            same_origin_json(&app, &request)?;
+            let length = header_text(&request, "content-length")
+                .parse::<usize>()
+                .unwrap_or(0);
             if !(1..=2048).contains(&length) {
                 return Err(ReviewError::new(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -122,6 +93,46 @@ async fn api_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRes
             "Metodo non consentito",
         )),
     }
+}
+
+fn header_text<'a>(request: &'a Request, name: &str) -> &'a str {
+    request
+        .headers()
+        .get(name)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+}
+
+pub(super) fn same_origin_json(app: &ReviewApplication, request: &Request) -> ReviewResult<()> {
+    let origin = header_text(request, "origin");
+    let host = header_text(request, "host");
+    let allowed = app
+        .oauth
+        .as_ref()
+        .map(|config| config.redirect_uri.origin().ascii_serialization());
+    if (!origin.is_empty()
+        && if let Some(allowed) = allowed {
+            origin != allowed
+        } else {
+            origin != format!("https://{host}") && origin != format!("http://{host}")
+        })
+        || matches!(
+            header_text(request, "sec-fetch-site"),
+            "cross-site" | "same-site"
+        )
+    {
+        return Err(ReviewError::new(
+            StatusCode::FORBIDDEN,
+            "Origine non consentita",
+        ));
+    }
+    if header_text(request, "content-type").split(';').next() != Some("application/json") {
+        return Err(ReviewError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "JSON richiesto",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn static_file(

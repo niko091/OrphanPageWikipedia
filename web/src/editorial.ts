@@ -1,4 +1,4 @@
-import type {PageObservation, ReferenceEdge, Candidate, PromptCandidate, CandidateRecord, PromptSource, PromptDocument, ReviewStatus, EditorialReview, ReviewContext, PromptRequest, Provider, Dataset} from './types.js';
+import type {PageObservation, ReferenceEdge, Candidate, PromptCandidate, CandidateRecord, PromptSource, PromptDocument, ReviewStatus, EditorialReview, ReviewContext, PromptRequest, Provider, ProposalMode, Dataset} from './types.js';
 import {$, element, deorphanizePage} from './dom.js';
 import {t, number, uiLanguage} from './i18n.js';
 import {isRecord} from './validation.js';
@@ -15,10 +15,10 @@ interface EditorialContext {
 }
 let editorialContext: EditorialContext;
 export function configureEditorial(context: EditorialContext): void {editorialContext=context;}
-export function wikiLink(title: string, language: string) {
+export function wikiLink(title: string, language: string, revision?: number | null) {
   if(editorialContext.data.metadata.demo || !/^[a-z][a-z0-9-]{0,19}$/.test(language)) return element('span',title);
   const link=element('a',title);
-  link.href=`https://${language}.wikipedia.org/wiki/${encodeURIComponent(title.replaceAll(' ','_'))}`;
+  link.href=revision?`https://${language}.wikipedia.org/w/index.php?oldid=${revision}`:`https://${language}.wikipedia.org/wiki/${encodeURIComponent(title.replaceAll(' ','_'))}`;
   link.target='_blank';link.rel='noopener noreferrer';return link;
 }
 export const candidateReasons: Record<string, string> = {missing_item:'Identificativo interlingua non disponibile.',ambiguous_item:'Corrispondenza interlingua ambigua.',counterpart_unavailable:'Voce equivalente non disponibile o ambigua nelle lingue confrontate.'};
@@ -81,6 +81,7 @@ const reviewKey=(language: string,source: number,target: number)=>`${language}:$
 export let editorialReviews=new Map<string,EditorialReview>(),reviewsAvailable=false;
 export let reviewContext: ReviewContext | null=null,activePromptReview: ReviewContext | null=null;
 let reviewVersion=0,reviewReadVersion=0,reviewSaving=false;
+let reviewSurface: {rows: HTMLElement; status: HTMLElement} | null=null;
 let reviewSaveController: AbortController | null=null;
 const reviewLabels: Record<ReviewStatus,string>={fixed:'Fixato',not_fixed:'Non fixato',bad_link:'Bad link'};
 export function reviewedEdge(page: PageObservation,sourceID: number): EditorialReview | undefined {
@@ -144,15 +145,16 @@ export async function loadSharedReviews(): Promise<void> {
 export function closeReview() {
   ++reviewVersion;reviewSaveController?.abort();reviewSaveController=null;reviewSaving=false;reviewContext=null;
   if($('review-dialog')?.open)$('review-dialog')!.close();
-  $('review-rows')?.replaceChildren();
+  reviewSurface?.rows.replaceChildren();reviewSurface=null;
 }
-function renderReviewDialog(message='') {
-  if(!reviewContext)return;
+function renderReviews(message='', focus?: {source: number; status: 'fixed' | 'bad_link'}) {
+  if(!reviewContext||!reviewSurface)return;
   const context=reviewContext;
-  const box=$('review-rows')!;box.replaceChildren();
-  $('review-dialog-status')!.textContent=message||t(editorialContext.authEnabled!==false&&!editorialContext.authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
+  const box=reviewSurface.rows;box.replaceChildren();
+  reviewSurface.status.textContent=message||t(editorialContext.authEnabled!==false&&!editorialContext.authUsername?'Accedi con Wikipedia per salvare la valutazione':reviewsAvailable?
     'Valuta ogni coppia. Fixato e Bad link escludono la coppia dai prossimi prompt; riclicca la valutazione selezionata per annullarla.':
     'Valutazioni condivise non disponibili. Chiudi e ricarica la pagina per riprovare.');
+  let focusButton: HTMLButtonElement | undefined;
   for(const source of reviewContext.sources) {
     const row=element('article',null,'review-row');
     const identity=element('p');identity.append(wikiLink(source.title,reviewContext.language),element('span',' → '),wikiLink(reviewContext.target_title,reviewContext.language));row.append(identity);
@@ -163,13 +165,16 @@ function renderReviewDialog(message='') {
       const button=element('button',t(reviewLabels[status]));button.type='button';button.disabled=reviewSaving||!reviewsAvailable||editorialContext.authEnabled!==false&&!editorialContext.authUsername;
       button.setAttribute('aria-pressed',String(review?.status===status));
       button.addEventListener('click',()=>{void saveReview(context,source,status);});actions.append(button);
+      if(focus?.source===source.page_id&&focus.status===status&&!button.disabled)focusButton=button;
     }
     row.append(actions);box.append(row);
   }
+  focusButton?.focus();
 }
 export function showReview(context: ReviewContext) {
-  closePrompt();reviewContext=context;
-  renderReviewDialog();$('review-dialog')!.showModal();
+  closePrompt();
+  reviewContext=context;reviewSurface={rows:$('review-rows')!,status:$('review-dialog-status')!};
+  renderReviews();$('review-dialog')!.showModal();
 }
 async function saveReview(context: ReviewContext,source: {page_id: number; title: string},status: 'fixed' | 'bad_link') {
   if(reviewSaving||!reviewsAvailable||context!==reviewContext||editorialContext.authEnabled!==false&&!editorialContext.authUsername)return;
@@ -177,7 +182,7 @@ async function saveReview(context: ReviewContext,source: {page_id: number; title
   const version=reviewVersion,key=reviewKey(context.language,source.page_id,context.target_id);
   const current=editorialReviews.get(key);
   const nextStatus=current?.status===status?'not_fixed':status;
-  const controller=new AbortController();reviewSaveController=controller;reviewSaving=true;renderReviewDialog(t('Salvataggio…'));
+  const controller=new AbortController();reviewSaveController=controller;reviewSaving=true;renderReviews(t('Salvataggio…'));
   const timer=setTimeout(()=>controller.abort(),8000);
   let message='';
   try {
@@ -195,7 +200,7 @@ async function saveReview(context: ReviewContext,source: {page_id: number; title
   } catch {message=t('Salvataggio non confermato. Ricarica la pagina prima di riprovare.');}
   finally {
     clearTimeout(timer);
-    if(version===reviewVersion){reviewSaving=false;reviewSaveController=null;renderReviewDialog(message);}
+    if(version===reviewVersion){reviewSaving=false;reviewSaveController=null;renderReviews(message,{source:source.page_id,status});}
   }
 }
 export function fixRequest(page: PageObservation, record?: CandidateRecord, focusedCandidate?: Candidate): PromptRequest | null {
@@ -270,6 +275,7 @@ export function closePrompt() {
   if($('llm-prompt-text'))$('llm-prompt-text')!.value='';
   if($('llm-prompt-copy'))$('llm-prompt-copy')!.disabled=true;
   if($('llm-prompt-debug'))$('llm-prompt-debug')!.checked=false;
+  closeProposalDialog();
 }
 export async function copyPrompt() {
   if($('llm-prompt-copy')!.disabled||!$('llm-prompt-text')!.value)return;
@@ -332,12 +338,140 @@ export async function copyConnectionPrompt() {
   if(!connectionCopyRequest)return;
   await showPrompt(connectionCopyRequest);
 }
+
+interface ProposalSession {
+  review: ReviewContext;
+  mode: ProposalMode;
+  opener: HTMLButtonElement;
+}
+let proposalSession: ProposalSession | null=null;
+
+function closeProposalDialog() {
+  const session=proposalSession;
+  if(!session)return;
+  proposalSession=null;
+  $('proposal-dialog')!.close();
+  $('proposal-rows')!.replaceChildren();
+  $('proposal-target')!.replaceChildren();
+  $('proposal-status')!.textContent='';
+  if(session.opener.isConnected)session.opener.focus();
+  else $('candidate-search')?.focus();
+}
+
+function showProposals(review: ReviewContext,mode: ProposalMode,opener: HTMLButtonElement) {
+  closePrompt();
+  proposalSession={review,mode,opener};
+  $('proposal-target')!.replaceChildren(wikiLink(review.target_title,review.language));
+  $('proposal-preview')!.hidden=mode!=='preview';
+  $('proposal-dialog')!.showModal();
+  void submitProposals();
+}
+
+const proposalActions=['ADD LINK','BEFORE','AFTER','REPLACE'];
+const positiveId=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
+const count=(value: unknown): value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0;
+
+function renderProposals(value: unknown,session: ProposalSession) {
+  const {review,mode}=session;
+  const sources=new Map(review.sources.map(source=>[source.page_id,source]));
+  const invalid=()=>new Error('Risposta di Lift Wing non valida.');
+  if(!isRecord(value)||value.format!=='editorial_proposals_v1'||value.preview!==(mode==='preview')||
+    !Array.isArray(value.sent_source_ids)||!Array.isArray(value.proposals)||!count(value.unavailable)||
+    !count(value.oversized)||!count(value.discarded)||!value.sent_source_ids.every(id=>positiveId(id)&&sources.has(id)))throw invalid();
+  const sent=new Set<number>(value.sent_source_ids);
+  if(sent.size!==value.sent_source_ids.length||sent.size+value.unavailable+value.oversized!==sources.size)throw invalid();
+  const proposed=new Set<number>();
+  const rows=value.proposals.map((row: unknown)=>{
+    if(!isRecord(row)||!positiveId(row.source_id)||!sent.has(row.source_id)||proposed.has(row.source_id)||
+      typeof row.action!=='string'||!proposalActions.includes(row.action)||typeof row.anchor!=='string'||!row.anchor.trim()||
+      /[\r\n]/.test(row.anchor)||typeof row.reference_language!=='string'||row.reference_language===review.language||
+      !/^[a-z][a-z0-9-]{0,19}$/.test(row.reference_language)||row.reference_language==='all'||
+      typeof row.reference_title!=='string'||!row.reference_title.trim()||
+      (row.action==='ADD LINK'?row.wikitext!==null:typeof row.wikitext!=='string'||!row.wikitext.trim())||
+      (mode==='preview'?(row.source_revision_id!==null||row.reference_revision_id!==null):
+        (!positiveId(row.source_revision_id)||!positiveId(row.reference_revision_id))))throw invalid();
+    const source=sources.get(row.source_id)!;
+    proposed.add(row.source_id);
+    const tr=element('tr'),identity=element('th');
+    identity.scope='row';identity.append(wikiLink(source.title,review.language));
+    if(positiveId(row.source_revision_id)) {
+      const revision=element('small');
+      revision.append(wikiLink(t('Revisione {id}',{id:row.source_revision_id}),review.language,row.source_revision_id));
+      identity.append(revision);
+    }
+    const reference=element('td');
+    reference.append(wikiLink(row.reference_title,row.reference_language,positiveId(row.reference_revision_id)?row.reference_revision_id:null),element('small',row.reference_language.toUpperCase()));
+    const anchor=element('td');anchor.append(element('code',row.anchor));
+    const edit=element('td');edit.append(element('strong',row.action));
+    if(typeof row.wikitext==='string') {
+      const pre=element('pre');pre.append(element('code',row.wikitext));edit.append(pre);
+    }
+    tr.append(identity,reference,anchor,edit);
+    return tr;
+  });
+  $('proposal-rows')!.replaceChildren(...rows);
+  $('proposal-table')!.hidden=!rows.length;
+  const notes=[sent.size===0?t('Nessuna coppia inviata a Lift Wing.'):rows.length===0?
+    t(value.discarded?'Nessuna proposta ha superato i controlli.':'Nessuna proposta per le coppie analizzate.'):
+    t('Verifica il testo su Wikipedia prima di applicare le proposte.')];
+  if(value.unavailable)notes.push(t('Coppie con fonti non verificabili: {n}.',{n:value.unavailable}));
+  if(value.oversized)notes.push(t('Coppie con fonti troppo lunghe per il modello: {n}.',{n:value.oversized}));
+  if(value.discarded&&rows.length)notes.push(t('Proposte scartate dai controlli: {n}.',{n:value.discarded}));
+  $('proposal-status')!.textContent=notes.join(' ');
+  if(sent.size) {
+    reviewContext={...review,sources:review.sources.filter(source=>sent.has(source.page_id))};
+    reviewSurface={rows:$('proposal-review-rows')!,status:$('proposal-review-status')!};
+    $('proposal-reviews')!.hidden=false;
+    renderReviews();
+  }
+}
+
+export async function submitProposals() {
+  const session=proposalSession;
+  if(!session||promptController)return;
+  const {review,mode}=session;
+  const controller=new AbortController();promptController=controller;
+  const timer=setTimeout(()=>controller.abort(),60_000);
+  const status=$('proposal-status')!,retry=$('proposal-retry')!;
+  status.textContent=t(mode==='preview'?'Preparazione dell’anteprima…':'Lettura delle revisioni e generazione con Lift Wing…');
+  $('proposal-table')!.hidden=true;$('proposal-reviews')!.hidden=true;retry.hidden=true;
+  try {
+    const response=await fetch('api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:review.dataset,language:review.language,
+        target_id:review.target_id,source_ids:review.sources.map(source=>source.page_id),ui_language:uiLanguage})});
+    if(proposalSession!==session)return;
+    if(!response.ok) {
+      const message=response.status===429?'Lift Wing è occupato. Riprova tra poco.':response.status===504?
+        'Tempo di attesa scaduto. Riprova.':'Proposte non disponibili. Riprova.';
+      status.textContent=t(message);retry.hidden=false;return;
+    }
+    const value: unknown=await response.json();
+    if(proposalSession===session)renderProposals(value,session);
+  } catch {
+    if(proposalSession===session) {
+      status.textContent=t(controller.signal.aborted?'Tempo di attesa scaduto. Riprova.':'Proposte non disponibili. Riprova.');
+      retry.hidden=false;
+    }
+  } finally {
+    clearTimeout(timer);
+    if(promptController===controller)promptController=null;
+  }
+}
+
 export function fixLink(request: PromptRequest | null) {
   if(!request) {
     const disabled=element('span',editorialContext.data.metadata.demo?'Fix this · DEMO':'Fix this','fix-link');
     disabled.setAttribute('aria-disabled','true');
     disabled.title=t(editorialContext.data.metadata.demo?'Titolo sintetico: nessuna pagina Wikipedia associata.':'Nessuna pagina candidata disponibile per preparare il prompt.');
     return disabled;
+  }
+  const mode=request.provider.proposals;
+  if(mode&&request.review) {
+    const review=request.review;
+    const button=element('button',t('Genera proposte con Wikimedia'),'fix-link');
+    button.type='button';
+    button.addEventListener('click',()=>showProposals(review,mode,button));
+    return button;
   }
   const link=element('button','Fix this','fix-link');
   link.type='button';link.title=t('Prepara prompt e wikitesto per {provider}',{provider:t(request.provider.name)});

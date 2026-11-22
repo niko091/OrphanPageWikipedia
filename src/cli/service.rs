@@ -12,9 +12,14 @@ impl Invocation {
             .cloned()
             .or_else(|| std::env::var("ORPHANWIKI_WEB_ROOT").ok())
             .unwrap_or_else(|| "web".into());
+        let bind = self
+            .args
+            .get_one::<String>("bind")
+            .ok_or("Indirizzo mancante")?;
         let mut app =
             orphanwiki::editorial::ReviewApplication::new(self.root.join(web_root), database)
                 .with_oauth_from_environment()?
+                .with_proposals_from_environment(bind)?
                 .with_collection_verification(!self.args.get_flag("skip-collection-verification"));
         if let Some(path) = self.args.get_one::<String>("collection-database") {
             orphanwiki::store::Census::open(&self.root.join(path)).map_err(|e| e.to_string())?;
@@ -22,9 +27,7 @@ impl Invocation {
         }
         orphanwiki::editorial::serve(
             app,
-            self.args
-                .get_one::<String>("bind")
-                .ok_or("Indirizzo mancante")?,
+            bind,
             *self.args.get_one::<u16>("port").ok_or("Porta mancante")?,
         )
         .map_err(|e| e.to_string())
