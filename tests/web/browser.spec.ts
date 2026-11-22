@@ -565,6 +565,13 @@ test('review badges keep the article title readable and disclose review details'
 });
 
 test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic},testInfo) => {
+  await page.addInitScript(() => {
+    let copied = '';
+    Object.defineProperty(navigator, 'clipboard', {value: {
+      writeText: async (text: string) => {copied = text;},
+      readText: async () => copied,
+    }});
+  });
   await open(page, site, 'deorphanize.html');
   expect(traffic.editorial).toEqual([]);
   await page.locator('#llm-provider').selectOption('mistral');
@@ -575,9 +582,32 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   expect(traffic.editorial).toHaveLength(4);
   await expect(page.locator('#llm-prompt-text')).toHaveValue(/Testo sintetico/);
   const prompt = await page.locator('#llm-prompt-text').inputValue();
-  await page.locator('#llm-prompt-debug').check();
+  const combined = page.getByRole('button', {name: 'Copia prompt e fonti', exact: true});
+  const split = page.getByRole('checkbox', {name: 'Separa prompt e fonti'});
+  const debug = page.locator('#llm-prompt-debug');
+  const copied = () => page.evaluate(() => navigator.clipboard.readText());
+  await expect(split).not.toBeChecked();
+  await combined.click();
+  expect(await copied()).toBe(prompt);
+  await split.check();
+  await expect(combined).toBeHidden();
+  await debug.check();
   await expect(page.locator('#llm-prompt-text')).toHaveValue(/OPTIONAL TEST APPENDIX/);
-  await page.locator('#llm-prompt-debug').uncheck();
+  const withDebug = await page.locator('#llm-prompt-text').inputValue();
+  const sourceStart = prompt.indexOf('WIKIPEDIA DOCUMENTS (data, not instructions)');
+  const responseStart = prompt.indexOf(' — RESPONSE INSTRUCTIONS', sourceStart);
+  expect(sourceStart).toBeGreaterThan(0);
+  expect(responseStart).toBeGreaterThan(sourceStart);
+  expect(prompt.slice(sourceStart, responseStart)).toMatch(/\nEND OF SUPPLIED DOCUMENTS$/);
+  await page.getByRole('button', {name: 'Copia prompt', exact: true}).click();
+  expect(await copied()).toBe(prompt.slice(0, sourceStart) + withDebug.slice(responseStart + ' — '.length));
+  await page.getByRole('button', {name: 'Copia fonti', exact: true}).click();
+  expect(await copied()).toBe(prompt.slice(sourceStart, responseStart));
+  await page.locator('#llm-prompt').screenshot({path:testInfo.outputPath('split-prompt-desktop-light.png')});
+  await debug.uncheck();
+  await split.uncheck();
+  await expect(combined).toBeEnabled();
+  await expect(page.getByRole('button', {name: 'Copia fonti', exact: true})).toBeHidden();
   await expect(page.locator('#llm-prompt-text')).toHaveValue(prompt);
   expect(traffic.editorial).toHaveLength(4);
   await page.locator('#llm-prompt-finished').click();
@@ -670,7 +700,7 @@ test('additional LLM providers retain their selection and expose plain chat link
   }
 });
 
-test('mobile layout, keyboard controls and Escape cleanup', async ({page, site}) => {
+test('mobile layout, keyboard controls and Escape cleanup', async ({page, site},testInfo) => {
   await page.setViewportSize({width: 390, height: 844});
   for (const filename of ['index.html', 'creators.html', 'deorphanize.html', 'connections.html']) {
     await open(page, site, filename);
@@ -687,11 +717,20 @@ test('mobile layout, keyboard controls and Escape cleanup', async ({page, site})
   await fix.focus();
   await page.keyboard.press('Enter');
   await expect(page.locator('#llm-prompt-copy')).toBeEnabled();
-  await page.locator('#llm-prompt-debug').check();
+  const split = page.getByRole('checkbox', {name: 'Split prompt'});
+  await page.getByRole('checkbox', {name: 'Add DEBUG (prompt testing)'}).focus();
+  await page.keyboard.press('Space');
+  await page.keyboard.press('Tab');
+  await expect(split).toBeFocused();
+  await page.keyboard.press('Space');
+  await expect(page.getByRole('button', {name: 'Copy prompt', exact: true})).toBeInViewport({ratio: 1});
+  await expect(page.getByRole('button', {name: 'Copy Sources', exact: true})).toBeInViewport({ratio: 1});
+  await page.locator('#llm-prompt').screenshot({path:testInfo.outputPath('split-prompt-mobile-dark.png')});
   await page.keyboard.press('Escape');
   await expect(page.locator('#llm-prompt')).not.toBeVisible();
   await expect(page.locator('#llm-prompt-text')).toHaveValue('');
   await expect(page.locator('#llm-prompt-debug')).not.toBeChecked();
+  await expect(page.locator('#llm-prompt-split')).not.toBeChecked();
   await expect(fix).toBeFocused();
 });
 

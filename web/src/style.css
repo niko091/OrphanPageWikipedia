@@ -407,13 +407,19 @@ dialog textarea {
   resize: vertical;
 }
 
-.prompt-debug {
-  flex-direction: row;
-  align-items: center;
-  margin-top: 12px;
+.prompt-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-block-start: 12px;
 }
 
-.prompt-debug input {
+.prompt-options label {
+  flex-direction: row;
+  align-items: center;
+}
+
+.prompt-options input {
   margin: 0;
   padding: 0;
 }
@@ -423,6 +429,16 @@ dialog textarea {
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+@media(max-width: 600px) {
+  #llm-prompt {
+    padding: 12px;
+  }
+
+  #llm-prompt-text {
+    height: 35vh;
+  }
 }
 
 .review-row {
@@ -1196,13 +1212,13 @@ svg text {
   font-weight: 600;
 }
 
-.connect-button,#llm-prompt-copy {
+.connect-button,.prompt-copy {
   color: #fff;
   background: #36c;
   border: 1px solid #36c;
 }
 
-.connect-button:hover,#llm-prompt-copy:hover:enabled {
+.connect-button:hover,.prompt-copy:hover:enabled {
   color: #fff;
   background: #3056a9;
   border-color: #3056a9;

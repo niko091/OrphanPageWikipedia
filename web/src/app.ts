@@ -646,7 +646,10 @@ if($('llm-provider')!) {
   });
 }
 $('llm-prompt-copy')?.addEventListener('click',()=>copyPrompt());
+$('llm-prompt-copy-text')?.addEventListener('click',()=>copyPrompt('prompt'));
+$('llm-prompt-copy-sources')?.addEventListener('click',()=>copyPrompt('sources'));
 $('llm-prompt-debug')?.addEventListener('change',updatePreparedPrompt);
+$('llm-prompt-split')?.addEventListener('change',updatePreparedPrompt);
 $('connection-copy-prompt')?.addEventListener('click',()=>{void copyConnectionPrompt().catch(fail);});
 $('llm-prompt-close')?.addEventListener('click',closePrompt);
 $('llm-prompt-finished')?.addEventListener('click',()=>{if(activePromptReview)void showReview(activePromptReview);});

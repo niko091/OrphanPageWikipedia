@@ -233,7 +233,10 @@ export interface UIElements {
   'review-close': HTMLButtonElement;
   'review-service-status': HTMLElement;
   'llm-prompt-copy': HTMLButtonElement;
+  'llm-prompt-copy-text': HTMLButtonElement;
+  'llm-prompt-copy-sources': HTMLButtonElement;
   'llm-prompt-debug': HTMLInputElement;
+  'llm-prompt-split': HTMLInputElement;
   'llm-prompt-open': HTMLAnchorElement;
   'llm-prompt-status': HTMLElement;
   'llm-prompt-text': HTMLTextAreaElement;
