@@ -152,10 +152,19 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await expect(search).toBeVisible();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
   await page.setViewportSize({width:1280,height:844});
-  const searchBounds=await search.boundingBox(),reviewBounds=await page.locator('#connection-reviewed').boundingBox();
-  assert(searchBounds&&reviewBounds);
-  expect(searchBounds.x).toBeGreaterThan(reviewBounds.x+reviewBounds.width);
-  expect(Math.abs(searchBounds.y-reviewBounds.y)).toBeLessThanOrEqual(2);
+  await page.locator('#ui-language-toggle').click();
+  await page.locator('#connection-reviewed').click();
+  await page.locator('html').evaluate(node=>{node.dataset.theme='dark';});
+  const searchBounds=await page.getByRole('searchbox',{name:'Search by title'}).boundingBox();
+  assert(searchBounds);
+  for(const id of ['connection-open','connection-reviewed']) {
+    const buttonBounds=await page.locator('#'+id).boundingBox();
+    assert(buttonBounds);
+    expect(searchBounds.x).toBeGreaterThan(buttonBounds.x+buttonBounds.width);
+    expect(searchBounds.y).toBeCloseTo(buttonBounds.y,0);
+    expect(searchBounds.height).toBeCloseTo(buttonBounds.height,0);
+  }
+  await page.locator('.connection-toolbar').screenshot({path:testInfo.outputPath('connection-toolbar-dark.png')});
   expect(traffic.editorial).toEqual([]);
 });
 
