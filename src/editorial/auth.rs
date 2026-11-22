@@ -227,7 +227,8 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
     if action == "session" && request.method() == Method::GET {
         return Ok(response(
             StatusCode::OK,
-            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?}),
+            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?,
+                "proposals": app.proposals.as_ref().map(ProposalService::mode)}),
         ));
     }
     let config = app.oauth.as_ref().ok_or_else(|| {

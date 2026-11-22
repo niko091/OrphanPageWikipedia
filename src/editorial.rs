@@ -1,6 +1,7 @@
 //! Shared human review state, isolated from immutable scientific exports.
 mod auth;
 mod http;
+mod proposals;
 mod reviews;
 mod storage;
 use auth::{auth, LoginSession, OAuthConfig};
@@ -14,6 +15,7 @@ use axum::{
 };
 use http::{api, page_query, response, static_file};
 use mysql::prelude::Queryable;
+use proposals::ProposalService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -158,6 +160,7 @@ pub struct ReviewApplication {
     verify_collection: bool,
     database: ReviewDatabase,
     oauth: Option<OAuthConfig>,
+    proposals: Option<ProposalService>,
     sessions: Arc<Mutex<BTreeMap<String, LoginSession>>>,
 }
 
@@ -169,6 +172,7 @@ impl ReviewApplication {
             web_root,
             database,
             oauth: None,
+            proposals: None,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -209,8 +213,27 @@ impl ReviewApplication {
             .route("/api/reviews", any(api))
             .route("/api/pages", any(page_query))
             .route("/api/auth/{action}", any(auth))
+            .route("/api/editorial/proposals", any(proposals::handle))
             .fallback(static_file)
             .with_state(Arc::new(self))
+    }
+
+    pub fn with_proposals_from_environment(mut self, bind: &str) -> Result<Self, String> {
+        let mode = std::env::var("ORPHANWIKI_LIFT_WING").unwrap_or_default();
+        self.proposals = match mode.as_str() {
+            "" | "off" => None,
+            "live" => Some(ProposalService::live()?),
+            "preview"
+                if bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+                    && matches!(self.database, ReviewDatabase::Sqlite(_))
+                    && self.oauth.is_none() =>
+            {
+                Some(ProposalService::preview())
+            }
+            "preview" => return Err("L'anteprima Lift Wing richiede un indirizzo di loopback, SQLite e OAuth disattivato".into()),
+            _ => return Err("ORPHANWIKI_LIFT_WING deve essere live, preview oppure off".into()),
+        };
+        Ok(self)
     }
 }
 

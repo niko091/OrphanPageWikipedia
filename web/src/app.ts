@@ -1,7 +1,7 @@
 import {createExplorer} from './explorer.js';
 import {wikimediaAPI} from './wikimedia.js';
 import {configureProfile,clearProfileCache,recentWikipediaEdits,readProfileTopics} from './profile.js';
-import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, referenceCount, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink} from './editorial.js';
+import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, referenceCount, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink, submitProposals} from './editorial.js';
 import {createCharts} from './charts.js';
 import type {PageObservation, Candidate, CandidateRecord, Dataset, ManifestEntry, Provider, CreatorRow, DashboardModule, DashboardSummaryData, RecentEdit, InterestReport} from './types.js';
 import {ARTICLE_INDEX_FIELDS} from './types.js';
@@ -22,7 +22,9 @@ const llmProviders: Record<string, Provider> = {
   gemini:{name:'Gemini',url:'https://gemini.google.com/'},
   other:{name:'Altro',url:null}
 };
-let llmProvider=readPreference('orphanwiki-llm','qwen',Object.keys(llmProviders));
+const liftWingKey='lift-wing',manualProviderKeys=Object.keys(llmProviders);
+let llmProvider=readPreference('orphanwiki-llm','qwen',manualProviderKeys);
+const llmPreference=()=>llmProviders[liftWingKey]?'orphanwiki-deorphanize-llm':'orphanwiki-llm';
 let theme=readPreference('orphanwiki-theme','system',['system','light','dark']);
 const systemTheme=window.matchMedia?.('(prefers-color-scheme: dark)');
 function applyTheme() {
@@ -107,6 +109,15 @@ async function authRequest(action: 'session' | 'logout'): Promise<void> {
     if(!isRecord(payload)||typeof payload.enabled!=='boolean'||!(payload.username===null||validUsername(payload.username))||!payload.enabled&&payload.username!==null)throw new Error('Accesso Wikipedia non disponibile');
     if(authUsername!==payload.username)clearProfile();
     authEnabled=payload.enabled;authUsername=payload.username;authError=null;
+    if(deorphanizePage&&action==='session') {
+      const mode=payload.proposals==='live'||payload.proposals==='preview'?payload.proposals:undefined;
+      if(mode!==llmProviders[liftWingKey]?.proposals) {
+        if(mode)llmProviders[liftWingKey]={name:'Wikimedia (Lift Wing)',url:null,proposals:mode};
+        else delete llmProviders[liftWingKey];
+        llmProvider=readPreference(llmPreference(),mode?liftWingKey:'qwen',Object.keys(llmProviders));
+        populateLlmProviders();
+      }
+    }
   } finally {clearTimeout(timer);}
   renderAuth();
 }
@@ -627,7 +638,7 @@ if($('llm-provider')!) {
   $('llm-provider')!.addEventListener('change',()=>{
     const value=$('llm-provider')!.value;if(!Object.hasOwn(llmProviders,value)){$('llm-provider')!.value=llmProvider;return;}
     closePrompt();
-    llmProvider=value;savePreference('orphanwiki-llm',value);
+    llmProvider=value;savePreference(llmPreference(),value);
     if(data) {if(deorphanizePage)candidateCards();if(connectionsPage)renderConnections();}
   });
 }
@@ -639,6 +650,10 @@ $('llm-prompt-finished')?.addEventListener('click',()=>{if(activePromptReview)vo
 $('review-close')?.addEventListener('click',closeReview);
 $('review-dialog')?.addEventListener('cancel',event=>{event.preventDefault();closeReview();});
 $('llm-prompt')?.addEventListener('cancel',event=>{event.preventDefault();closePrompt();});
+$('proposal-close')?.addEventListener('click',closePrompt);
+$('proposal-retry')?.addEventListener('click',()=>{void submitProposals();});
+$('proposal-dialog')?.addEventListener('cancel',event=>{event.preventDefault();closePrompt();});
+window.addEventListener('pagehide',closePrompt);
 $('chart-type')?.addEventListener('change',()=>{if(data&&document.body.dataset.loading!=='true')renderCharts();});
 $('category-metric')?.addEventListener('change',()=>{if(data)categories();});
 for(const id of ['topics-full-metric','topics-paper-metric'])$(id)?.addEventListener('change',()=>{if(data)paperProfiles();});

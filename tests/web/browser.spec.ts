@@ -19,16 +19,18 @@ async function stop(server: ChildProcess): Promise<void> {
   });
 }
 
-const test = base.extend<{traffic: {editorial: string[]}}, {site: string}>({
-  site: [async ({}, use) => {
+const test = base.extend<{traffic: {editorial: string[]}}, {site: string; proposalPreview: boolean}>({
+  proposalPreview: [false, {scope: 'worker', option: true}],
+  site: [async ({proposalPreview}, use) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orphanwiki-browser-'));
     let server: ChildProcess | undefined;
     try {
-      const {web}=prepareSite(directory);
+      const {web}=prepareSite(directory,proposalPreview);
       const data=path.join(web,'data');
       for(const name of fs.readdirSync(data))if(name!=='collection.sqlite')fs.rmSync(path.join(data,name),{recursive:true});
       server = spawn(executable, ['serve', '--web-root', web, '--database', path.join(directory, 'reviews.sqlite'),
-        '--bind', '127.0.0.1', '--port', '0'], {cwd: root, env, stdio: ['ignore', 'pipe', 'pipe']});
+        '--bind', '127.0.0.1', '--port', '0'], {cwd: root,
+        env:proposalPreview?{...env,ORPHANWIKI_LIFT_WING:'preview'}:env, stdio: ['ignore', 'pipe', 'pipe']});
       const process = server;
       let stderr = '';
       process.stderr?.on('data', (chunk: Buffer) => {stderr += chunk.toString();});
@@ -362,6 +364,145 @@ test('article search, filtering, sorting and pagination', async ({page, site}) =
   await page.locator('#article-search').fill('');
   await page.locator('#article-sort').selectOption('length-desc');
   await expect(page.locator('#article-rows tr').first()).toContainText(title(32));
+});
+
+const previewTest = test.extend<{}, {proposalPreview: boolean}>({
+  proposalPreview: true,
+});
+
+previewTest.describe('local Wikimedia proposals preview', () => {
+  previewTest('shows proposals and saves reviews for every submitted pair', async ({page,site,traffic},testInfo) => {
+    const submissions: unknown[]=[];
+    page.on('request',request=>{
+      if(new URL(request.url()).pathname==='/api/editorial/proposals')submissions.push(request.postDataJSON());
+    });
+    await open(page,site,'deorphanize.html');
+    await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
+    expect(submissions).toEqual([]);
+    const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})});
+    const trigger=card.getByRole('button',{name:'Fix this',exact:true});
+    await expect(card.locator('.candidate-footer .connect-button')).toHaveText('Connetti');
+    await trigger.click();
+    const dialog=page.getByRole('dialog',{name:'Proposte di collegamento'});
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByText('Anteprima locale. Le proposte sono simulate.')).toBeVisible();
+    const pairs=page.locator('#proposal-review-rows .review-row');
+    await expect(pairs).toHaveCount(2);
+    const suggested=pairs.filter({has:page.getByRole('link',{name:title(33),exact:true})});
+    await expect(suggested.locator('p:first-child + .review-proposal table tbody tr')).toHaveCount(1);
+    await expect(suggested.getByRole('table')).toContainText(`[[${title(1)}]]`);
+    await expect(suggested.getByRole('link',{name:'Modifica su Wikipedia'})).toHaveCount(0);
+    const skipped=pairs.filter({has:page.getByRole('link',{name:title(34),exact:true})});
+    await expect(skipped.locator('p').nth(1)).toHaveText('Il modello non ha individuato un punto d’inserimento adatto.');
+    await expect(skipped.getByRole('table')).toHaveCount(0);
+    await expect(suggested.locator('.review-reason')).toHaveCount(0);
+    await expect(page.locator('#proposal-status')).toBeEmpty();
+    expect(submissions).toEqual([{dataset:'fixture.json',language:'vec',target_id:1,source_ids:[33,34],ui_language:'it'}]);
+    expect(traffic.editorial).toEqual([]);
+    for(const width of [1280,390])for(const theme of ['light','dark']) {
+      await page.setViewportSize({width,height:844});
+      await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+      await expect(page.locator('#proposal-close')).toBeInViewport();
+      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1)).toBe(true);
+      await dialog.screenshot({path:testInfo.outputPath(`proposals-${width}-${theme}.png`)});
+    }
+    await page.keyboard.press('Escape');
+    await expect(dialog).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+    await expect(page.locator('#proposal-review-rows table')).toHaveCount(0);
+    await trigger.click();
+    const badLink=skipped.getByRole('button',{name:'Bad link'});
+    await badLink.click();
+    await expect(badLink).toHaveAttribute('aria-pressed','true');
+    await expect(badLink).toBeFocused();
+    await expect(skipped.locator('.review-reason')).toBeVisible();
+    await page.locator('#proposal-close').click();
+    await open(page,site,'deorphanize.html');
+    await trigger.click();
+    await expect(pairs).toHaveCount(1);
+    expect(submissions.at(-1)).toMatchObject({source_ids:[33]});
+  });
+
+  previewTest('shows zero-suggestion reasons under each pair after retry', async ({page,site},testInfo) => {
+    let attempted=0;
+    await page.route('**/api/editorial/proposals',async route=>{
+      const response=await route.fetch();
+      const body: unknown=await response.json();
+      assert(record(body));
+      assert.deepEqual(body.sent_source_ids,[34,35]);
+      const outcomes=[{source_id:34,reason:'insufficient_evidence'},{source_id:35,reason:'unavailable'}];
+      await route.fulfill({response,json:++attempted===1?{}:{...body,sent_source_ids:[34],unavailable:1,proposals:[],outcomes}});
+    });
+    await open(page,site,'deorphanize.html');
+    await page.locator('#ui-language-toggle').click();
+    const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(2),exact:true})});
+    await card.getByRole('button',{name:'Fix this',exact:true}).click();
+    await expect(page.locator('#proposal-status')).toContainText('Suggestions are temporarily unavailable');
+    await page.locator('#proposal-retry').click();
+    await expect(page.locator('#proposal-status')).toHaveText('Pairs with unverifiable sources: 1.');
+    const dialog=page.getByRole('dialog',{name:'Link suggestions'});
+    const reviews=dialog.getByRole('region',{name:'Review candidate page pairs'});
+    await expect(dialog.locator('#proposal-title:first-child + #proposal-reviews')).toBeVisible();
+    await expect(dialog.getByRole('table')).toHaveCount(0);
+    const pairs=reviews.locator('.review-row');
+    await expect(pairs).toHaveCount(2);
+    const sent=pairs.filter({has:page.getByRole('link',{name:title(34),exact:true})});
+    const unavailable=pairs.filter({has:page.getByRole('link',{name:title(35),exact:true})});
+    await expect(sent.locator('p').nth(1)).toHaveText('The model did not find enough evidence.');
+    await expect(sent.getByRole('button',{name:'Bad link'})).toBeEnabled();
+    await expect(unavailable.locator('p').nth(1)).toHaveText('A required source could not be verified.');
+    await expect(unavailable.getByRole('button')).toHaveCount(0);
+    await page.locator('html').evaluate(node=>{node.dataset.theme='dark';});
+    for(const width of [1280,390]) {
+      await page.setViewportSize({width,height:844});
+      await expect(page.locator('#proposal-close')).toBeInViewport();
+      await dialog.screenshot({path:testInfo.outputPath(`proposal-reasons-${width}.png`)});
+    }
+  });
+
+  previewTest('opens the editor for a single proposed edit without signing in', async ({page,site,traffic},testInfo) => {
+    await page.route('**/api/auth/session',route=>route.fulfill({json:{enabled:true,username:null,proposals:'live'}}));
+    await page.route('**/api/editorial/proposals',async route=>{
+      const response=await route.fetch();
+      const body: unknown=await response.json();
+      assert(record(body));
+      assert.deepEqual(body.sent_source_ids,[35]);
+      assert(Array.isArray(body.proposals)&&body.proposals.length===1);
+      const proposal: unknown=body.proposals[0];
+      assert(record(proposal));
+      await route.fulfill({response,json:{...body,preview:false,proposals:[{...proposal,source_revision_id:1035,reference_revision_id:2035}]}});
+    });
+    await open(page,site,'deorphanize.html');
+    await page.locator('#ui-language-toggle').click();
+    const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(3),exact:true})});
+    const trigger=card.getByRole('button',{name:'Fix this',exact:true});
+    await trigger.click();
+    const dialog=page.getByRole('dialog',{name:'Link suggestions'});
+    const pair=dialog.locator('.review-row');
+    await expect(pair).toHaveCount(1);
+    await expect(pair.getByRole('table')).toContainText(`[[${title(3)}]]`);
+    const edit=pair.getByRole('link',{name:'Edit on Wikipedia'});
+    await expect(edit).toHaveAttribute('href','https://vec.wikipedia.org/w/index.php?title=Voce_sintetica_035&action=edit');
+    await expect(edit).toHaveAttribute('target','_blank');
+    await expect(dialog.locator('#proposal-status')).toBeEmpty();
+    await expect(dialog.locator('#proposal-review-status')).toBeHidden();
+    await expect(pair.getByRole('button',{name:'Fixed'})).toBeDisabled();
+    expect(traffic.editorial).toEqual([]);
+    for(const width of [1280,390]) {
+      await page.setViewportSize({width,height:844});
+      await page.locator('html').evaluate(node=>{node.dataset.theme='dark';});
+      await expect(edit).toBeInViewport();
+      await dialog.screenshot({path:testInfo.outputPath(`anonymous-proposal-${width}.png`)});
+    }
+    await dialog.getByRole('button',{name:'Close'}).click();
+    await page.locator('#llm-provider').selectOption('mistral');
+    await trigger.click();
+    await page.locator('#llm-prompt-finished').click();
+    const review=page.getByRole('dialog',{name:'Review candidate page pairs'});
+    await expect(review.locator('.review-row')).toHaveCount(1);
+    await expect(review.locator('#review-dialog-status')).toBeHidden();
+    await expect(review.getByRole('button',{name:'Fixed'})).toBeDisabled();
+  });
 });
 
 test('editorial preparation, dialog cleanup and persistent shared review', async ({page, site, traffic},testInfo) => {
