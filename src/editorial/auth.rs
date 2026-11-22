@@ -225,11 +225,12 @@ fn auth_redirect(
 async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewResult<Response> {
     let action = request.uri().path().rsplit('/').next().unwrap_or("");
     if action == "session" && request.method() == Method::GET {
-        return Ok(response(
-            StatusCode::OK,
-            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?,
-                "proposals": app.proposals.as_ref().map(ProposalService::mode)}),
-        ));
+        let mut session =
+            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?});
+        if let Some(proposals) = &app.proposals {
+            session["proposals"] = json!(proposals.mode());
+        }
+        return Ok(response(StatusCode::OK, session));
     }
     let config = app.oauth.as_ref().ok_or_else(|| {
         ReviewError::new(
