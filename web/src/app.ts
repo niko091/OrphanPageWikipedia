@@ -372,9 +372,13 @@ function candidateCards() {
     const card=element('article',null,'candidate-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');
     header.append(cardTitle('h3',page.title,pageLanguage(page)),element('span',count==null?'—':number(count),'candidate-badge'));
-    body.append(header,element('p',label(page),'candidate-category'),element('p',count==null?t('Dati non disponibili'):t('{n} pagine candidate',{n:number(count)}),'candidate-hint'));
-    const reviewed=(record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[]).filter(id=>closedEdge(page,id)).length;
-    if(reviewed)body.append(element('p',t('{n} coppie segnate come Fixato o Bad link, escluse dai prompt.',{n:number(reviewed)}),'candidate-hint'));
+    const hint=element('p',null,'candidate-hint');
+    if(count==null)hint.textContent=t('Dati non disponibili');
+    else {
+      const reviewed=(record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[]).filter(id=>closedEdge(page,id)).length;
+      hint.append(element('strong',number(reviewed)),'/',element('strong',number(count)),' ',t('pagine valutate'));
+    }
+    body.append(header,element('p',label(page),'candidate-category'),hint);
     const footer=element('div',null,'candidate-footer'),connect=element('a',t('Connetti'),'connect-button');
     connect.href=`connections.html?dataset=${encodeURIComponent(datasetFile)}&page=${encodeURIComponent(page.page_id)}`;
     if(data.metadata.kind==='aggregate') connect.href+=`&language=${encodeURIComponent(pageLanguage(page))}`;

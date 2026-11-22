@@ -574,6 +574,9 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   });
   await open(page, site, 'deorphanize.html');
   expect(traffic.editorial).toEqual([]);
+  const counts=page.locator('#candidate-cards .candidate-card')
+    .filter({has:page.getByRole('heading',{name:title(1),exact:true})}).locator('.candidate-hint');
+  await expect(counts).toHaveText(['0/1 pagine valutate']);
   await page.locator('#llm-provider').selectOption('mistral');
   expect(traffic.editorial).toEqual([]);
   await page.locator('#candidate-cards button.fix-link').first().click();
@@ -637,6 +640,12 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await expect(reviewDialog.getByRole('tooltip')).toHaveCount(0);
   await reviewDialog.screenshot({path:testInfo.outputPath('review-fixed-390-dark.png')});
   await page.locator('#review-close').click();
+  await page.locator('#candidate-search').fill(title(1));
+  await expect(counts).toHaveText(['1/1 pagine valutate']);
+  await page.locator('#ui-language-toggle').click();
+  await expect(counts).toHaveText(['1/1 pages reviewed']);
+  await expect(counts.locator('strong')).toHaveText(['1','1']);
+  await page.locator('#ui-language-toggle').click();
   await open(page, site, 'connections.html');
   await expect(page.locator('#connection-candidates .review-badge')).toHaveCount(0);
   await page.locator('#connection-reviewed').click();
