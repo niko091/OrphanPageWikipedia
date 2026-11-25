@@ -277,13 +277,18 @@ test('continuity shows individual months and a complete overflow category',async
     await expect(chart.locator('svg rect')).toHaveCount(28);
     await expect(chart.locator('svg rect[aria-label*="· 1 Mesi"]')).toHaveCount(2);
     await expect(chart.locator('svg rect[aria-label*="· 2 Mesi"]')).toHaveCount(2);
-    const bounds=await chart.boundingBox();assert(bounds);
-    const labels=await chart.locator('svg text').evaluateAll(nodes=>nodes.map(node=>{
-      const rect=node.getBoundingClientRect();return {left:rect.left,right:rect.right};
-    }));
+    const {bounds,labels}=await chart.evaluate(node=>{
+      const bounds=node.getBoundingClientRect();
+      const labels=Array.from(node.querySelectorAll('svg text'),label=>{
+        const rect=label.getBoundingClientRect();
+        return {left:rect.left,right:rect.right};
+      });
+      return {bounds:{left:bounds.left,right:bounds.right},labels};
+    });
+    expect(labels.length).toBeGreaterThan(0);
     for(const label of labels) {
-      expect(label.left).toBeGreaterThanOrEqual(bounds.x-1);
-      expect(label.right).toBeLessThanOrEqual(bounds.x+bounds.width+1);
+      expect(label.left).toBeGreaterThanOrEqual(bounds.left-1);
+      expect(label.right).toBeLessThanOrEqual(bounds.right+1);
     }
     await chart.screenshot({path:testInfo.outputPath(`continuity-${width}-${theme}.png`)});
   }
@@ -307,8 +312,12 @@ test('orphan votes preview before login, survive a successful login and toggle o
   await page.route('**/api/auth/login?*',route=>{
     const returnTo=new URL(route.request().url()).searchParams.get('return_to');
     assert(returnTo);
+    const callback=new URL(returnTo,site);
+    assert.equal(callback.origin,site);
     signedIn=loginSucceeds;
-    return route.fulfill({status:303,headers:{location:new URL(returnTo,site).href}});
+    // WebKit cannot intercept a navigation with a synthetic redirect response.
+    const destination=JSON.stringify(callback.href).replaceAll('<','\\u003c');
+    return route.fulfill({contentType:'text/html',body:`<script>location.replace(${destination})</script>`});
   });
   await page.route('**/api/auth/logout',route=>{
     signedIn=false;
