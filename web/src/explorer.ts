@@ -5,6 +5,7 @@ import {canonicalJSON,validateDataset} from './datasets.js';
 import {isRecord} from './validation.js';
 import {editorialReviews} from './editorial.js';
 export type RemoteKind='articles'|'cards'|'creators';
+export const DEFAULT_CARD_ORDER='length-desc';
 const listPageSize=(kind: RemoteKind)=>kind==='cards'?16:25;
 export interface CardVote {
   stars: number | null;
@@ -112,7 +113,7 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     category:kind==='articles'&&field('article-classification')==='macro'?field('article-macro'):kind==='creators'?'':field((prefix+'-category') as keyof UIElements),
     classification:kind==='articles'?field('article-classification')||'categories':'categories',
     group:kind==='articles'?field('article-group')||'orphans':'orphans',
-    order:field((prefix+'-sort') as keyof UIElements)||(kind==='cards'?'candidates-desc':kind==='creators'?'orphans-desc':'title-asc'),
+    order:field((prefix+'-sort') as keyof UIElements)||(kind==='cards'?DEFAULT_CARD_ORDER:kind==='creators'?'orphans-desc':'title-asc'),
     show_disambiguation:kind==='cards'&&Boolean($('candidate-show-disambiguation')?.checked),
     show_redirects:kind==='cards'&&Boolean($('candidate-show-redirects')?.checked),
     show_without_connections:kind==='cards'&&Boolean($('candidate-show-without-connections')?.checked),

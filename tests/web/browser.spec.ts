@@ -330,7 +330,8 @@ test('orphan cards show three stars above two and send the displayed ranking whe
     return route.fulfill({json:{stars:body.stars}});
   });
   await open(page,site,'deorphanize.html');
-  await page.locator('#candidate-sort').selectOption('length-desc');
+  await expect(page.locator('#candidate-sort')).toHaveValue('length-desc');
+  await expect(card.locator('.candidate-title')).toHaveText(title(32));
   await page.locator('#candidate-more').click();
   await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('2');
   const targetId=Number(new URL(await card.locator('.connect-button').getAttribute('href')??'',site).searchParams.get('page'));
@@ -460,6 +461,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await expect(page.locator('#llm-provider option')).toHaveText(['QWEN (LiftWing)',...manualLlmOptions]);
     await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
     expect(submissions).toEqual([]);
+    await page.locator('#candidate-search').fill(title(1));
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})});
     const trigger=card.getByRole('button',{name:'Fix this',exact:true});
     await expect(card.locator('.candidate-footer .connect-button')).toHaveText('Connetti');
@@ -502,6 +504,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await expect(skipped.locator('.review-reason')).toBeVisible();
     await page.locator('#proposal-close').click();
     await open(page,site,'deorphanize.html');
+    await page.locator('#candidate-search').fill(title(1));
     await trigger.click();
     await expect(pairs).toHaveCount(1);
     expect(submissions.at(-1)).toMatchObject({source_ids:[33]});
@@ -519,6 +522,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     });
     await open(page,site,'deorphanize.html');
     await page.locator('#ui-language-toggle').click();
+    await page.locator('#candidate-search').fill(title(2));
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(2),exact:true})});
     await card.getByRole('button',{name:'Fix this',exact:true}).click();
     await expect(page.locator('#proposal-status')).toContainText('Suggestions are temporarily unavailable');
@@ -564,6 +568,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await open(page,site,'deorphanize.html');
     await page.locator('#ui-language-toggle').click();
     await expect(page.locator('#llm-provider option').first()).toHaveText('QWEN (LiftWing)');
+    await page.locator('#candidate-search').fill(title(3));
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(3),exact:true})});
     const trigger=card.getByRole('button',{name:'Fix this',exact:true});
     await trigger.click();
@@ -664,12 +669,14 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   });
   await open(page, site, 'deorphanize.html');
   expect(traffic.editorial).toEqual([]);
-  const counts=page.locator('#candidate-cards .candidate-card')
-    .filter({has:page.getByRole('heading',{name:title(1),exact:true})}).locator('.candidate-hint');
+  await page.locator('#candidate-search').fill(title(1));
+  const card=page.locator('#candidate-cards .candidate-card')
+    .filter({has:page.getByRole('heading',{name:title(1),exact:true})});
+  const counts=card.locator('.candidate-hint');
   await expect(counts).toHaveText(['0/1 pagine valutate']);
   await page.locator('#llm-provider').selectOption('mistral');
   expect(traffic.editorial).toEqual([]);
-  await page.locator('#candidate-cards button.fix-link').first().click();
+  await card.locator('button.fix-link').click();
   await expect(page.locator('#llm-prompt')).toBeVisible();
   await expect(page.locator('#llm-prompt-copy')).toBeEnabled();
   expect(traffic.editorial).toHaveLength(4);

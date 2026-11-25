@@ -1,4 +1,4 @@
-import {createExplorer} from './explorer.js';
+import {createExplorer, DEFAULT_CARD_ORDER} from './explorer.js';
 import {wikimediaAPI} from './wikimedia.js';
 import {configureProfile,clearProfileCache,recentWikipediaEdits,readProfileTopics} from './profile.js';
 import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, referenceCount, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink, submitProposals} from './editorial.js';
@@ -97,7 +97,7 @@ function clearProfile() {
   if($('profile-status'))$('profile-status')!.textContent='';
   if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
   if($('profile-apply'))$('profile-apply')!.disabled=false;
-  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value=DEFAULT_CARD_ORDER;
 }
 async function authRequest(action: 'session' | 'logout'): Promise<void> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
@@ -202,7 +202,7 @@ async function applyProfile() {
   profileController.abort();profileController=new AbortController();
   const button=$('profile-apply')!;button.disabled=true;
   $('profile-sort-option')!.disabled=true;
-  if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+  if($('candidate-sort')!.value==='personalized')$('candidate-sort')!.value=DEFAULT_CARD_ORDER;
   $('profile-status')!.textContent=t('Caricamento delle ultime 100 modifiche nelle Wikipedie analizzate…');
   try {
     const edits=await recentWikipediaEdits(authUsername??$('profile-username')!.value.trim(),profileController.signal,
@@ -571,7 +571,7 @@ async function load(entry: ManifestEntry) {
   if($('profile-apply'))$('profile-apply')!.disabled=deorphanizePage;
   if($('dataset-date'))$('dataset-date')!.disabled=false;
   if($('profile-sort-option'))$('profile-sort-option')!.disabled=true;
-  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value='candidates-desc';
+  if($('candidate-sort')?.value==='personalized')$('candidate-sort')!.value=DEFAULT_CARD_ORDER;
   setConnectionCopyRequest(null);
   if($('connection-copy-prompt')!)$('connection-copy-prompt')!.disabled=true;
   document.body.dataset.loading='true';
