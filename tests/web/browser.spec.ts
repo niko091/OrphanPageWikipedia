@@ -10,6 +10,8 @@ import type {Page, TestInfo} from '@playwright/test';
 
 import {root,executable,title,record,env,prepareSite} from './fixture.ts';
 
+const manualLlmOptions=['ChatGPT','Gemini','Claude','Qwen','Kimi','GLM','Mistral','Altro'];
+
 async function stop(server: ChildProcess): Promise<void> {
   if (server.exitCode !== null || server.signalCode !== null) return;
   await new Promise<void>(resolve => {
@@ -386,6 +388,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       if(new URL(request.url()).pathname==='/api/editorial/proposals')submissions.push(request.postDataJSON());
     });
     await open(page,site,'deorphanize.html');
+    await expect(page.locator('#llm-provider option')).toHaveText(['QWEN (LiftWing)',...manualLlmOptions]);
     await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
     expect(submissions).toEqual([]);
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(1),exact:true})});
@@ -491,6 +494,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     });
     await open(page,site,'deorphanize.html');
     await page.locator('#ui-language-toggle').click();
+    await expect(page.locator('#llm-provider option').first()).toHaveText('QWEN (LiftWing)');
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(3),exact:true})});
     const trigger=card.getByRole('button',{name:'Fix this',exact:true});
     await trigger.click();
@@ -703,6 +707,8 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
 });
 
 test('additional LLM providers retain their selection and expose plain chat links',async({page,site,traffic})=>{
+  await open(page,site,'deorphanize.html');
+  await expect(page.locator('#llm-provider option')).toHaveText(manualLlmOptions);
   for(const [provider,name,url] of [
     ['chatgpt','ChatGPT','https://chatgpt.com/'],
     ['claude','Claude','https://claude.ai/'],

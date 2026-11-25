@@ -13,13 +13,13 @@ import {calculateReport, setCalculator} from './reports.js';
 
 declare const nativeModuleUrl: string;
 const llmProviders: Record<string, Provider> = {
+  chatgpt:{name:'ChatGPT',url:'https://chatgpt.com/'},
+  gemini:{name:'Gemini',url:'https://gemini.google.com/'},
+  claude:{name:'Claude',url:'https://claude.ai/'},
   qwen:{name:'Qwen',url:'https://chat.qwen.ai/'},
   kimi:{name:'Kimi',url:'https://www.kimi.ai/'},
   glm:{name:'GLM',url:'https://chat.z.ai/'},
   mistral:{name:'Mistral',url:'https://chat.mistral.ai/chat'},
-  chatgpt:{name:'ChatGPT',url:'https://chatgpt.com/'},
-  claude:{name:'Claude',url:'https://claude.ai/'},
-  gemini:{name:'Gemini',url:'https://gemini.google.com/'},
   other:{name:'Altro',url:null}
 };
 const liftWingKey='lift-wing',manualProviderKeys=Object.keys(llmProviders);
@@ -112,7 +112,7 @@ async function authRequest(action: 'session' | 'logout'): Promise<void> {
     if(deorphanizePage&&action==='session') {
       const mode=payload.proposals==='live'||payload.proposals==='preview'?payload.proposals:undefined;
       if(mode!==llmProviders[liftWingKey]?.proposals) {
-        if(mode)llmProviders[liftWingKey]={name:'Wikimedia (Lift Wing)',url:null,proposals:mode};
+        if(mode)llmProviders[liftWingKey]={name:'QWEN (LiftWing)',url:null,proposals:mode};
         else delete llmProviders[liftWingKey];
         llmProvider=readPreference(llmPreference(),mode?liftWingKey:'qwen',Object.keys(llmProviders));
         populateLlmProviders();
@@ -623,7 +623,8 @@ function renderCharts() {
 }
 function populateLlmProviders() {
   const select=$('llm-provider');if(!select)return;
-  select.replaceChildren(...Object.entries(llmProviders).map(([key,provider])=>new Option(t(provider.name),key)));
+  const keys=llmProviders[liftWingKey]?[liftWingKey,...manualProviderKeys]:manualProviderKeys;
+  select.replaceChildren(...keys.map(key=>new Option(t(llmProviders[key].name),key)));
   select.value=llmProvider;
 }
 let lastError: Error | null = null;
