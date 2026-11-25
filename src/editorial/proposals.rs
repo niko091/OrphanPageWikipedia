@@ -305,6 +305,8 @@ struct Skipped {
 struct Proposal {
     #[serde(flatten)]
     edit: Edit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reading_section: Option<String>,
     reference_language: String,
     reference_title: String,
     source_revision_id: Option<u64>,
@@ -312,12 +314,22 @@ struct Proposal {
 }
 
 impl Proposal {
-    fn new(edit: Edit, candidate: &Candidate, articles: &Articles<'_>) -> Self {
+    fn new(mut edit: Edit, candidate: &Candidate, articles: &Articles<'_>) -> Self {
+        let local = articles.get(&candidate.local);
+        edit.reading_text = edit
+            .reading_text
+            .take()
+            .filter(|text| local.is_some_and(|doc| valid_reading_text(&edit, text, &doc.wikitext)));
+        let reading_section = local
+            .filter(|_| edit.reading_text.is_some())
+            .and_then(|doc| reading_section(&doc.wikitext, &edit.anchor))
+            .map(str::to_owned);
         Self {
             edit,
+            reading_section,
             reference_language: candidate.reference.language.clone(),
             reference_title: candidate.reference.title.clone(),
-            source_revision_id: articles.get(&candidate.local).map(|d| d.revision_id),
+            source_revision_id: local.map(|doc| doc.revision_id),
             reference_revision_id: articles.get(&candidate.reference).map(|d| d.revision_id),
         }
     }
@@ -343,6 +355,8 @@ struct Edit {
     anchor: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     link_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reading_text: Option<String>,
     wikitext: Option<String>,
 }
 
@@ -375,6 +389,7 @@ fn preview(selection: &Selection) -> Generation {
                 }
                 .into(),
                 link_text: None,
+                reading_text: None,
                 wikitext: Some(format!("{text} con [[{}]].", selection.target.title)),
             },
             candidate,
@@ -561,7 +576,7 @@ Prefer ADD LINK on the shortest complete existing unlinked name or term identify
 Otherwise propose only a small, useful addition supported by the supplied sources. Use BEFORE, AFTER or REPLACE in an existing passage, list, table or local template invocation. Preserve citations, named refs and structure. Do not add sections, invent local template parameters, modify shared templates or cite Wikipedia as a new reference. For REPLACE return the entire changed local block. All non-ADD LINK wikitext must be in the local article language, actually change the local text and include a wikilink to the supplied target.
 An existing section can take its first list entry even if its body is empty. In a calendar article, if the evidence confirms the person, event type and exact day/month, a short list entry under the appropriate existing events, births or deaths heading is a valid edit without a prior local mention. Use AFTER with the exact wikitext of that heading, including the equals signs. Supply only the new list entry with its target link, without reproducing the heading. Include a year or description only if supported by the supplied text.
 For that calendar case, a linked year and person in the corresponding reference date page's births or deaths list is direct evidence of the entry. Corroborate it with the biographies when they give the date. A blank local heading is available for insertion. Keep the list entry minimal.
-For each proposal provide the numeric source_id and a unique verbatim single-line Ctrl+F anchor in local X. Check anchors against the actual wikitext, including whitespace. Return only a JSON object like {"proposals":[{"source_id":123,"action":"ADD LINK","anchor":"Existing context with Example","link_text":"Example","wikitext":null},{"source_id":124,"action":"AFTER","anchor":"== Deaths ==","wikitext":"* 1901 – [[Example Person]]"}],"skipped":[{"source_id":456,"reason":"insufficient_evidence"}]}. For BEFORE/AFTER/REPLACE omit link_text. Provide one outcome per candidate, in the supplied order. For a skip, use only insufficient_evidence, no_placement or already_linked. An empty proposals array is valid."#;
+For each proposal provide the numeric source_id and a unique verbatim single-line anchor in local X. Check anchors against the actual wikitext, including whitespace. For a reading link also provide reading_text, a unique verbatim part of anchor that readers can see at the edit location and that contains link_text for ADD LINK. Prefer a plain-text anchor when possible. For a heading, use the visible title without the equals signs as reading_text. Omit reading_text for source-only locations or when the quote is ambiguous or depends on template expansion. Return only a JSON object like {"proposals":[{"source_id":123,"action":"ADD LINK","anchor":"Existing context with Example","link_text":"Example","reading_text":"Existing context with Example","wikitext":null},{"source_id":124,"action":"AFTER","anchor":"== Deaths ==","reading_text":"Deaths","wikitext":"* 1901 – [[Example Person]]"}],"skipped":[{"source_id":456,"reason":"insufficient_evidence"}]}. For BEFORE/AFTER/REPLACE omit link_text. Provide one outcome per candidate, in the supplied order. For a skip, use only insufficient_evidence, no_placement or already_linked. An empty proposals array is valid."#;
 
 fn package(selection: &Selection, group: &[&Candidate], docs: &Articles<'_>) -> String {
     let articles: BTreeSet<_> = std::iter::once(&selection.target)
@@ -792,6 +807,51 @@ fn is_heading(line: &str) -> bool {
     line.starts_with('=') && line.ends_with('=') && !line.trim_matches('=').trim().is_empty()
 }
 
+fn valid_reading_text(edit: &Edit, text: &str, local: &str) -> bool {
+    !text.is_empty()
+        && text == text.trim()
+        && !text.chars().any(char::is_control)
+        && !text.contains(['[', ']', '{', '}', '<', '>', '|'])
+        && !text.contains("''")
+        && edit.anchor.contains(text)
+        && local.match_indices(text).take(2).count() == 1
+        && (!matches!(edit.action, Action::AddLink)
+            || text.contains(edit.link_text.as_deref().unwrap_or(&edit.anchor)))
+}
+
+fn reading_section<'a>(local: &'a str, anchor: &str) -> Option<&'a str> {
+    fn plain_heading(line: &str) -> Option<&str> {
+        let line = line.trim_end();
+        let start = line.len() - line.trim_start_matches('=').len();
+        let end = line.len() - line.trim_end_matches('=').len();
+        if !(1..=6).contains(&start) || start != end || start + end >= line.len() {
+            return None;
+        }
+        let name = line[start..line.len() - end].trim();
+        name.split(' ')
+            .all(|word| !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || c == '-'))
+            .then_some(name)
+    }
+
+    let offset = local.find(anchor)?;
+    let line_end = local[offset..]
+        .find('\n')
+        .map_or(local.len(), |end| offset + end);
+    let heading = local[..line_end]
+        .lines()
+        .rev()
+        .find(|line| is_heading(line))?;
+    let name = plain_heading(heading)?;
+    (local
+        .lines()
+        .filter_map(plain_heading)
+        .filter(|heading| *heading == name)
+        .take(2)
+        .count()
+        == 1)
+        .then_some(name)
+}
+
 fn reference_link_context(text: &str, target: &str) -> Vec<Value> {
     let mut heading = None;
     let mut matches = Vec::new();
@@ -990,9 +1050,18 @@ mod tests {
             action: Action::After,
             anchor: "== Morte ==".into(),
             link_text: None,
+            reading_text: Some("Morte".into()),
             wikitext: Some("* 1954 – [[Example Person]]".into()),
         };
         assert_eq!(check_edit(&edit, local, "Example Person"), Ok(()));
+        assert!(valid_reading_text(&edit, "Morte", local));
+        assert_eq!(reading_section(local, &edit.anchor), Some("Morte"));
+        assert_eq!(
+            reading_section("== Morte ==\n== Morte ==\nEsempio", "Esempio"),
+            None
+        );
+        assert!(!valid_reading_text(&edit, "Morte", "== Morte ==\nMorte"));
+        assert!(!valid_reading_text(&edit, "Nascite", local));
         edit.wikitext = Some("== Morte illustri ==\n* 1954 – [[Example Person]]".into());
         assert_eq!(
             check_edit(&edit, local, "Example Person"),
@@ -1007,6 +1076,7 @@ mod tests {
             action: Action::AddLink,
             anchor: "Example Person".into(),
             link_text: None,
+            reading_text: None,
             wikitext: None,
         };
         let local = "In 1954, Example Person died.\nA book by Example Person.";
@@ -1049,7 +1119,7 @@ mod tests {
                             "vec" => {
                                 assert_eq!(query["pageids"],"1|2|3|4");
                                 vec![wiki_page(1,"Bersaglio","La voce bersaglio."),
-                                    wiki_page(2,"Fonte locale","Il sentiero attraversa Bersaglio."),
+                                    wiki_page(2,"Fonte locale","== Percorso ==\nIl sentiero attraversa Bersaglio."),
                                     wiki_page(3,"Altra fonte","Il lago alimenta il fiume."),
                                     wiki_page(4,"Fonte lunga",&"Testo della fonte. ".repeat(2000))]
                             }
@@ -1075,7 +1145,7 @@ mod tests {
                     assert_eq!(prompt["candidates"].as_array().unwrap().len(),2);
                     assert!(prompt["documents"].as_array().unwrap().iter().any(|doc| doc["revision"]["wikitext"]=="[[Bersaj]]"));
                     let edits=json!({"proposals":[
-                        {"source_id":2,"action":"ADD LINK","anchor":"Bersaglio","wikitext":null},
+                        {"source_id":2,"action":"ADD LINK","anchor":"Il sentiero attraversa Bersaglio","link_text":"Bersaglio","reading_text":"Il sentiero attraversa Bersaglio","wikitext":null},
                         {"source_id":3,"action":"AFTER","anchor":"Il lago","wikitext":"Testo senza collegamento."},
                         {"source_id":99,"action":"ADD LINK","anchor":"Bersaglio","wikitext":null}
                     ]});
@@ -1106,6 +1176,9 @@ mod tests {
             assert_eq!(result.proposals.len(),1);
             assert_eq!(result.proposals[0].source_revision_id,Some(102));
             assert_eq!(result.proposals[0].reference_revision_id,Some(120));
+            let proposal=json!(&result.proposals[0]);
+            assert_eq!(proposal["reading_text"],"Il sentiero attraversa Bersaglio");
+            assert_eq!(proposal["reading_section"],"Percorso");
             server.abort();
         });
     }

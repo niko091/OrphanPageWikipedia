@@ -279,6 +279,9 @@ await test('prompt preparation is click-only, deduplicated, Wikipedia-only and b
   editorial.setConnectionCopyRequest(prepared);await editorial.copyConnectionPrompt();
   assert.equal(contentCalls,4);assert.equal(node('llm-prompt').open,true);assert.equal(node('llm-prompt-copy').disabled,false);
   const text=node('llm-prompt-text').value;assert(text.includes(articleText));assert(!text.includes('UNREADABLE'));
+  assert.match(text,/\| Stringa da inserire \/ ADD LINK \| Passaggio da modificare \|/);
+  assert.match(text,/Column 4: use \[Vai al passaggio\]\(<LOCAL_X_URL#:~:text=encodedQuote>\)/);
+  assert.match(text,/For a source-only location .*inline code in column 4/);
   assert.equal((text.match(/^DOCUMENT D\d+/gm)||[]).length,4);assert.equal(node('llm-prompt-open').href,'https://chat.qwen.ai/');
   await editorial.copyPrompt();assert.equal(copied.at(-1),text);assert.equal(storage.size,0);
   editorial.closePrompt();assert.equal(node('llm-prompt-text').value,'');assert.equal(node('llm-prompt').open,false);

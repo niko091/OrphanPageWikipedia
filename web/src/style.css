@@ -508,7 +508,7 @@ dialog textarea {
   overflow-wrap: anywhere;
 }
 
-.proposal-table td:last-child {
+.proposal-table .proposal-wikitext {
   inline-size: 36%;
 }
 

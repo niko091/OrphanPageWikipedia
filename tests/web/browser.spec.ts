@@ -400,6 +400,9 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     const suggested=pairs.filter({has:page.getByRole('link',{name:title(33),exact:true})});
     await expect(suggested.locator('p:first-child + .review-proposal table tbody tr')).toHaveCount(1);
     await expect(suggested.getByRole('table')).toContainText(`[[${title(1)}]]`);
+    await expect(suggested.getByRole('columnheader').last()).toHaveText('Passaggio da modificare');
+    await expect(suggested.getByRole('cell').last()).toContainText('Cerca nel wikitesto');
+    await expect(suggested.getByRole('link',{name:'Vai al passaggio'})).toHaveCount(0);
     await expect(suggested.getByRole('link',{name:'Modifica su Wikipedia'})).toHaveCount(0);
     const skipped=pairs.filter({has:page.getByRole('link',{name:title(34),exact:true})});
     await expect(skipped.locator('p').nth(1)).toHaveText('Il modello non ha individuato un punto d’inserimento adatto.');
@@ -470,6 +473,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
   });
 
   previewTest('opens the editor for a single proposed edit without signing in', async ({page,site,traffic},testInfo) => {
+    let addLink=false;
     await page.route('**/api/auth/session',route=>route.fulfill({json:{enabled:true,username:null,proposals:'live'}}));
     await page.route('**/api/editorial/proposals',async route=>{
       const response=await route.fetch();
@@ -479,7 +483,11 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       assert(Array.isArray(body.proposals)&&body.proposals.length===1);
       const proposal: unknown=body.proposals[0];
       assert(record(proposal));
-      await route.fulfill({response,json:{...body,preview:false,proposals:[{...proposal,source_revision_id:1035,reference_revision_id:2035}]}});
+      const anchor=addLink?'Nel 1954, Città era qui':'Città, ieri - oggi';
+      const edit=addLink?{action:'ADD LINK',link_text:'Città',wikitext:null}:{};
+      await route.fulfill({response,json:{...body,preview:false,proposals:[{
+        ...proposal,...edit,anchor,reading_text:anchor,reading_section:'Storia locale',source_revision_id:1035,reference_revision_id:2035,
+      }]}});
     });
     await open(page,site,'deorphanize.html');
     await page.locator('#ui-language-toggle').click();
@@ -490,6 +498,10 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     const pair=dialog.locator('.review-row');
     await expect(pair).toHaveCount(1);
     await expect(pair.getByRole('table')).toContainText(`[[${title(3)}]]`);
+    await expect(pair.getByRole('columnheader').last()).toHaveText('Passage to edit');
+    const passage=pair.getByRole('cell').last().getByRole('link',{name:'Go to passage'});
+    await expect(passage).toHaveAttribute('href','https://vec.wikipedia.org/wiki/Voce_sintetica_035#Storia_locale:~:text=Citt%C3%A0%2C%20ieri%20%2D%20oggi');
+    await expect(passage).toHaveAttribute('target','_blank');
     const edit=pair.getByRole('link',{name:'Edit on Wikipedia'});
     await expect(edit).toHaveAttribute('href','https://vec.wikipedia.org/w/index.php?title=Voce_sintetica_035&action=edit');
     await expect(edit).toHaveAttribute('target','_blank');
@@ -503,6 +515,11 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       await expect(edit).toBeInViewport();
       await dialog.screenshot({path:testInfo.outputPath(`anonymous-proposal-${width}.png`)});
     }
+    await dialog.getByRole('button',{name:'Close'}).click();
+    addLink=true;
+    await trigger.click();
+    await expect(passage).toHaveAttribute('href','https://vec.wikipedia.org/wiki/Voce_sintetica_035#Storia_locale:~:text=Nel%201954%2C-,Citt%C3%A0,-era%20qui');
+    await expect(pair.getByRole('cell').nth(1)).toContainText('Text to link Città');
     await dialog.getByRole('button',{name:'Close'}).click();
     await page.locator('#llm-provider').selectOption('mistral');
     await trigger.click();
