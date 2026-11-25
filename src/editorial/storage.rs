@@ -1,4 +1,11 @@
-use super::*;
+use super::{votes::VoteContext, *};
+
+const VOTE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS orphan_votes (
+    user_id BIGINT NOT NULL, language VARCHAR(20) NOT NULL, target_id BIGINT NOT NULL,
+    stars SMALLINT NOT NULL CHECK (stars BETWEEN 1 AND 5), voted_at VARCHAR(32) NOT NULL,
+    dataset VARCHAR(255) NOT NULL, sort_order VARCHAR(32) NOT NULL,
+    list_page BIGINT NOT NULL, page_position BIGINT NOT NULL,
+    PRIMARY KEY (user_id, language, target_id))";
 
 #[derive(Clone)]
 pub enum ReviewDatabase {
@@ -53,8 +60,8 @@ impl ReviewDatabase {
         ))
     }
 
-    pub(super) fn connect(&self) -> ReviewResult<Storage> {
-        let mut storage = match self {
+    fn open(&self) -> ReviewResult<Storage> {
+        Ok(match self {
             Self::Sqlite(path) => {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent).map_err(|_| ReviewError::unavailable())?;
@@ -75,7 +82,17 @@ impl ReviewDatabase {
                     "Configurare ToolsDB per le valutazioni su Toolforge",
                 ))
             }
-        };
+        })
+    }
+
+    pub(super) fn connect_votes(&self) -> ReviewResult<Storage> {
+        let mut storage = self.open()?;
+        storage.execute(VOTE_SCHEMA, &[])?;
+        Ok(storage)
+    }
+
+    pub(super) fn connect(&self) -> ReviewResult<Storage> {
+        let mut storage = self.open()?;
         let schema = if matches!(storage, Storage::Mysql(_)) {
             SCHEMA.replace(
                 "reviewer VARCHAR(255)",
@@ -139,6 +156,67 @@ pub(super) enum Storage {
 }
 
 impl Storage {
+    pub(super) fn votes(
+        &mut self,
+        user_id: u64,
+        language: &str,
+        ids: &[u64],
+    ) -> ReviewResult<BTreeMap<u64, u8>> {
+        let markers = vec!["?"; ids.len()].join(",");
+        let sql = format!("SELECT target_id, stars FROM orphan_votes WHERE user_id=? AND language=? AND target_id IN ({markers})");
+        let mut values = vec![user_id.into(), language.into()];
+        values.extend(ids.iter().copied().map(SqlValue::from));
+        match self {
+            Self::Sqlite(db) => {
+                let mut statement = db.prepare(&sql).map_err(|_| ReviewError::unavailable())?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params_from_iter(Self::sqlite_parameters(&values)),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| ReviewError::unavailable())?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(|_| ReviewError::unavailable())
+            }
+            Self::Mysql(db) => {
+                let rows: Vec<(u64, u8)> = db
+                    .exec(&sql, Self::mysql_parameters(&values))
+                    .map_err(|_| ReviewError::unavailable())?;
+                Ok(rows.into_iter().collect())
+            }
+        }
+    }
+
+    pub(super) fn save_vote(
+        &mut self,
+        user_id: u64,
+        context: &VoteContext,
+        stars: u8,
+    ) -> ReviewResult<()> {
+        let now: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
+        let voted_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let values = [
+            user_id.into(),
+            context.language.as_str().into(),
+            context.target_id.into(),
+            u64::from(stars).into(),
+            voted_at.as_str().into(),
+            context.dataset.as_str().into(),
+            context.sort_order.as_str().into(),
+            context.list_page.into(),
+            context.page_position.into(),
+        ];
+        let insert = "INSERT INTO orphan_votes (user_id, language, target_id, stars, voted_at, dataset, sort_order, list_page, page_position) VALUES (?,?,?,?,?,?,?,?,?)";
+        let update = match self {
+            Self::Sqlite(_) => "ON CONFLICT (user_id, language, target_id) DO UPDATE SET stars=excluded.stars, voted_at=excluded.voted_at,
+                dataset=excluded.dataset, sort_order=excluded.sort_order, list_page=excluded.list_page, page_position=excluded.page_position",
+            Self::Mysql(_) => "ON DUPLICATE KEY UPDATE stars=VALUES(stars), voted_at=VALUES(voted_at),
+                dataset=VALUES(dataset), sort_order=VALUES(sort_order), list_page=VALUES(list_page), page_position=VALUES(page_position)",
+        };
+        self.execute(&format!("{insert} {update}"), &values)?;
+        Ok(())
+    }
+
     fn sqlite_parameters(values: &[SqlValue]) -> Vec<rusqlite::types::Value> {
         values
             .iter()

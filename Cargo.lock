@@ -1146,6 +1146,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustix",
  "serde",

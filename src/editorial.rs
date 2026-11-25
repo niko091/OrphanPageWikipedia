@@ -4,6 +4,7 @@ mod http;
 mod proposals;
 mod reviews;
 mod storage;
+mod votes;
 use auth::{auth, LoginSession, OAuthConfig};
 use axum::{
     body::{to_bytes, Body},
@@ -212,6 +213,7 @@ impl ReviewApplication {
         Router::new()
             .route("/api/reviews", any(api))
             .route("/api/pages", any(page_query))
+            .route("/api/orphan-votes", any(votes::handle))
             .route("/api/auth/{action}", any(auth))
             .route("/api/editorial/proposals", any(proposals::handle))
             .fallback(static_file)

@@ -5,6 +5,7 @@ pub(super) struct OAuthConfig {
     pub(super) client_id: String,
     pub(super) client_secret: String,
     pub(super) redirect_uri: reqwest::Url,
+    pub(super) vote_key: ring::hmac::Key,
 }
 
 impl OAuthConfig {
@@ -35,6 +36,11 @@ impl OAuthConfig {
             client_id,
             client_secret,
             redirect_uri,
+            vote_key: ring::hmac::Key::generate(
+                ring::hmac::HMAC_SHA256,
+                &ring::rand::SystemRandom::new(),
+            )
+            .map_err(|_| "Chiave per i voti non disponibile")?,
         })
     }
 
@@ -54,7 +60,7 @@ impl OAuthConfig {
         )
     }
 
-    fn identify(&self, code: &str) -> ReviewResult<String> {
+    fn identify(&self, code: &str) -> ReviewResult<WikimediaIdentity> {
         self.identify_at(
             code,
             "https://meta.wikimedia.org/w/rest.php/oauth2/access_token",
@@ -67,7 +73,7 @@ impl OAuthConfig {
         code: &str,
         token_url: &str,
         profile_url: &str,
-    ) -> ReviewResult<String> {
+    ) -> ReviewResult<WikimediaIdentity> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
@@ -95,7 +101,15 @@ impl OAuthConfig {
             .bearer_auth(token)
             .send()
             .map_err(|_| ReviewError::unavailable())?;
-        verified_username(&oauth_json(profile)?)
+        let profile = oauth_json(profile)?;
+        let user_id = profile["sub"]
+            .as_u64()
+            .or_else(|| profile["sub"].as_str()?.parse().ok())
+            .filter(|&id| valid_id(id));
+        Ok(WikimediaIdentity {
+            username: verified_username(&profile)?,
+            user_id,
+        })
     }
 }
 
@@ -128,9 +142,15 @@ pub(super) fn verified_username(profile: &Value) -> ReviewResult<String> {
         .ok_or_else(ReviewError::unavailable)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WikimediaIdentity {
+    pub(super) username: String,
+    pub(super) user_id: Option<u64>,
+}
+
 pub(super) struct LoginSession {
     pub(super) expires: std::time::Instant,
-    pub(super) username: Option<String>,
+    pub(super) identity: Option<WikimediaIdentity>,
     pub(super) state: String,
     pub(super) return_to: String,
 }
@@ -172,7 +192,7 @@ pub(super) fn return_page(value: &str) -> bool {
 }
 
 impl ReviewApplication {
-    fn session(&self, request: &Request) -> ReviewResult<Option<String>> {
+    pub(super) fn session(&self, request: &Request) -> ReviewResult<Option<WikimediaIdentity>> {
         let Some(key) = session_cookie(request) else {
             return Ok(None);
         };
@@ -183,18 +203,20 @@ impl ReviewApplication {
         sessions.retain(|_, session| session.expires > std::time::Instant::now());
         Ok(sessions
             .get(key)
-            .and_then(|session| session.username.clone()))
+            .and_then(|session| session.identity.clone()))
     }
     pub(super) fn reviewer(&self, request: &Request) -> ReviewResult<String> {
         if self.oauth.is_none() {
             return Ok(String::new());
         }
-        self.session(request)?.ok_or_else(|| {
-            ReviewError::new(
-                StatusCode::UNAUTHORIZED,
-                "Accedi con Wikipedia per salvare la valutazione",
-            )
-        })
+        self.session(request)?
+            .map(|identity| identity.username)
+            .ok_or_else(|| {
+                ReviewError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "Accedi con Wikipedia per salvare la valutazione",
+                )
+            })
     }
 }
 pub(super) async fn auth(State(app): State<Arc<ReviewApplication>>, request: Request) -> Response {
@@ -225,8 +247,7 @@ fn auth_redirect(
 async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewResult<Response> {
     let action = request.uri().path().rsplit('/').next().unwrap_or("");
     if action == "session" && request.method() == Method::GET {
-        let mut session =
-            json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?});
+        let mut session = json!({"enabled": app.oauth.is_some(), "username": app.session(&request)?.map(|identity| identity.username)});
         if let Some(proposals) = &app.proposals {
             session["proposals"] = json!(proposals.mode());
         }
@@ -330,7 +351,7 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
             key.clone(),
             LoginSession {
                 expires: std::time::Instant::now() + Duration::from_secs(600),
-                username: None,
+                identity: None,
                 state,
                 return_to: fields
                     .first()
@@ -363,7 +384,7 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
             let session = sessions
                 .get(cookie)
                 .filter(|session| {
-                    session.username.is_none()
+                    session.identity.is_none()
                         && session.state == state
                         && session.expires > std::time::Instant::now()
                 })
@@ -387,7 +408,7 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
             .filter(|code| !code.is_empty() && code.len() <= 4096)
             .ok_or_else(ReviewError::invalid)?;
         let configuration = config.clone();
-        let username = tokio::task::spawn_blocking(move || configuration.identify(&code))
+        let identity = tokio::task::spawn_blocking(move || configuration.identify(&code))
             .await
             .map_err(|_| ReviewError::unavailable())??;
         let key = random_key()?;
@@ -398,7 +419,7 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
                 key.clone(),
                 LoginSession {
                     expires: std::time::Instant::now() + Duration::from_secs(28800),
-                    username: Some(username),
+                    identity: Some(identity),
                     state: String::new(),
                     return_to: String::new(),
                 },

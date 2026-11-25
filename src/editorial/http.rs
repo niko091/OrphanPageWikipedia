@@ -8,6 +8,7 @@ pub(super) async fn page_query(
         return ReviewError::new(StatusCode::METHOD_NOT_ALLOWED, "Metodo non consentito")
             .into_response();
     }
+    let vote_session = super::votes::session(&app, &request).ok();
     let body = match to_bytes(request.into_body(), 8 * 1024 * 1024).await {
         Ok(body) => body,
         Err(_) => return ReviewError::invalid().into_response(),
@@ -19,8 +20,12 @@ pub(super) async fn page_query(
     match tokio::task::spawn_blocking(move || {
         // Ordering uses the review snapshot explicitly loaded by this browser;
         // filtering must not silently refresh shared workflow state.
-        crate::store::Census::open(&app.collection_database)
-            .and_then(|db| db.query(&query, &query.closed_pairs))
+        let mut result = crate::store::Census::open(&app.collection_database)?
+            .query(&query, &query.closed_pairs)?;
+        if let Some(session) = vote_session {
+            super::votes::attach(&app.database, &session, &query, &mut result);
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
     })
     .await
     {

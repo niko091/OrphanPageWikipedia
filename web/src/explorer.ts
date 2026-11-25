@@ -6,13 +6,20 @@ import {isRecord} from './validation.js';
 import {editorialReviews} from './editorial.js';
 export type RemoteKind='articles'|'cards'|'creators';
 const listPageSize=(kind: RemoteKind)=>kind==='cards'?16:25;
+export interface CardVote {
+  stars: number | null;
+  receipt: {context: string; signature: number[]};
+  saving?: Promise<void>;
+}
 interface RemoteList {
   key: string; offset: number; total: number; pages: PageObservation[]; creators: CreatorRow[];
   records: Record<string,CandidateRecord>; transports: Record<string,CardTransport>;
+  votes: Map<string,CardVote>;
 }
 
 interface ExplorerContext {
  readonly data: Dataset; readonly datasetFile: string; readonly loadVersion: number; readonly precomputed: DashboardSummaryData;
+ readonly authUsername: string | null;
  pageKey: (page: PageObservation) => string; hiddenTargetCategories: () => string[];
  creatorListInfo: (total:number,shown:number) => string; setCreators: (rows: CreatorRow[]) => void;
  abortCards: () => void; render: (kind: RemoteKind) => void; fail: (error: unknown) => void;
@@ -22,6 +29,26 @@ let remoteRendering=false,remoteController=new AbortController(),remoteVersion=0
 let remoteList: RemoteList | null=null,listHydration: Promise<void>=Promise.resolve();
 let remoteQueryKey='',remoteOffset=0,paginationFocus=false;
 let remoteProfileEdits: RecentEdit[]=[];
+const pendingVotes=new Set<Promise<void>>();
+
+function saveCardVote(key: string,vote: CardVote,stars: number): Promise<void> | undefined {
+  if(vote.saving||remoteList?.votes.get(key)!==vote||!context.authUsername)return;
+  const saving=(async()=>{
+    const response=await fetch('api/orphan-votes',{method:'POST',cache:'no-store',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(8000),
+      body:JSON.stringify({stars,receipt:vote.receipt})});
+    if(response.status===401)throw new Error('Accedi con Wikimedia per votare.');
+    if(!response.ok)throw new Error('Impossibile salvare il voto. Riprova.');
+    const result: unknown=await response.json();
+    if(!isRecord(result)||result.stars!==stars)throw new Error('Impossibile salvare il voto. Riprova.');
+    vote.stars=stars;
+  })();
+  vote.saving=saving;
+  pendingVotes.add(saving);
+  const finish=()=>{pendingVotes.delete(saving);delete vote.saving;};
+  void saving.then(finish,finish);
+  return saving;
+}
 function resetRemoteList() {
   ++remoteVersion;remoteController.abort();remoteList=null;remoteProfileEdits=[];
   remoteQueryKey='';remoteOffset=0;paginationFocus=false;
@@ -94,7 +121,7 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     closed_pairs:kind==='cards'?[...editorialReviews.values()].filter(review=>review.status==='fixed'||review.status==='bad_link').map(review=>[review.language,review.target_id,review.source_id]):[],
     edits:kind==='cards'&&field('candidate-sort')==='personalized'?remoteProfileEdits:[]};
   const queryKey=canonicalJSON([{...request,missing_category:'',missing_topics:'',empty_topics:''},kind==='cards'?[...editorialReviews.values()]:[]]);
-  const key=canonicalJSON([queryKey,uiLanguage]);
+  const key=canonicalJSON([queryKey,uiLanguage,kind==='cards'?context.authUsername:null]);
   if(queryKey!==remoteQueryKey){remoteQueryKey=queryKey;remoteOffset=0;paginationFocus=false;}
   const offset=remoteOffset;
   const more=$(prefix+'-more' as keyof UIElements) as HTMLButtonElement;
@@ -120,13 +147,17 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
   if(remoteList)listPagination(kind,remoteList,true);
   more.disabled=true;info.textContent=t('Caricamento…');
   try {
-    const response=await fetch('api/pages',{method:'POST',cache:'no-store',credentials:'omit',signal,
+    if(kind==='cards'&&pendingVotes.size) {
+      await Promise.allSettled(pendingVotes);
+      signal.throwIfAborted();
+    }
+    const response=await fetch('api/pages',{method:'POST',cache:'no-store',credentials:kind==='cards'?'same-origin':'omit',signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({...request,offset})});
     const payload: unknown=await response.json();
     if(signal.aborted||version!==remoteVersion||load!==context.loadVersion)return;
     if(!response.ok||!isRecord(payload)||payload.dataset!==context.datasetFile||payload.offset!==offset||
       !Number.isSafeInteger(payload.total)||Number(payload.total)<0)throw new Error('Indice degli articoli non valido');
-    const next: RemoteList={key,offset,total:0,pages:[],creators:[],records:{},transports:{}};
+    const next: RemoteList={key,offset,total:0,pages:[],creators:[],records:{},transports:{},votes:new Map()};
     next.total=Number(payload.total);
     if(kind==='creators') {
       if(payload.format!=='creator_results_v1'||!Array.isArray(payload.creators)||payload.creators.length>pageSize||
@@ -146,6 +177,17 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
       } else validateDataset(member);
       next.pages.push(...member.pages);Object.assign(next.records,member.link_candidates);Object.assign(next.transports,payload.card_transports);
       if(new Set(next.pages.map(context.pageKey)).size!==next.pages.length)throw new Error('Indice degli articoli non valido');
+      const voting=payload.orphan_voting;
+      if(kind==='cards'&&context.authUsername&&isRecord(voting)) {
+        for(const page of next.pages) {
+          const vote=voting[context.pageKey(page)];
+          if(isRecord(vote)&&(vote.stars===null||typeof vote.stars==='number'&&Number.isInteger(vote.stars)&&vote.stars>=1&&vote.stars<=5)&&
+            isRecord(vote.receipt)&&typeof vote.receipt.context==='string'&&Array.isArray(vote.receipt.signature)&&
+            vote.receipt.signature.length===32&&vote.receipt.signature.every(byte=>Number.isInteger(byte)&&byte>=0&&byte<=255)) {
+            next.votes.set(context.pageKey(page),{stars:vote.stars,receipt:{context:vote.receipt.context,signature:vote.receipt.signature}});
+          }
+        }
+      }
     }
     const loaded=kind==='creators'?next.creators.length:next.pages.length;
     if(loaded!==Math.min(pageSize,Math.max(0,next.total-offset)))throw new Error('Indice degli articoli non valido');
@@ -163,6 +205,7 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
   }
 }
 
-return {resetRemoteList,databaseList,stepListPage,get hydration(){return listHydration;},
+return {resetRemoteList,databaseList,stepListPage,saveCardVote,get hydration(){return listHydration;},
+ cardVote(key: string){return remoteList?.votes.get(key);},
  setProfileEdits(edits: RecentEdit[]){remoteProfileEdits=edits;}};
 }

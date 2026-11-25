@@ -339,7 +339,7 @@ fn default_order() -> String {
     "title-asc".into()
 }
 impl PageQuery {
-    fn page_size(&self) -> i64 {
+    pub(crate) fn page_size(&self) -> i64 {
         if self.kind == "cards" {
             16
         } else {

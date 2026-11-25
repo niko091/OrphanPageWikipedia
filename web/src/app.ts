@@ -357,6 +357,56 @@ function hiddenSuggestedLink(page: PageObservation,candidate: Candidate): boolea
     linkFilterActive('candidate-hide-link-names')&&nameIndexCategories.includes(normalized)||
     linkFilterActive('candidate-hide-link-redirects')&&(redirectOrphanCategories.has(folded)||softRedirectCategories.includes(normalized)));
 }
+function orphanRating(page: PageObservation) {
+  const key=pageKey(page),vote=authUsername?explorer.cardVote(key):undefined;
+  const group=element('div',null,'candidate-rating');
+  const status=element('p',null,'candidate-rating-status');
+  const label=t('Vota {title}',{title:page.title});
+  const reason=!authUsername?'Accedi con Wikimedia per votare.':!vote?'Votazione non disponibile.':'';
+  group.setAttribute('role','group');
+  group.setAttribute('aria-label',reason?label+'. '+t(reason):label);
+  if(reason)group.title=t(reason);
+  status.setAttribute('role','status');
+  const buttons=Array.from({length:5},(_,index)=>{
+    const stars=index+1;
+    const button=element('button',null,'candidate-star');
+    button.type='button';
+    const description=t(stars===1?'1 stella':'{n} stelle',{n:number(stars)});
+    button.title=description;
+    button.setAttribute('aria-label',description);
+    button.disabled=!vote;
+    button.addEventListener('click',()=>{
+      if(!vote)return;
+      const saving=explorer.saveCardVote(key,vote,stars);
+      if(saving)follow(saving);
+    });
+    return button;
+  });
+  group.append(...buttons);
+  function render() {
+    buttons.forEach((button,index)=>{
+      const stars=index+1;
+      button.textContent=stars<=(vote?.stars??0)?'★':'☆';
+      button.setAttribute('aria-pressed',String(stars===vote?.stars));
+      if(vote?.saving&&!button.disabled)button.setAttribute('aria-disabled','true');
+      else button.removeAttribute('aria-disabled');
+    });
+  }
+  function follow(saving: Promise<void>) {
+    status.textContent=t('Salvataggio del voto…');render();
+    void saving.then(()=>{
+      status.textContent=t('Voto salvato.');render();
+    },error=>{
+      status.textContent=t(error instanceof Error&&error.message==='Accedi con Wikimedia per votare.'
+        ?error.message:'Impossibile salvare il voto. Riprova.');render();
+    });
+  }
+  if(vote?.saving)follow(vote.saving);else render();
+  return {group,status};
+}
+function disableOrphanRatings() {
+  for(const button of $('candidate-cards')?.querySelectorAll<HTMLButtonElement>('.candidate-star')??[])button.disabled=true;
+}
 function candidateCards() {
   if(!deorphanizePage||$('dataset')!.value==='')return;
   if(databaseList('cards',candidateCards))return;
@@ -371,14 +421,15 @@ function candidateCards() {
     const record=records[pageKey(page)],count=record?.candidate_count;
     const card=element('article',null,'candidate-card'),body=element('div',null,'candidate-body');
     const header=element('div',null,'candidate-header');
-    header.append(cardTitle('h3',page.title,pageLanguage(page)),element('span',count==null?'—':number(count),'candidate-badge'));
+    const rating=orphanRating(page);
+    header.append(cardTitle('h3',page.title,pageLanguage(page)),rating.group);
     const hint=element('p',null,'candidate-hint');
     if(count==null)hint.textContent=t('Dati non disponibili');
     else {
       const reviewed=(record?.candidate_ids??record?.candidates?.map(candidate=>candidate.page_id)??[]).filter(id=>closedEdge(page,id)).length;
       hint.append(element('strong',number(reviewed)),'/',element('strong',number(count)),' ',t('pagine valutate'));
     }
-    body.append(header,element('p',label(page),'candidate-category'),hint);
+    body.append(header,element('p',label(page),'candidate-category'),hint,rating.status);
     const footer=element('div',null,'candidate-footer'),connect=element('a',t('Connetti'),'connect-button');
     connect.href=`connections.html?dataset=${encodeURIComponent(datasetFile)}&page=${encodeURIComponent(page.page_id)}`;
     if(data.metadata.kind==='aggregate') connect.href+=`&language=${encodeURIComponent(pageLanguage(page))}`;
@@ -509,6 +560,7 @@ function clearLanguageSelection() {
 }
 async function load(entry: ManifestEntry) {
   resetRemoteList();
+  disableOrphanRatings();
   closePrompt();
   ++cardRequestVersion;cardController.abort();cardHydration=Promise.resolve();
   const version=++loadVersion;
@@ -731,9 +783,9 @@ $('connection-search')?.addEventListener('input',()=>{if(data){connectionOffset=
 $('connection-open')?.addEventListener('click',()=>{connectionReviewed=false;connectionOffset=0;renderConnections();});
 $('connection-reviewed')?.addEventListener('click',()=>{connectionReviewed=true;connectionOffset=0;renderConnections();});
 $('candidate-more')?.addEventListener('click',()=>stepListPage('cards',1));
-const explorer=createExplorer({get data(){return data;},get datasetFile(){return datasetFile;},get loadVersion(){return loadVersion;},
+const explorer=createExplorer({get data(){return data;},get datasetFile(){return datasetFile;},get loadVersion(){return loadVersion;},get authUsername(){return authUsername;},
  get precomputed(){return precomputed;},pageKey,hiddenTargetCategories,creatorListInfo,
- setCreators(rows){creatorRows=rows;},abortCards(){++cardRequestVersion;cardController.abort();},
+ setCreators(rows){creatorRows=rows;},abortCards(){++cardRequestVersion;cardController.abort();disableOrphanRatings();},
  render(kind){(kind==='articles'?articleList:kind==='creators'?creatorList:candidateCards)();},fail});
 const {resetRemoteList,databaseList,stepListPage}=explorer;
 configureProfile({get datasetEntries(){return datasetEntries;},get topicDisplayNames(){return topicDisplayNames;}});

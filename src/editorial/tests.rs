@@ -1,4 +1,4 @@
-use super::auth::{random_key, verified_username};
+use super::auth::{random_key, verified_username, WikimediaIdentity};
 use super::http::serve_file;
 use super::storage::client_defaults;
 use super::*;
@@ -100,11 +100,13 @@ impl Fixture {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let response = api(
-                State(self.app.clone()),
-                request.body(Body::from(body)).unwrap(),
-            )
-            .await;
+            let state = State(self.app.clone());
+            let request = request.body(Body::from(body)).unwrap();
+            let response = if request.uri().path() == "/api/orphan-votes" {
+                votes::handle(state, request).await
+            } else {
+                api(state, request).await
+            };
             let status = response.status();
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             assert_eq!(
@@ -251,7 +253,10 @@ fn authenticated_reviews_cannot_forge_authors_and_logout_revokes_writes() {
         key.clone(),
         LoginSession {
             expires: std::time::Instant::now() + Duration::from_secs(60),
-            username: Some("Editor À & Test".into()),
+            identity: Some(WikimediaIdentity {
+                username: "Editor À & Test".into(),
+                user_id: Some(123),
+            }),
             state: String::new(),
             return_to: String::new(),
         },
@@ -321,7 +326,10 @@ fn authenticated_reviews_cannot_forge_authors_and_logout_revokes_writes() {
         key,
         LoginSession {
             expires: std::time::Instant::now() - Duration::from_secs(1),
-            username: Some("Expired".into()),
+            identity: Some(WikimediaIdentity {
+                username: "Expired".into(),
+                user_id: Some(123),
+            }),
             state: String::new(),
             return_to: String::new(),
         },
@@ -395,7 +403,10 @@ fn oauth_server_exchange_uses_form_secret_and_bearer_profile_only() {
                 &format!("http://{address}/profile")
             )
             .unwrap(),
-        "Editor À & Test"
+        WikimediaIdentity {
+            username: "Editor À & Test".into(),
+            user_id: Some(123)
+        }
     );
     worker.join().unwrap();
     for value in [
@@ -422,6 +433,115 @@ fn oauth_server_exchange_uses_form_secret_and_bearer_profile_only() {
     assert_eq!(
         local.cookie("abc", 10),
         "orphanwiki_session=abc; Path=/tool/; HttpOnly; SameSite=Lax; Max-Age=10"
+    );
+}
+
+#[test]
+fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
+    let mut f = Fixture::new();
+    enable_oauth(&mut f);
+    let sign_in = |user_id, username: &str| {
+        let key = random_key().unwrap();
+        f.app.sessions.lock().unwrap().insert(
+            key.clone(),
+            LoginSession {
+                expires: std::time::Instant::now() + Duration::from_secs(60),
+                identity: Some(WikimediaIdentity {
+                    username: username.into(),
+                    user_id: Some(user_id),
+                }),
+                state: String::new(),
+                return_to: String::new(),
+            },
+        );
+        format!("orphanwiki_session={key}")
+    };
+    let alice = sign_in(123, "Editor");
+    let bob = sign_in(456, "Another editor");
+    let cards = |cookie: &str, order: &str, offset| {
+        let request = Request::builder()
+            .header("cookie", cookie)
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let session = votes::session(&f.app, &request).unwrap();
+        let query = serde_json::from_value(
+            json!({"kind":"cards","dataset":"vec.json","order":order,"offset":offset}),
+        )
+        .unwrap();
+        let mut result = json!({"metadata":{"language":"vec","complete":true},"pages":[{"page_id":1},{"page_id":2}]});
+        votes::attach(&f.app.database, &session, &query, &mut result);
+        result["orphan_voting"]["2"].clone()
+    };
+    let post = |cookie: &str, origin: &str, body| {
+        f.request(
+            Method::POST,
+            "/api/orphan-votes",
+            Some(body),
+            &[("cookie", cookie), ("origin", origin)],
+        )
+    };
+    let origin = "https://example.toolforge.org";
+    let first = cards(&alice, "candidates-desc", 16);
+    assert!(first["stars"].is_null());
+    let body = json!({"stars":5,"receipt":first["receipt"]});
+    assert_eq!(post("", origin, body.clone()).0, StatusCode::UNAUTHORIZED);
+    assert_eq!(post(&bob, origin, body.clone()).0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        post(&alice, "https://other.example", body.clone()).0,
+        StatusCode::FORBIDDEN
+    );
+    let mut forged = body.clone();
+    forged["stars"] = json!(6);
+    assert_eq!(post(&alice, origin, forged).0, StatusCode::BAD_REQUEST);
+    let mut forged = body.clone();
+    forged["receipt"]["context"] = json!(body["receipt"]["context"]
+        .as_str()
+        .unwrap()
+        .replace("\"list_page\":2", "\"list_page\":4"));
+    assert_ne!(body["receipt"]["context"], forged["receipt"]["context"]);
+    assert_eq!(post(&alice, origin, forged).0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        post(&alice, origin, body),
+        (StatusCode::OK, json!({"stars":5}))
+    );
+    assert!(cards(&bob, "candidates-desc", 16)["stars"].is_null());
+    let renamed = sign_in(123, "Renamed editor");
+    let next = cards(&renamed, "length-desc", 32);
+    assert_eq!(next["stars"], 5);
+    assert_eq!(
+        post(
+            &renamed,
+            origin,
+            json!({"stars":3,"receipt":next["receipt"]})
+        )
+        .0,
+        StatusCode::OK
+    );
+
+    let db = rusqlite::Connection::open(f.root.join("reviews.sqlite")).unwrap();
+    let votes: u64 = db
+        .query_row("SELECT count(*) FROM orphan_votes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(votes, 1);
+    let vote: (u64, String, u64, u8, String, String, String, u64, u64) = db.query_row(
+        "SELECT user_id,language,target_id,stars,voted_at,dataset,sort_order,list_page,page_position FROM orphan_votes",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    assert_eq!(
+        (vote.0, vote.1.as_str(), vote.2, vote.3),
+        (123, "vec", 2, 3)
+    );
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&vote.4)
+            .unwrap()
+            .offset()
+            .local_minus_utc()
+            == 0
+    );
+    assert_eq!(
+        (vote.5.as_str(), vote.6.as_str(), vote.7, vote.8),
+        ("vec.json", "length-desc", 3, 2)
     );
 }
 
@@ -737,6 +857,26 @@ fn mariadb_persistence_conflicts_and_rollback_on_isolated_test_database() {
     connection
         .query_drop("DROP TABLE editorial_reviews")
         .unwrap();
+    connection
+        .query_drop("DROP TABLE IF EXISTS orphan_votes")
+        .unwrap();
+    let mut votes = f.app.database.connect_votes().unwrap();
+    let context = votes::VoteContext {
+        dataset: "vec.json".into(),
+        language: "vec".into(),
+        target_id: 1,
+        sort_order: "candidates-desc".into(),
+        list_page: 2,
+        page_position: 1,
+    };
+    votes.save_vote(123, &context, 5).unwrap();
+    votes.save_vote(123, &context, 2).unwrap();
+    assert_eq!(
+        votes.votes(123, "vec", &[1, 2]).unwrap(),
+        BTreeMap::from([(1, 2)])
+    );
+    assert!(votes.votes(456, "vec", &[1]).unwrap().is_empty());
+    connection.query_drop("DROP TABLE orphan_votes").unwrap();
 }
 
 #[test]

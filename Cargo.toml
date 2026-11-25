@@ -17,7 +17,7 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 dashboard = ["dep:wasm-bindgen"]
-cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc", "dep:focaccia", "dep:axum", "dep:tokio", "dep:mysql", "dep:futures-util", "dep:rustix", "dep:signal-hook", "dep:nix", "dep:indexmap", "serde_json/float_roundtrip"]
+cli = ["dep:clap", "dep:reqwest", "dep:sha1", "dep:sha2", "dep:bzip2", "dep:rusqlite", "dep:flate2", "dep:quick-xml", "dep:cc", "dep:focaccia", "dep:axum", "dep:tokio", "dep:mysql", "dep:futures-util", "dep:rustix", "dep:signal-hook", "dep:nix", "dep:indexmap", "dep:ring", "serde_json/float_roundtrip"]
 
 [dependencies]
 regex = "=1.13.1"
@@ -43,6 +43,7 @@ rustix = { version = "=1.1.6", default-features = false, features = ["std", "tim
 signal-hook = { version = "=0.4.6", optional = true, default-features = false }
 nix = { version = "=0.32.0", default-features = false, features = ["resource"], optional = true }
 indexmap = { version = "=2.14.2", default-features = false, features = ["serde", "std"], optional = true }
+ring = { version = "=0.17.14", optional = true }
 
 [build-dependencies]
 cc = { version = "=1.11.2", optional = true }
