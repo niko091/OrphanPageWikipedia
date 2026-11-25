@@ -358,7 +358,6 @@ button.candidate-star {
 button.candidate-star:nth-child(4) { grid-column: 2 / span 2; }
 button.candidate-star:nth-child(5) { grid-column: 4 / span 2; }
 button.candidate-star:disabled { color: var(--muted); opacity: 1; }
-button.candidate-star[aria-disabled="true"]:enabled { cursor: wait; }
 button.candidate-star:focus-visible { outline-offset: -2px; }
 
 .candidate-rating-status {
@@ -417,6 +416,18 @@ dialog {
 
 dialog::backdrop {
   background: #0008;
+}
+
+#vote-login-dialog {
+  width: min(28rem,calc(100% - 32px));
+}
+
+#vote-login-title {
+  margin-block-start: 0;
+}
+
+#candidate-vote-notice:empty,#vote-login-status:empty {
+  margin-block: 0;
 }
 
 dialog textarea {

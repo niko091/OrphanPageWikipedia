@@ -464,13 +464,13 @@ fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
             .header("content-type", "application/json")
             .body(Body::empty())
             .unwrap();
-        let session = votes::session(&f.app, &request).unwrap();
+        let access = votes::access(&f.app, &request).unwrap();
         let query = serde_json::from_value(
             json!({"kind":"cards","dataset":"vec.json","order":order,"offset":offset}),
         )
         .unwrap();
         let mut result = json!({"metadata":{"language":"vec","complete":true},"pages":[{"page_id":1},{"page_id":2}]});
-        votes::attach(&f.app.database, &session, &query, &mut result);
+        votes::attach(&f.app.database, &access, &query, &mut result);
         result["orphan_voting"]["2"].clone()
     };
     let post = |cookie: &str, origin: &str, body| {
@@ -482,6 +482,14 @@ fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
         )
     };
     let origin = "https://example.toolforge.org";
+    let guest = cards("", "candidates-desc", 16);
+    assert!(guest["stars"].is_null());
+    let guest_vote = json!({"stars":5,"receipt":guest["receipt"]});
+    assert_eq!(
+        post("", origin, guest_vote.clone()).0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(!f.root.join("reviews.sqlite").exists());
     let first = cards(&alice, "candidates-desc", 16);
     assert!(first["stars"].is_null());
     let body = json!({"stars":5,"receipt":first["receipt"]});
@@ -494,6 +502,10 @@ fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
     let mut forged = body.clone();
     forged["stars"] = json!(6);
     assert_eq!(post(&alice, origin, forged).0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        post(&alice, origin, json!({"receipt":first["receipt"]})).0,
+        StatusCode::BAD_REQUEST
+    );
     let mut forged = body.clone();
     forged["receipt"]["context"] = json!(body["receipt"]["context"]
         .as_str()
@@ -502,7 +514,7 @@ fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
     assert_ne!(body["receipt"]["context"], forged["receipt"]["context"]);
     assert_eq!(post(&alice, origin, forged).0, StatusCode::BAD_REQUEST);
     assert_eq!(
-        post(&alice, origin, body),
+        post(&alice, origin, guest_vote),
         (StatusCode::OK, json!({"stars":5}))
     );
     assert!(cards(&bob, "candidates-desc", 16)["stars"].is_null());
@@ -543,6 +555,26 @@ fn orphan_vote_uses_authenticated_identity_and_rendered_rank() {
         (vote.5.as_str(), vote.6.as_str(), vote.7, vote.8),
         ("vec.json", "length-desc", 3, 2)
     );
+    let bob_vote = cards(&bob, "candidates-desc", 16);
+    assert_eq!(
+        post(
+            &bob,
+            origin,
+            json!({"stars":2,"receipt":bob_vote["receipt"]})
+        )
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(
+            &renamed,
+            origin,
+            json!({"stars":null,"receipt":next["receipt"]})
+        ),
+        (StatusCode::OK, json!({"stars":null}))
+    );
+    assert!(cards(&renamed, "length-desc", 32)["stars"].is_null());
+    assert_eq!(cards(&bob, "candidates-desc", 16)["stars"], 2);
 }
 
 #[test]
@@ -876,6 +908,8 @@ fn mariadb_persistence_conflicts_and_rollback_on_isolated_test_database() {
         BTreeMap::from([(1, 2)])
     );
     assert!(votes.votes(456, "vec", &[1]).unwrap().is_empty());
+    votes.delete_vote(123, &context).unwrap();
+    assert!(votes.votes(123, "vec", &[1]).unwrap().is_empty());
     connection.query_drop("DROP TABLE orphan_votes").unwrap();
 }
 

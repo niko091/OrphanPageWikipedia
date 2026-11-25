@@ -7,10 +7,28 @@ import {editorialReviews} from './editorial.js';
 export type RemoteKind='articles'|'cards'|'creators';
 export const DEFAULT_CARD_ORDER='length-desc';
 const listPageSize=(kind: RemoteKind)=>kind==='cards'?16:25;
+export interface VoteReceipt {context: string; signature: number[]}
 export interface CardVote {
   stars: number | null;
-  receipt: {context: string; signature: number[]};
+  receipt: VoteReceipt;
+  pendingStars?: number | null;
   saving?: Promise<void>;
+}
+export function readVoteReceipt(value: unknown): VoteReceipt | null {
+  if(!isRecord(value)||typeof value.context!=='string'||!Array.isArray(value.signature)||value.signature.length!==32)return null;
+  const signature=value.signature.filter((byte: unknown): byte is number=>
+    typeof byte==='number'&&Number.isInteger(byte)&&byte>=0&&byte<=255);
+  return signature.length===32?{context:value.context,signature}:null;
+}
+export const validStars=(value: unknown): value is number=>
+  typeof value==='number'&&Number.isInteger(value)&&value>=1&&value<=5;
+export async function submitCardVote(receipt: VoteReceipt,stars: number | null): Promise<void> {
+  const response=await fetch('api/orphan-votes',{method:'POST',cache:'no-store',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(8000),body:JSON.stringify({stars,receipt})});
+  if(response.status===401)throw new Error('Accedi con Wikimedia per votare.');
+  if(!response.ok)throw new Error('Impossibile salvare il voto. Riprova.');
+  const result: unknown=await response.json();
+  if(!isRecord(result)||result.stars!==stars)throw new Error('Impossibile salvare il voto. Riprova.');
 }
 interface RemoteList {
   key: string; offset: number; total: number; pages: PageObservation[]; creators: CreatorRow[];
@@ -29,30 +47,34 @@ export function createExplorer(context: ExplorerContext) {
 let remoteRendering=false,remoteController=new AbortController(),remoteVersion=0;
 let remoteList: RemoteList | null=null,listHydration: Promise<void>=Promise.resolve();
 let remoteQueryKey='',remoteOffset=0,paginationFocus=false;
+let returningCardOffset=0;
 let remoteProfileEdits: RecentEdit[]=[];
 const pendingVotes=new Set<Promise<void>>();
 
-function saveCardVote(key: string,vote: CardVote,stars: number): Promise<void> | undefined {
-  if(vote.saving||remoteList?.votes.get(key)!==vote||!context.authUsername)return;
+function saveCardVote(key: string,vote: CardVote,stars: number | null): Promise<void> | undefined {
+  if(remoteList?.votes.get(key)!==vote||!context.authUsername)return;
+  vote.pendingStars=stars;
+  if(vote.saving)return vote.saving;
   const saving=(async()=>{
-    const response=await fetch('api/orphan-votes',{method:'POST',cache:'no-store',credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(8000),
-      body:JSON.stringify({stars,receipt:vote.receipt})});
-    if(response.status===401)throw new Error('Accedi con Wikimedia per votare.');
-    if(!response.ok)throw new Error('Impossibile salvare il voto. Riprova.');
-    const result: unknown=await response.json();
-    if(!isRecord(result)||result.stars!==stars)throw new Error('Impossibile salvare il voto. Riprova.');
-    vote.stars=stars;
+    let next=stars;
+    for(;;) {
+      await submitCardVote(vote.receipt,next);
+      vote.stars=next;
+      const wanted=vote.pendingStars;
+      if(wanted===undefined||wanted===next)break;
+      next=wanted;
+    }
   })();
   vote.saving=saving;
   pendingVotes.add(saving);
-  const finish=()=>{pendingVotes.delete(saving);delete vote.saving;};
+  const finish=()=>{pendingVotes.delete(saving);delete vote.saving;delete vote.pendingStars;};
   void saving.then(finish,finish);
   return saving;
 }
 function resetRemoteList() {
   ++remoteVersion;remoteController.abort();remoteList=null;remoteProfileEdits=[];
   remoteQueryKey='';remoteOffset=0;paginationFocus=false;
+  returningCardOffset=0;
   for(const prefix of ['article','creator','candidate'] as const) {
     const previous=$(prefix+'-previous'),pages=$(prefix+'-pages'),more=$(prefix+'-more') as HTMLButtonElement | null;
     if(previous)previous.hidden=true;
@@ -123,7 +145,11 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
     edits:kind==='cards'&&field('candidate-sort')==='personalized'?remoteProfileEdits:[]};
   const queryKey=canonicalJSON([{...request,missing_category:'',missing_topics:'',empty_topics:''},kind==='cards'?[...editorialReviews.values()]:[]]);
   const key=canonicalJSON([queryKey,uiLanguage,kind==='cards'?context.authUsername:null]);
-  if(queryKey!==remoteQueryKey){remoteQueryKey=queryKey;remoteOffset=0;paginationFocus=false;}
+  if(queryKey!==remoteQueryKey) {
+    remoteQueryKey=queryKey;
+    remoteOffset=kind==='cards'?returningCardOffset:0;
+    returningCardOffset=0;paginationFocus=false;
+  }
   const offset=remoteOffset;
   const more=$(prefix+'-more' as keyof UIElements) as HTMLButtonElement;
   const info=$(prefix+'-info' as keyof UIElements)!;
@@ -179,13 +205,12 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
       next.pages.push(...member.pages);Object.assign(next.records,member.link_candidates);Object.assign(next.transports,payload.card_transports);
       if(new Set(next.pages.map(context.pageKey)).size!==next.pages.length)throw new Error('Indice degli articoli non valido');
       const voting=payload.orphan_voting;
-      if(kind==='cards'&&context.authUsername&&isRecord(voting)) {
+      if(kind==='cards'&&isRecord(voting)) {
         for(const page of next.pages) {
-          const vote=voting[context.pageKey(page)];
-          if(isRecord(vote)&&(vote.stars===null||typeof vote.stars==='number'&&Number.isInteger(vote.stars)&&vote.stars>=1&&vote.stars<=5)&&
-            isRecord(vote.receipt)&&typeof vote.receipt.context==='string'&&Array.isArray(vote.receipt.signature)&&
-            vote.receipt.signature.length===32&&vote.receipt.signature.every(byte=>Number.isInteger(byte)&&byte>=0&&byte<=255)) {
-            next.votes.set(context.pageKey(page),{stars:vote.stars,receipt:{context:vote.receipt.context,signature:vote.receipt.signature}});
+          const key=context.pageKey(page),vote=voting[key];
+          if(isRecord(vote)&&(vote.stars===null||validStars(vote.stars))) {
+            const receipt=readVoteReceipt(vote.receipt);
+            if(receipt)next.votes.set(key,{stars:context.authUsername?vote.stars:null,receipt});
           }
         }
       }
@@ -207,6 +232,10 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
 }
 
 return {resetRemoteList,databaseList,stepListPage,saveCardVote,get hydration(){return listHydration;},
+ get cardOffset(){return remoteList?.offset??0;},
+ restoreCardOffset(offset: number){
+   if(Number.isSafeInteger(offset)&&offset>=0&&offset%listPageSize('cards')===0)returningCardOffset=offset;
+ },
  cardVote(key: string){return remoteList?.votes.get(key);},
  setProfileEdits(edits: RecentEdit[]){remoteProfileEdits=edits;}};
 }

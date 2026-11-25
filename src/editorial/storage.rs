@@ -217,6 +217,18 @@ impl Storage {
         Ok(())
     }
 
+    pub(super) fn delete_vote(&mut self, user_id: u64, context: &VoteContext) -> ReviewResult<()> {
+        self.execute(
+            "DELETE FROM orphan_votes WHERE user_id=? AND language=? AND target_id=?",
+            &[
+                user_id.into(),
+                context.language.as_str().into(),
+                context.target_id.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn sqlite_parameters(values: &[SqlValue]) -> Vec<rusqlite::types::Value> {
         values
             .iter()

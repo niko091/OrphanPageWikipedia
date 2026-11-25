@@ -1,4 +1,5 @@
-import {createExplorer, DEFAULT_CARD_ORDER} from './explorer.js';
+import {createExplorer, DEFAULT_CARD_ORDER, readVoteReceipt, submitCardVote, validStars} from './explorer.js';
+import type {VoteReceipt} from './explorer.js';
 import {wikimediaAPI} from './wikimedia.js';
 import {configureProfile,clearProfileCache,recentWikipediaEdits,readProfileTopics} from './profile.js';
 import {configureEditorial, resetReviews, setConnectionCopyRequest, wikiLink, candidateReasons, cardTitle, candidateOrder, referenceCount, reviewedEdge, closedEdge, reviewedOnly, reviewBadge, loadSharedReviews, closeReview, activePromptReview, showReview, fixRequest, updatePreparedPrompt, closePrompt, copyPrompt, connectionCopyRequest, copyConnectionPrompt, fixLink, submitProposals} from './editorial.js';
@@ -50,6 +51,7 @@ function applyTranslations() {
     if((option as HTMLOptionElement).value==='all')option.textContent=t('Tutte le lingue');
   }
   if(deorphanizePage&&datasetEntries.length&&$('dataset')!.value==='')$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
+  setVoteNotice(voteNotice);
 }
 
 const pageLanguage = (row: PageObservation) => row.language || data.metadata.language;
@@ -73,6 +75,73 @@ const waitingCardFetches: (()=>void)[]=[];
 
 let authEnabled: boolean | null=null,authUsername: string | null=null;
 let authError: string | null=null,authBusy=false;
+const targetFilterIds=['candidate-show-disambiguation','candidate-show-redirects','candidate-show-without-connections',
+  'candidate-show-names','candidate-show-indexes','candidate-show-maintenance'] as const;
+interface GuestVote {
+  dataset: string;
+  title: string;
+  receipt: VoteReceipt;
+  stars: number;
+  view: {order: string; search: string; category: string; offset: number; filters: boolean[]};
+}
+let guestRating: {vote: GuestVote | null; opener: HTMLButtonElement; reset: () => void} | null=null;
+let voteNotice='';
+const guestVoteStorage='orphanwiki-pending-vote';
+const voteReturnParameter='vote-return';
+function setVoteNotice(message: string) {
+  voteNotice=message;
+  const notice=$('candidate-vote-notice');
+  if(notice)notice.textContent=t(message);
+}
+function voteError(error: unknown): string {
+  return error instanceof Error&&error.message==='Accedi con Wikimedia per votare.'
+    ?error.message:'Impossibile salvare il voto. Riprova.';
+}
+function takeGuestVote(): GuestVote | null {
+  const url=new URL(window.location.href),marker=url.searchParams.get(voteReturnParameter);
+  if(marker!==null) {
+    url.searchParams.delete(voteReturnParameter);
+    window.history.replaceState(window.history.state,'',url);
+  }
+  try {
+    const stored=sessionStorage.getItem(guestVoteStorage);
+    sessionStorage.removeItem(guestVoteStorage);
+    if(!marker||!stored)return null;
+    const draft: unknown=JSON.parse(stored);
+    const view=isRecord(draft)?draft.view:null;
+    if(!isRecord(draft)||draft.marker!==marker||typeof draft.expires!=='number'||draft.expires<Date.now()||
+      typeof draft.dataset!=='string'||draft.dataset!==url.searchParams.get('dataset')||
+      typeof draft.title!=='string'||!validStars(draft.stars)||!isRecord(view)||
+      typeof view.order!=='string'||typeof view.search!=='string'||typeof view.category!=='string'||
+      typeof view.offset!=='number'||!Array.isArray(view.filters)||view.filters.length!==targetFilterIds.length)return null;
+    const receipt=readVoteReceipt(draft.receipt);
+    const filters=view.filters.map((value: unknown)=>value===true);
+    return receipt?{dataset:draft.dataset,title:draft.title,stars:draft.stars,receipt,
+      view:{order:view.order,search:view.search,category:view.category,offset:view.offset,filters}}:null;
+  } catch {return null;}
+}
+async function finishGuestVote(vote: GuestVote) {
+  try {
+    await submitCardVote(vote.receipt,vote.stars);
+    setVoteNotice('Voto salvato.');
+  } catch(error) {setVoteNotice(voteError(error));}
+}
+function showVoteLogin(vote: GuestVote | null,opener: HTMLButtonElement,reset: () => void) {
+  guestRating={vote,opener,reset};
+  $('vote-login-status')!.textContent=t(authEnabled!==true?'Accesso Wikimedia non disponibile al momento. Riprova.':
+    !vote?'Votazione non disponibile.':'');
+  renderAuth();
+  $('vote-login-dialog')!.showModal();
+}
+function closeVoteLogin() {
+  const active=guestRating;
+  guestRating=null;
+  $('vote-login-dialog')?.close();
+  if(!active)return;
+  active.reset();
+  if(active.opener.isConnected)active.opener.focus();
+  try {sessionStorage.removeItem(guestVoteStorage);} catch { /* Storage is optional until login. */ }
+}
 const validUsername=(value: unknown): value is string=>typeof value==='string'&&value.length>0&&value.length<=255&&!/[\u0000-\u001f\u007f#<>|\[\]{}]/.test(value);
 function userPage(username: string, language: string): string {
   const edition=/^[a-z][a-z0-9-]{0,19}$/.test(language)&&language!=='all'?language:uiLanguage;
@@ -88,6 +157,8 @@ function renderAuth() {
   $('auth-logout')!.hidden=authUsername===null;
   const message=authError??(authEnabled!==true?'Accesso Wikimedia non disponibile al momento. Riprova.':'');
   $('auth-status')!.textContent=t(message);$('auth-status')!.hidden=!message;
+  const voteLogin=$('vote-login');
+  if(voteLogin)voteLogin.disabled=authBusy||authEnabled!==true||!guestRating?.vote;
   if($('profile-username')) { $('profile-username')!.disabled=authUsername!==null;if(authUsername)$('profile-username')!.value=authUsername; }
 }
 function clearProfile() {
@@ -122,16 +193,33 @@ async function authRequest(action: 'session' | 'logout'): Promise<void> {
   renderAuth();
 }
 async function loadAuth() {await authRequest('session');}
-async function login() {
+async function login(draft?: GuestVote) {
   if(authBusy)return;
   authBusy=true;authError=null;renderAuth();
   try {
     await authRequest('session');
+    if(draft&&guestRating?.vote!==draft)return;
     if(authEnabled!==true)throw new Error('Accesso non disponibile');
-    if(authUsername)return;
+    if(authUsername) {
+      if(draft) {
+        await finishGuestVote(draft);
+        closeVoteLogin();
+        if(data)renderDataset();
+      }
+      return;
+    }
     const page=connectionsPage?'connections.html':deorphanizePage?'deorphanize.html':creatorsPage?'creators.html':'index.html';
-    window.location.assign('api/auth/login?return_to='+encodeURIComponent(page+window.location.search));
-  } catch {authError='Accesso Wikimedia non disponibile al momento. Riprova.';}
+    let search=window.location.search;
+    if(draft) {
+      const marker=crypto.randomUUID();
+      sessionStorage.setItem(guestVoteStorage,JSON.stringify({...draft,marker,expires:Date.now()+15*60*1000}));
+      search='?'+new URLSearchParams({dataset:draft.dataset,[voteReturnParameter]:marker}).toString();
+    }
+    window.location.assign('api/auth/login?return_to='+encodeURIComponent(page+search));
+  } catch {
+    authError='Accesso Wikimedia non disponibile al momento. Riprova.';
+    if(draft&&guestRating?.vote===draft)$('vote-login-status')!.textContent=t(authError);
+  }
   finally {authBusy=false;renderAuth();}
 }
 async function logout() {
@@ -358,7 +446,9 @@ function hiddenSuggestedLink(page: PageObservation,candidate: Candidate): boolea
     linkFilterActive('candidate-hide-link-redirects')&&(redirectOrphanCategories.has(folded)||softRedirectCategories.includes(normalized)));
 }
 function orphanRating(page: PageObservation) {
-  const key=pageKey(page),vote=authUsername?explorer.cardVote(key):undefined;
+  const key=pageKey(page),vote=explorer.cardVote(key);
+  let preview: number | null=null,watched: Promise<void> | undefined;
+  const selected=()=>authUsername?(vote?.pendingStars===undefined?vote?.stars:vote.pendingStars):preview;
   const group=element('div',null,'candidate-rating');
   const status=element('p',null,'candidate-rating-status');
   const label=t('Vota {title}',{title:page.title});
@@ -374,31 +464,42 @@ function orphanRating(page: PageObservation) {
     const description=t(stars===1?'1 stella':'{n} stelle',{n:number(stars)});
     button.title=description;
     button.setAttribute('aria-label',description);
-    button.disabled=!vote;
+    button.disabled=Boolean(authUsername&&!vote);
     button.addEventListener('click',()=>{
+      setVoteNotice('');
+      if(!authUsername) {
+        preview=stars;render();
+        showVoteLogin(vote?{dataset:datasetFile,title:page.title,receipt:vote.receipt,stars,view:{
+          order:$('candidate-sort')!.value,search:$('candidate-search')!.value,category:$('candidate-category')!.value,
+          offset:explorer.cardOffset,filters:targetFilterIds.map(id=>Boolean($(id)?.checked))
+        }}:null,button,()=>{
+          preview=null;render();
+        });
+        return;
+      }
       if(!vote)return;
-      const saving=explorer.saveCardVote(key,vote,stars);
+      const saving=explorer.saveCardVote(key,vote,selected()===stars?null:stars);
       if(saving)follow(saving);
     });
     return button;
   });
   group.append(...buttons);
   function render() {
+    const active=selected();
     buttons.forEach((button,index)=>{
       const stars=index+1;
-      button.textContent=stars<=(vote?.stars??0)?'★':'☆';
-      button.setAttribute('aria-pressed',String(stars===vote?.stars));
-      if(vote?.saving&&!button.disabled)button.setAttribute('aria-disabled','true');
-      else button.removeAttribute('aria-disabled');
+      button.textContent=stars<=(active??0)?'★':'☆';
+      button.setAttribute('aria-pressed',String(stars===active));
     });
   }
   function follow(saving: Promise<void>) {
     status.textContent=t('Salvataggio del voto…');render();
+    if(watched===saving)return;
+    watched=saving;
     void saving.then(()=>{
-      status.textContent=t('Voto salvato.');render();
+      status.textContent=t(vote?.stars===null?'Voto rimosso.':'Voto salvato.');render();
     },error=>{
-      status.textContent=t(error instanceof Error&&error.message==='Accedi con Wikimedia per votare.'
-        ?error.message:'Impossibile salvare il voto. Riprova.');render();
+      status.textContent=t(voteError(error));render();
     });
   }
   if(vote?.saving)follow(vote.saving);else render();
@@ -558,7 +659,7 @@ function clearLanguageSelection() {
   $('status')!.hidden=false;$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
   for(const [id,file] of [['articles-link','index.html'],['creators-link','creators.html'],['deorphanize-link','deorphanize.html']] as const)$(id)!.href=file;
 }
-async function load(entry: ManifestEntry) {
+async function load(entry: ManifestEntry, guestVote?: GuestVote) {
   resetRemoteList();
   disableOrphanRatings();
   closePrompt();
@@ -579,6 +680,19 @@ async function load(entry: ManifestEntry) {
   $('status')!.textContent=t('Caricamento…');
 
   for(const id of ['candidate-search','candidate-category','article-search','creator-search','article-category','article-macro'] as const)if($(id)!)$(id)!.value='';
+  if(guestVote) {
+    const {view}=guestVote,sort=$('candidate-sort')!;
+    targetFilterIds.forEach((id,index)=>{$(id)!.checked=view.filters[index];});
+    if([...sort.options].some(option=>option.value===view.order&&!option.disabled)) {
+      sort.value=view.order;
+      $('candidate-search')!.value=view.search;
+      $('candidate-category')!.value=view.category;
+      explorer.restoreCardOffset(view.offset);
+    } else {
+      // Personalized ranking can be rebuilt only on explicit profile submission.
+      $('candidate-search')!.value=guestVote.title;
+    }
+  }
   const summary=await readSummary(entry,signal);
   if(version!==loadVersion)return;
   precomputed=summary;
@@ -749,7 +863,7 @@ if(deorphanizePage) {
     if(event.key==='Escape'&&!options.hidden){event.preventDefault();open(false);button.focus();}
   });
 }
-for(const id of ['candidate-show-disambiguation','candidate-show-redirects','candidate-show-without-connections','candidate-show-names','candidate-show-indexes','candidate-show-maintenance'] as const)$(id)?.addEventListener('change',()=>{
+for(const id of targetFilterIds)$(id)?.addEventListener('change',()=>{
   if(data)candidateCards();
 });
 for(const id of linkFilterIds) {
@@ -766,6 +880,9 @@ $('auth-menu')?.addEventListener('keydown',event=>{
 });
 $('auth-login')?.addEventListener('click',()=>{void login();});
 $('auth-logout')?.addEventListener('click',()=>{void logout();});
+$('vote-login')?.addEventListener('click',()=>{if(guestRating?.vote)void login(guestRating.vote);});
+$('vote-login-cancel')?.addEventListener('click',closeVoteLogin);
+$('vote-login-dialog')?.addEventListener('cancel',event=>{event.preventDefault();closeVoteLogin();});
 $('profile-apply')?.addEventListener('click',()=>{if(data)void applyProfile().catch(fail);});
 for(const id of ['article-search','article-category','article-group','article-sort']) $(id)?.addEventListener('input',()=>{if(data)articleList();});
 $('article-macro')?.addEventListener('change',()=>{if(data)articleList();});
@@ -796,7 +913,12 @@ configureEditorial({
  pageLanguage,pageKey,hiddenSuggestedLink,validUsername,loadAuth,renderDataset,wikimediaAPI,fail
 });
 export const dashboardReady=(async()=>{
+  const guestVote=deorphanizePage?takeGuestVote():null;
   await loadAuth();
+  if(guestVote) {
+    if(authUsername)await finishGuestVote(guestVote);
+    else setVoteNotice('Voto annullato.');
+  }
   const bindings: DashboardModule = await import(nativeModuleUrl);
   await bindings.default();setCalculator(bindings.calculate);
   for(const label of calculateReport<string[]>('taxonomy',null)) {
@@ -839,7 +961,7 @@ export const dashboardReady=(async()=>{
   }
   const initial=matching??selectedEntry();
   if(!initial)throw new Error('Nessuna raccolta reale presente');
-  await load(initial);
+  await load(initial,guestVote??undefined);
 })().catch(fail);
 
 let chartResizeTimer: ReturnType<typeof setTimeout> | undefined;

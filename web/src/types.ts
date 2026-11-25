@@ -228,6 +228,11 @@ export interface UIElements {
   'llm-prompt-close': HTMLButtonElement;
   'llm-prompt-finished': HTMLButtonElement;
   'review-dialog': HTMLDialogElement;
+  'vote-login-dialog': HTMLDialogElement;
+  'vote-login': HTMLButtonElement;
+  'vote-login-cancel': HTMLButtonElement;
+  'vote-login-status': HTMLElement;
+  'candidate-vote-notice': HTMLElement;
   'review-rows': HTMLElement;
   'review-dialog-status': HTMLElement;
   'review-close': HTMLButtonElement;

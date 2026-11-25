@@ -296,16 +296,20 @@ test('continuity shows individual months and a complete overflow category',async
   await expect(chart).toContainText('the last groups all values above 12 months');
 });
 
-test('orphan cards show three stars above two and send the displayed ranking when voting', async ({page,site},testInfo)=>{
-  await open(page,site,'deorphanize.html');
+test('orphan votes preview before login, survive a successful login and toggle off', async ({page,site},testInfo)=>{
   const card=page.locator('#candidate-cards .candidate-card').first();
   const stars=card.locator('.candidate-rating button');
-  await expect(stars).toHaveCount(5);
-  for(const button of await stars.all())await expect(button).toBeDisabled();
-
-  let signedIn=true;
-  const votes=new Map<number,number>(),submitted: unknown[]=[];
+  let signedIn=false,loginSucceeds=false,holdSave=false;
+  let releaseSave=()=>{};
+  const savingGate=new Promise<void>(resolve=>{releaseSave=resolve;});
+  const votes=new Map<number,number>(),submitted: Record<string,unknown>[]=[];
   await page.route('**/api/auth/session',route=>route.fulfill({json:{enabled:true,username:signedIn?'Test editor':null}}));
+  await page.route('**/api/auth/login?*',route=>{
+    const returnTo=new URL(route.request().url()).searchParams.get('return_to');
+    assert(returnTo);
+    signedIn=loginSucceeds;
+    return route.fulfill({status:303,headers:{location:new URL(returnTo,site).href}});
+  });
   await page.route('**/api/auth/logout',route=>{
     signedIn=false;
     return route.fulfill({json:{enabled:true,username:null}});
@@ -313,25 +317,32 @@ test('orphan cards show three stars above two and send the displayed ranking whe
   await page.route('**/api/pages',async route=>{
     const response=await route.fetch(), result: unknown=await response.json(), query: unknown=route.request().postDataJSON();
     assert(record(result)&&record(query)&&Array.isArray(result.pages)&&typeof query.offset==='number');
-    if(signedIn)result.orphan_voting=Object.fromEntries(result.pages.map((item: unknown,index: number)=>{
+    result.orphan_voting=Object.fromEntries(result.pages.map((item: unknown,index: number)=>{
       assert(record(item)&&typeof item.page_id==='number');
       const context=JSON.stringify({target_id:item.page_id,dataset:query.dataset,sort_order:query.order,
         list_page:Number(query.offset)/16+1,page_position:index+1});
-      return [item.page_id,{stars:votes.get(item.page_id)??null,receipt:{context,signature:Array(32).fill(123)}}];
+      return [item.page_id,{stars:signedIn?votes.get(item.page_id)??null:null,receipt:{context,signature:Array(32).fill(123)}}];
     }));
     await route.fulfill({response,json:result});
   });
-  await page.route('**/api/orphan-votes',route=>{
+  await page.route('**/api/orphan-votes',async route=>{
+    assert(signedIn);
     const body: unknown=route.request().postDataJSON();
-    assert(record(body)&&record(body.receipt)&&typeof body.receipt.context==='string'&&typeof body.stars==='number');
+    assert(record(body)&&record(body.receipt)&&typeof body.receipt.context==='string'&&(typeof body.stars==='number'||body.stars===null));
     const context: unknown=JSON.parse(body.receipt.context);
     assert(record(context)&&typeof context.target_id==='number');
-    submitted.push({stars:body.stars,...context});votes.set(context.target_id,body.stars);
+    submitted.push({stars:body.stars,...context});
+    if(body.stars===null)votes.delete(context.target_id);
+    else {
+      if(holdSave)await savingGate;
+      votes.set(context.target_id,body.stars);
+    }
     return route.fulfill({json:{stars:body.stars}});
   });
   await open(page,site,'deorphanize.html');
   await expect(page.locator('#candidate-sort')).toHaveValue('length-desc');
   await expect(card.locator('.candidate-title')).toHaveText(title(32));
+  await expect(stars).toHaveCount(5);
   await page.locator('#candidate-more').click();
   await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('2');
   const targetId=Number(new URL(await card.locator('.connect-button').getAttribute('href')??'',site).searchParams.get('page'));
@@ -347,22 +358,57 @@ test('orphan cards show three stars above two and send the displayed ranking whe
     await card.screenshot({path:testInfo.outputPath(`orphan-vote-${width}-${theme}.png`)});
   }
   const rating=card.getByRole('button',{name:'4 stelle',exact:true});
+  const dialog=page.getByRole('dialog',{name:'Accedi per votare'});
+  const signIn=dialog.getByRole('button',{name:'Accedi con Wikimedia',exact:true});
   await rating.focus();
   await page.keyboard.press('Space');
+  await expect(dialog).toBeVisible();
+  await expect(stars).toHaveText(['★','★','★','★','☆']);
+  await expect(dialog.getByRole('button',{name:'Annulla'})).toBeFocused();
+  await dialog.screenshot({path:testInfo.outputPath('vote-login-390-dark.png')});
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
   await expect(rating).toBeFocused();
+  await expect(stars).toHaveText(['☆','☆','☆','☆','☆']);
+  expect(submitted).toEqual([]);
+
+  await rating.click();
+  await signIn.click();
+  await expect(page.locator('#candidate-vote-notice')).toHaveText('Voto annullato.');
+  await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('2');
+  await expect(rating).toHaveAttribute('aria-pressed','false');
+  expect(submitted).toEqual([]);
+
+  loginSucceeds=true;
+  await rating.click();
+  await signIn.click();
+  await expect(page.locator('#candidate-vote-notice')).toHaveText('Voto salvato.');
+  await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('2');
   await expect(rating).toHaveAttribute('aria-pressed','true');
   await expect(stars).toHaveText(['★','★','★','★','☆']);
-  await expect(card.locator('.candidate-rating-status')).toHaveText('Voto salvato.');
   expect(submitted).toEqual([{stars:4,target_id:targetId,dataset:'fixture.json',sort_order:'length-desc',list_page:2,page_position:1}]);
+  expect(new URL(page.url()).searchParams.has('vote-return')).toBe(false);
+  expect(await page.evaluate(()=>sessionStorage.getItem('orphanwiki-pending-vote'))).toBeNull();
   await page.locator('#candidate-previous').click();
   await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('1');
   await page.locator('#candidate-more').click();
   await expect(rating).toHaveAttribute('aria-pressed','true');
+  await rating.click();
+  await expect(card.locator('.candidate-rating-status')).toHaveText('Voto rimosso.');
+  await expect(stars).toHaveText(['☆','☆','☆','☆','☆']);
+  holdSave=true;
+  await rating.dblclick();
+  try {
+    await expect(stars).toHaveText(['☆','☆','☆','☆','☆']);
+  } finally {releaseSave();}
+  await expect(card.locator('.candidate-rating-status')).toHaveText('Voto rimosso.');
+  expect(submitted.map(vote=>vote.stars)).toEqual([4,null,4,null]);
   await page.locator('#ui-language-toggle').click();
-  await expect(card.getByRole('button',{name:'4 stars',exact:true})).toHaveAttribute('aria-pressed','true');
+  await expect(card.getByRole('button',{name:'4 stars',exact:true})).toHaveAttribute('aria-pressed','false');
   await page.locator('#auth-toggle').click();
   await page.locator('#auth-logout').click();
-  await expect(stars.nth(3)).toBeDisabled();
+  await expect(card.locator('.candidate-rating')).toHaveAttribute('aria-label',/Sign in with Wikimedia to vote/);
+  await expect(stars.nth(3)).toBeEnabled();
   await expect(stars.nth(3)).toHaveAttribute('aria-pressed','false');
 });
 
