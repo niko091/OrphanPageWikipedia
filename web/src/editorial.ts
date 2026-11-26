@@ -141,7 +141,7 @@ function withReviewTooltip(control: HTMLSpanElement | HTMLButtonElement,review: 
 async function readReviews(dataset: string): Promise<Map<string,EditorialReview>> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
   try {
-    const response=await fetch('api/reviews?dataset='+encodeURIComponent(dataset),{cache:'no-store',credentials:'omit',signal:controller.signal});
+    const response=await fetch('/api/reviews?dataset='+encodeURIComponent(dataset),{cache:'no-store',credentials:'omit',signal:controller.signal});
     if(!response.ok)throw new Error('Valutazioni condivise non disponibili');
     const payload: unknown=await response.json();
     if(!isRecord(payload)||payload.format!=='editorial_reviews_v1'||!Array.isArray(payload.reviews))throw new Error('Valutazioni condivise non valide');
@@ -221,7 +221,7 @@ async function saveReview(context: ReviewContext,source: {page_id: number; title
   const timer=setTimeout(()=>controller.abort(),8000);
   let message='';
   try {
-    const response=await fetch('api/reviews',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
+    const response=await fetch('/api/reviews',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:context.dataset,language:context.language,
         source_id:source.page_id,target_id:context.target_id,status:nextStatus,version:current?.version??0})});
     const payload: unknown=await response.json();
@@ -564,7 +564,7 @@ export async function submitProposals() {
   status.textContent=t(mode==='preview'?'Preparazione dell’anteprima…':'Lettura delle revisioni e generazione con Lift Wing…');
   $('proposal-review-status')!.hidden=true;retry.hidden=true;
   try {
-    const response=await fetch('api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
+    const response=await fetch('/api/editorial/proposals',{method:'POST',cache:'no-store',credentials:'same-origin',signal:controller.signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:review.dataset,language:review.language,
         target_id:review.target_id,source_ids:review.sources.map(source=>source.page_id),ui_language:uiLanguage})});
     if(proposalSession!==session)return;

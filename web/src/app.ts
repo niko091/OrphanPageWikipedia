@@ -13,6 +13,8 @@ import {isRecord,validEditorialRanking} from './validation.js';
 import {calculateReport, setCalculator} from './reports.js';
 
 declare const nativeModuleUrl: string;
+const [,,routeLanguage,routePageID]=window.location.pathname.split('/');
+const datasetSection=deorphanizePage?'deorphanize':creatorsPage?'creators':'articles';
 const llmProviders: Record<string, Provider> = {
   chatgpt:{name:'ChatGPT',url:'https://chatgpt.com/'},
   gemini:{name:'Gemini',url:'https://gemini.google.com/'},
@@ -110,7 +112,7 @@ function takeGuestVote(): GuestVote | null {
     const draft: unknown=JSON.parse(stored);
     const view=isRecord(draft)?draft.view:null;
     if(!isRecord(draft)||draft.marker!==marker||typeof draft.expires!=='number'||draft.expires<Date.now()||
-      typeof draft.dataset!=='string'||draft.dataset!==url.searchParams.get('dataset')||
+      typeof draft.dataset!=='string'||
       typeof draft.title!=='string'||!validStars(draft.stars)||!isRecord(view)||
       typeof view.order!=='string'||typeof view.search!=='string'||typeof view.category!=='string'||
       typeof view.offset!=='number'||!Array.isArray(view.filters)||view.filters.length!==targetFilterIds.length)return null;
@@ -173,7 +175,7 @@ function clearProfile() {
 async function authRequest(action: 'session' | 'logout'): Promise<void> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
   try {
-    const response=await fetch('api/auth/'+action,{cache:'no-store',credentials:'same-origin',signal:controller.signal,
+    const response=await fetch('/api/auth/'+action,{cache:'no-store',credentials:'same-origin',signal:controller.signal,
       ...(action==='logout'?{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}:{})});
     if(!response.ok)throw new Error('Accesso Wikipedia non disponibile');
     const payload: unknown=await response.json();
@@ -208,14 +210,13 @@ async function login(draft?: GuestVote) {
       }
       return;
     }
-    const page=connectionsPage?'connections.html':deorphanizePage?'deorphanize.html':creatorsPage?'creators.html':'index.html';
-    let search=window.location.search;
+    let returnTo=window.location.pathname.slice(1)||'articles';
     if(draft) {
       const marker=crypto.randomUUID();
       sessionStorage.setItem(guestVoteStorage,JSON.stringify({...draft,marker,expires:Date.now()+15*60*1000}));
-      search='?'+new URLSearchParams({dataset:draft.dataset,[voteReturnParameter]:marker}).toString();
+      returnTo+='?'+new URLSearchParams({[voteReturnParameter]:marker}).toString();
     }
-    window.location.assign('api/auth/login?return_to='+encodeURIComponent(page+search));
+    window.location.assign('/api/auth/login?return_to='+encodeURIComponent(returnTo));
   } catch {
     authError='Accesso Wikimedia non disponibile al momento. Riprova.';
     if(draft&&guestRating?.vote===draft)$('vote-login-status')!.textContent=t(authError);
@@ -360,7 +361,7 @@ async function readVisibleCard(filename: string,signal: AbortSignal): Promise<un
   if(activeCardFetches>=4)await new Promise<void>(resolve=>waitingCardFetches.push(resolve));else activeCardFetches++;
   try {
     signal.throwIfAborted();
-    const response=await fetch('data/'+filename,{cache:'no-store',credentials:'omit',signal});
+    const response=await fetch('/data/'+filename,{cache:'no-store',credentials:'omit',signal});
     if(!response.ok)throw new Error('Dataset non disponibile');
     return await response.json();
   } finally {const next=waitingCardFetches.shift();if(next)next();else activeCardFetches--;}
@@ -532,8 +533,7 @@ function candidateCards() {
     }
     body.append(header,element('p',label(page),'candidate-category'),hint,rating.status);
     const footer=element('div',null,'candidate-footer'),connect=element('a',t('Connetti'),'connect-button');
-    connect.href=`connections.html?dataset=${encodeURIComponent(datasetFile)}&page=${encodeURIComponent(page.page_id)}`;
-    if(data.metadata.kind==='aggregate') connect.href+=`&language=${encodeURIComponent(pageLanguage(page))}`;
+    connect.href=`/page/${pageLanguage(page)}/${page.page_id}`;
     connect.setAttribute('aria-label',t('Connetti {title}',{title:page.title}));
     footer.append(fixLink(fixRequest(page,record)),connect);card.append(body,footer);box.append(card);
     if(data.card_transports?.[pageLanguage(page)]&&record?.candidate_ids?.length&&!record.candidates&&!reviewedOnly(page,record)) {
@@ -545,11 +545,8 @@ function candidateCards() {
   cardHydration=hydrateVisibleCards(pending,request,cardController.signal);void cardHydration.catch(fail);
 }
 function renderConnections() {
-  const id=new URLSearchParams(window.location.search).get('page');
-  if(!/^[1-9][0-9]*$/.test(id||''))throw new Error('Identificativo della pagina non valido');
-  const language=new URLSearchParams(window.location.search).get('language');
-  const page=data.pages.find(p=>String(p.page_id)===id&&(data.metadata.kind!=='aggregate'||pageLanguage(p)===language));
-  if(!page||!page.orphan)throw new Error('Pagina orfana non presente in questa raccolta');
+  const [page]=data.pages;
+  if(!page?.orphan)throw new Error('Pagina orfana non presente in questa raccolta');
   const target=$('connection-target')!;target.replaceChildren();
   target.append(element('h2',t('Pagina da collegare')),wikiLink(page.title,pageLanguage(page)),element('p',t('Lingua: {language} · {category}',{language:pageLanguage(page).toUpperCase(),category:label(page)})));
   const record=data.link_candidates?.[pageKey(page)],count=record?.candidate_count;
@@ -641,10 +638,18 @@ function selectedEntry(): ManifestEntry | undefined {
   const date=$('dataset-date')?.value??'latest';
   return date==='latest'?choices[0]:choices.find(entry=>entry.date.startsWith(date));
 }
-function datasetLinks(entry: ManifestEntry) {
-  $('articles-link')!.href='index.html?dataset='+encodeURIComponent(entry.file);
-  $('creators-link')!.href='creators.html?dataset='+encodeURIComponent(entry.file);
-  $('deorphanize-link')!.href='deorphanize.html?dataset='+encodeURIComponent(entry.file);
+function datasetLinks(entry?: ManifestEntry) {
+  const edition=entry?`/${entry.language}`:'';
+  $('articles-link')!.href='/articles'+edition;
+  $('creators-link')!.href='/creators'+edition;
+  $('deorphanize-link')!.href='/deorphanize'+(entry?.kind==='aggregate'?'':edition);
+}
+function selectDataset() {
+  const entry=selectedEntry();
+  const path=entry?`/${datasetSection}/${entry.language}`:`/${datasetSection}`;
+  window.history.replaceState(window.history.state,'',path+window.location.hash);
+  if(entry)void load(entry).catch(fail);
+  else if(deorphanizePage)clearLanguageSelection();
 }
 function clearLanguageSelection() {
   resetRemoteList();
@@ -657,7 +662,7 @@ function clearLanguageSelection() {
   $('profile-apply')!.disabled=true;
   $('candidate-cards')!.replaceChildren();$('candidate-info')!.textContent='';
   $('status')!.hidden=false;$('status')!.textContent=t('Seleziona una lingua per visualizzare le voci orfane.');
-  for(const [id,file] of [['articles-link','index.html'],['creators-link','creators.html'],['deorphanize-link','deorphanize.html']] as const)$(id)!.href=file;
+  datasetLinks();
 }
 async function load(entry: ManifestEntry, guestVote?: GuestVote) {
   resetRemoteList();
@@ -698,16 +703,8 @@ async function load(entry: ManifestEntry, guestVote?: GuestVote) {
   precomputed=summary;
   let next: Dataset={metadata:summary.metadata,pages:[],link_candidates:{}};
   if(connectionsPage) {
-    const language=entry.kind==='aggregate'?new URLSearchParams(window.location.search).get('language'):entry.language;
-    if(!language||(entry.kind==='aggregate'&&!summary.metadata.languages?.includes(language)))throw new Error('Codice lingua non valido');
-    const member=entry.kind==='aggregate'?datasetEntries.find(e=>e.language===language&&e.kind!=='aggregate'):entry;
-    if(!member)throw new Error('Raccolta richiesta non disponibile');
-    next=await readConnections(member,signal);
+    next=await readConnections(entry,routePageID,signal);
     if(version!==loadVersion)return;
-    if(entry.kind==='aggregate') {
-      next.pages.forEach(page=>{page.language=language;});
-      next={...next,metadata:summary.metadata,link_candidates:Object.fromEntries(Object.entries(next.link_candidates!).map(([id,record])=>[language+':'+id,record]))};
-    }
   }
   if(!next)return;
   data=next; datasetFile=entry.file; connectionOffset=0;
@@ -915,53 +912,49 @@ configureEditorial({
 export const dashboardReady=(async()=>{
   const guestVote=deorphanizePage?takeGuestVote():null;
   await loadAuth();
-  if(guestVote) {
-    if(authUsername)await finishGuestVote(guestVote);
-    else setVoteNotice('Voto annullato.');
-  }
   const bindings: DashboardModule = await import(nativeModuleUrl);
   await bindings.default();setCalculator(bindings.calculate);
   for(const label of calculateReport<string[]>('taxonomy',null)) {
     const separator=label.indexOf('.'),parent=label.slice(0,separator),child=label.slice(separator+1);
     (topicTaxonomy[parent]??=[]).push(child);topicDisplayNames.set(label,parent+' · '+child);
   }
-  const response=await fetch('data/manifest.json',{cache:'no-store'});if(!response.ok)throw new Error('Nessuna raccolta presente');
+  const response=await fetch('/data/manifest.json',{cache:'no-store'});if(!response.ok)throw new Error('Nessuna raccolta presente');
   const entries=validateManifest(await response.json()).filter(entry=>!entry.demo).sort((a,b)=>b.date.localeCompare(a.date)||
     (b.published_at??'').localeCompare(a.published_at??'')||b.file.localeCompare(a.file));if(!entries.length)throw new Error('Nessuna raccolta reale presente');
   datasetEntries=entries;
   for(const entry of entries) {
     if(!/^[a-zA-Z0-9_.-]+\.json$/.test(entry.file))throw new Error('Nome dataset non valido');
   }
-  const requested=new URLSearchParams(window.location.search).get('dataset');
+  const matching=routeLanguage?languageEntries(routeLanguage)[0]:undefined;
+  const resumedVote=guestVote&&matching?.file===guestVote.dataset?guestVote:null;
+  if(guestVote) {
+    if(resumedVote&&authUsername)await finishGuestVote(resumedVote);
+    else setVoteNotice('Voto annullato.');
+  }
+  if(routeLanguage&&!matching)throw new Error('Raccolta richiesta non disponibile');
   if(connectionsPage) {
-    const entry=entries.find(entry=>entry.file===requested);
-    if(!entry)throw new Error('Raccolta richiesta non disponibile');
-    await load(entry);return;
+    if(!matching)throw new Error('Raccolta richiesta non disponibile');
+    await load(matching);return;
   }
   const languages=[...new Set(entries.map(entry=>entry.language))].filter(language=>!deorphanizePage||language!=='all').sort();
   if(!languages.length)throw new Error('Nessuna raccolta reale presente');
   if(deorphanizePage)$('dataset')!.append(new Option(t('Seleziona le lingue'),''));
   if(languages.includes('all'))$('dataset')!.append(new Option(t('Tutte le lingue'),'all'));
   for(const language of languages)if(language!=='all')$('dataset')!.append(new Option(language.toUpperCase(),language));
-  const matching=entries.find(entry=>entry.file===requested);
-  if(requested&&!matching)throw new Error('Raccolta richiesta non disponibile');
   $('dataset')!.value=deorphanizePage&&(!matching||matching.language==='all')?'':matching?.language??(languages.includes('all')?'all':languages[0]);
-  refreshDateChoices(matching?.date.slice(0,10));
-  $('dataset')!.addEventListener('change',async()=>{
+  refreshDateChoices();
+  $('dataset')!.addEventListener('change',()=>{
     const previous=$('dataset-date')?.value??'latest';
     refreshDateChoices(previous);
-    if(deorphanizePage&&$('dataset')!.value===''){clearLanguageSelection();return;}
-    const entry=selectedEntry();if(entry)await load(entry).catch(fail);
+    selectDataset();
   });
-  $('dataset-date')?.addEventListener('change',async()=>{
-    const entry=selectedEntry();if(entry)await load(entry).catch(fail);
-  });
+  $('dataset-date')?.addEventListener('change',selectDataset);
   if(deorphanizePage&&$('dataset')!.value==='') {
     clearLanguageSelection();return;
   }
   const initial=matching??selectedEntry();
   if(!initial)throw new Error('Nessuna raccolta reale presente');
-  await load(initial,guestVote??undefined);
+  await load(initial,resumedVote??undefined);
 })().catch(fail);
 
 let chartResizeTimer: ReturnType<typeof setTimeout> | undefined;

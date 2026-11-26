@@ -30,9 +30,8 @@ class Element {
 const nodes=new Map<string,Element>();
 function node(id: string): Element {let value=nodes.get(id);if(!value){value=new Element();nodes.set(id,value);}return value;}
 const storage=new Map<string,string>(),copied:string[]=[];
-const location={search:'?page=1'};
 Object.assign(globalThis,{
-  window:{location,localStorage:{getItem:(key:string)=>storage.get(key)??null,setItem:(key:string,value:string)=>storage.set(key,value)},
+  window:{localStorage:{getItem:(key:string)=>storage.get(key)??null,setItem:(key:string,value:string)=>storage.set(key,value)},
     navigator:{clipboard:{writeText:async(value:string)=>{copied.push(value);}}}},
   document:{body:{dataset:{page:'connections'}},getElementById:node,createElement:()=>new Element(),createElementNS:()=>new Element()},
 });
@@ -51,7 +50,7 @@ const editorial=await import(moduleURL('editorial')) as typeof import('../../web
 const profile=await import(moduleURL('profile')) as typeof import('../../web/src/profile.js');
 const requests:{url:string;signal?:AbortSignal|null}[]=[];
 let respond: (url:string,init?:RequestInit)=>Promise<Response>=async url=>{
-  const filename=path.join(dataRoot,url.replace(/^data\//,''));
+  const filename=path.join(dataRoot,url.replace(/^\/data\//,''));
   return fs.existsSync(filename)?new Response(fs.readFileSync(filename,'utf8')):new Response('missing',{status:404});
 };
 globalThis.fetch=async(input,init)=>{
@@ -110,7 +109,7 @@ await test('prepared summaries retain NULL and fail rather than recalculate abse
   await assert.rejects(datasets.readSummary(entry),/Riepilogo non valido/);
   respond=async()=>new Response('missing',{status:404});
   const start=requests.length;await assert.rejects(datasets.readSummary(entry),/Riepilogo non disponibile/);
-  assert.deepEqual(requests.slice(start).map(request=>request.url),['data/'+entry.summary_file]);
+  assert.deepEqual(requests.slice(start).map(request=>request.url),['/data/'+entry.summary_file]);
   respond=localResponse;
 });
 await test('creator axes use round references at their true positions without changing prepared observations',async()=>{
@@ -241,20 +240,20 @@ await test('legacy summaries keep the registration chart unavailable and malform
   respond=localResponse;
 });
 await test('connection v2 requires matching metadata and never loads a canonical census',async()=>{
-  const start=requests.length;const next=await datasets.readConnections(entry);
+  const start=requests.length;const next=await datasets.readConnections(entry,'1');
   assert.equal(next.pages.length,1);assert.equal(next.pages[0].page_id,1);
   assert(next.link_candidates?.['1'].candidates?.[0].evidence?.length);
   assert.equal(requests.slice(start).length,2);
-  assert(!requests.slice(start).some(request=>request.url==='data/'+entry.file));
-  const sharedName='data/'+entry.connections_metadata_file;
+  assert(!requests.slice(start).some(request=>request.url==='/data/'+entry.file));
+  const sharedName='/data/'+entry.connections_metadata_file;
   respond=async(url,init)=>{
     const response=await localResponse(url,init);
     if(url===sharedName){const value:unknown=await response.json();assert(record(value));value.connection_identity='f'.repeat(64);return new Response(JSON.stringify(value));}
     return response;
   };
-  await assert.rejects(datasets.readConnections(entry),/Metadati dei collegamenti non validi/);
+  await assert.rejects(datasets.readConnections(entry,'1'),/Metadati dei collegamenti non validi/);
   respond=async(url,init)=>url===sharedName?new Response('missing',{status:404}):localResponse(url,init);
-  await assert.rejects(datasets.readConnections(entry),/Dataset non disponibile/);
+  await assert.rejects(datasets.readConnections(entry,'1'),/Dataset non disponibile/);
   respond=localResponse;
 });
 await test('invalid pages fail validation while measured missing values remain NULL',()=>{
@@ -268,7 +267,7 @@ await test('profile topics fetch only selected shards and preserve empty predict
   const start=requests.length;const found=await profile.readProfileTopics(entry,new Set([1,2,999999]),new AbortController().signal);
   assert.deepEqual(found.get(1),[]);assert.deepEqual(found.get(2),['Culture.Media.Music']);assert.equal(found.get(999999),null);
   assert.equal(requests.slice(start).length,2);
-  assert(requests.slice(start).every(request=>request.url.startsWith('data/'+entry.profile_topics_dir)));
+  assert(requests.slice(start).every(request=>request.url.startsWith('/data/'+entry.profile_topics_dir)));
   profile.clearProfileCache();respond=async url=>url.endsWith('/0.json')?new Response('missing',{status:404}):localResponse(url);
   await assert.rejects(profile.readProfileTopics(entry,new Set([2]),new AbortController().signal),/Trasporto osservazioni non disponibile/);
   respond=localResponse;
@@ -334,7 +333,7 @@ await test('review buttons toggle either selection off and preserve shared versi
   const expected=['fixed','not_fixed','bad_link','fixed','not_fixed','bad_link','not_fixed'];
   for(const [index,status] of sequence.entries()) {
     respond=async(url,init)=>{
-      assert.equal(url,'api/reviews');assert.equal(init?.method,'POST');
+      assert.equal(url,'/api/reviews');assert.equal(init?.method,'POST');
       const body:unknown=JSON.parse(String(init.body));assert(record(body));
       assert.equal(body.status,expected[index]);assert.equal(body.version,version);
       assert.equal(body.source_id,source.page_id);assert.equal(body.target_id,context.target_id);

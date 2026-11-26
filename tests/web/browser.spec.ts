@@ -86,12 +86,12 @@ const test = base.extend<{traffic: {editorial: string[]}}, {site: string; propos
   }, {auto: true}],
 });
 
-async function open(page: Page, site: string, filename: string): Promise<void> {
-  await page.goto(`${site}/${filename}?dataset=fixture.json${filename === 'connections.html' ? '&page=1' : ''}`);
+async function open(page: Page, site: string, route: string): Promise<void> {
+  await page.goto(site+route);
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
   await expect(page.locator('#download, a[download], a[href*="api/export"]')).toHaveCount(0);
   // Cards hydrate after the index: inspect layout only when their controls are ready.
-  if (filename === 'deorphanize.html') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(16);
+  if (route === '/deorphanize/vec') await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(16);
 }
 
 async function inspectPagination(page: Page,testInfo: TestInfo,prefix: string) {
@@ -112,7 +112,7 @@ async function inspectPagination(page: Page,testInfo: TestInfo,prefix: string) {
 
 test('four pages load real assets, charts and prepared records', async ({page, site, traffic},testInfo) => {
   const wasm = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('.wasm') && response.ok());
-  await open(page, site, 'index.html');
+  await open(page, site, '/articles/vec');
   expect((await wasm).headers()['content-type']).toContain('application/wasm');
   await expect(page.locator('#length svg')).toBeVisible();
   await page.locator('#article-pages').getByRole('button',{name:'Pagina 2',exact:true}).click();
@@ -121,6 +121,7 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await expect(page.locator('#article-more')).toBeDisabled();
   await inspectPagination(page,testInfo,'article');
   await page.locator('#creators-link').click();
+  await expect(page).toHaveURL(`${site}/creators/vec`);
   await expect(page.locator('body')).toHaveAttribute('data-loading', 'false');
   await expect(page.locator('#creator-rows tr')).toHaveCount(25);
   await page.locator('#creator-more').click();
@@ -131,6 +132,7 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await page.locator('#creator-search').fill('creator:31');
   await expect(page.locator('#creator-rows tr')).toHaveCount(1);
   await page.locator('#deorphanize-link').click();
+  await expect(page).toHaveURL(`${site}/deorphanize/vec`);
   await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(16);
   await expect(page.locator('#candidate-cards button.fix-link')).toHaveCount(16);
   await page.locator('#candidate-more').click();
@@ -141,7 +143,12 @@ test('four pages load real assets, charts and prepared records', async ({page, s
   await page.locator('#candidate-previous').click();await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(16);
   await page.locator('#candidate-search').fill(title(1));
   await expect(page.locator('#candidate-cards .candidate-card')).toHaveCount(1);
-  await page.locator('#candidate-cards a[href*="connections.html"]').click();
+  const connect=page.locator('#candidate-cards a.connect-button');
+  await expect(connect).toHaveAttribute('href','/page/vec/1');
+  await connect.click();
+  await expect(page).toHaveURL(`${site}/page/vec/1`);
+  await page.reload();
+  await expect(page.locator('#articles-link')).toHaveAttribute('href','/articles/vec');
   await expect(page.locator('#candidate-hidden')).toHaveCount(0);
   await expect(page.locator('.toolbar, #llm-provider, #connection-copy-prompt, #download, #review-service-status')).toHaveCount(0);
   await expect(page.locator('#connection-candidates .connection-card')).toHaveCount(1);
@@ -167,17 +174,21 @@ test('four pages load real assets, charts and prepared records', async ({page, s
     expect(searchBounds.height).toBeCloseTo(buttonBounds.height,0);
   }
   await page.locator('.connection-toolbar').screenshot({path:testInfo.outputPath('connection-toolbar-dark.png')});
+  await page.locator('#footer-about').click();
+  await expect(page).toHaveURL(`${site}/about`);
+  await expect(page.locator('body')).toHaveAttribute('data-page','about');
   expect(traffic.editorial).toEqual([]);
 });
 
 test('deorphanize requires a language after aggregate navigation and preserves specific editions',async({page,site,traffic})=>{
-  for(const filename of ['index.html','creators.html']) {
-    await open(page,site,filename);
+  for(const route of ['/articles/vec','/creators/vec']) {
+    await open(page,site,route);
     await expect(page.locator('#dataset-date')).toBeVisible();
     await expect(page.locator('#dataset option[value="all"]')).toHaveCount(1);
     await page.locator('#dataset').selectOption('all');
     await expect(page.locator('body')).toHaveAttribute('data-loading','false');
     await page.locator('#deorphanize-link').click();
+    await expect(page).toHaveURL(`${site}/deorphanize`);
     await expect(page.locator('#dataset')).toHaveValue('');
     await expect(page.locator('#dataset option[value="all"]')).toHaveCount(0);
     await expect(page.locator('#dataset option:checked')).toHaveText('Seleziona le lingue');
@@ -189,7 +200,8 @@ test('deorphanize requires a language after aggregate navigation and preserves s
     await page.locator('#ui-language-toggle').click();
     await page.locator('#dataset').selectOption('lmo');
     await expect(page.locator('body')).toHaveAttribute('data-loading','false');
-    await page.locator(filename==='index.html'?'#articles-link':'#creators-link').click();
+    await expect(page).toHaveURL(`${site}/deorphanize/lmo`);
+    await page.locator(route==='/articles/vec'?'#articles-link':'#creators-link').click();
     await expect(page.locator('#dataset')).toHaveValue('lmo');
     await page.locator('#deorphanize-link').click();
     await expect(page.locator('#dataset')).toHaveValue('lmo');
@@ -199,7 +211,7 @@ test('deorphanize requires a language after aggregate navigation and preserves s
 });
 
 test('article chart references stay readable in both languages and themes',async({page,site},testInfo)=>{
-  await open(page,site,'index.html');
+  await open(page,site,'/articles/vec');
   for(const width of [1280,390])for(const theme of ['light','dark']) {
     await page.setViewportSize({width,height:844});
     await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
@@ -240,7 +252,7 @@ test('article chart references stay readable in both languages and themes',async
 });
 
 test('creator chart references stay readable at desktop and mobile widths',async({page,site},testInfo)=>{
-  await open(page,site,'creators.html');
+  await open(page,site,'/creators/vec');
   for(const width of [1280,390])for(const theme of ['light','dark']) {
     await page.setViewportSize({width,height:844});
     await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
@@ -264,7 +276,7 @@ test('creator chart references stay readable at desktop and mobile widths',async
 });
 
 test('registration cohorts compare articles by local registration date',async({page,site},testInfo)=>{
-  await open(page,site,'creators.html');
+  await open(page,site,'/creators/vec');
   await page.locator('#dataset').selectOption('vec');
   const chart=page.locator('#creator-registration-cohorts');
   const bars=chart.locator('svg rect');
@@ -309,7 +321,7 @@ test('registration cohorts compare articles by local registration date',async({p
 });
 
 test('continuity shows individual months and a complete overflow category',async({page,site},testInfo)=>{
-  await open(page,site,'creators.html');
+  await open(page,site,'/creators/vec');
   const chart=page.locator('#creator_continuity_months_before_creation-chart');
   for(const width of [1280,390])for(const theme of ['light','dark']) {
     await page.setViewportSize({width,height:844});
@@ -359,6 +371,8 @@ test('orphan votes preview before login, survive a successful login and toggle o
     assert(returnTo);
     const callback=new URL(returnTo,site);
     assert.equal(callback.origin,site);
+    assert.equal(callback.pathname,'/deorphanize/vec');
+    assert.deepEqual([...callback.searchParams.keys()],['vote-return']);
     signedIn=loginSucceeds;
     // WebKit cannot intercept a navigation with a synthetic redirect response.
     const destination=JSON.stringify(callback.href).replaceAll('<','\\u003c');
@@ -393,13 +407,14 @@ test('orphan votes preview before login, survive a successful login and toggle o
     }
     return route.fulfill({json:{stars:body.stars}});
   });
-  await open(page,site,'deorphanize.html');
+  await open(page,site,'/deorphanize/vec');
   await expect(page.locator('#candidate-sort')).toHaveValue('length-desc');
   await expect(card.locator('.candidate-title')).toHaveText(title(32));
   await expect(stars).toHaveCount(5);
   await page.locator('#candidate-more').click();
   await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('2');
-  const targetId=Number(new URL(await card.locator('.connect-button').getAttribute('href')??'',site).searchParams.get('page'));
+  const connectPath=new URL(await card.locator('.connect-button').getAttribute('href')??'',site).pathname;
+  const targetId=Number(/^\/page\/vec\/([1-9][0-9]*)$/.exec(connectPath)?.[1]);
   expect(targetId).toBeGreaterThan(0);
   for(const [width,theme] of [[1280,'light'],[390,'dark']] as const) {
     await page.setViewportSize({width,height:844});
@@ -441,7 +456,7 @@ test('orphan votes preview before login, survive a successful login and toggle o
   await expect(rating).toHaveAttribute('aria-pressed','true');
   await expect(stars).toHaveText(['★','★','★','★','☆']);
   expect(submitted).toEqual([{stars:4,target_id:targetId,dataset:'fixture.json',sort_order:'length-desc',list_page:2,page_position:1}]);
-  expect(new URL(page.url()).searchParams.has('vote-return')).toBe(false);
+  await expect(page).toHaveURL(`${site}/deorphanize/vec`);
   expect(await page.evaluate(()=>sessionStorage.getItem('orphanwiki-pending-vote'))).toBeNull();
   await page.locator('#candidate-previous').click();
   await expect(page.locator('#candidate-pages [aria-current=page]')).toHaveText('1');
@@ -469,7 +484,7 @@ test('orphan votes preview before login, survive a successful login and toggle o
 test('hidden pages opens independent options with keyboard and mobile support', async ({page, site, traffic}, testInfo) => {
   for (const width of [1280, 390]) {
     await page.setViewportSize({width, height: 844});
-    await open(page, site, 'deorphanize.html');
+    await open(page, site, '/deorphanize/vec');
     const button = page.getByRole('button', {name: 'Pagine nascoste', exact: true});
     const options = page.locator('#candidate-hidden-options');
     const disambiguation = page.getByRole('checkbox', {name: 'Mostra pagine di disambiguazione', exact: true});
@@ -527,7 +542,7 @@ test('hidden pages opens independent options with keyboard and mobile support', 
 });
 
 test('article search, filtering, sorting and pagination', async ({page, site}) => {
-  await open(page, site, 'index.html');
+  await open(page, site, '/articles/vec');
   await page.locator('#article-group').selectOption('all');
   await expect(page.locator('#article-rows tr')).toHaveCount(25);
   await page.locator('#article-more').click();
@@ -557,7 +572,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     page.on('request',request=>{
       if(new URL(request.url()).pathname==='/api/editorial/proposals')submissions.push(request.postDataJSON());
     });
-    await open(page,site,'deorphanize.html');
+    await open(page,site,'/deorphanize/vec');
     await expect(page.locator('#llm-provider option')).toHaveText(['QWEN (LiftWing)',...manualLlmOptions]);
     await expect(page.locator('#llm-provider')).toHaveValue('lift-wing');
     expect(submissions).toEqual([]);
@@ -603,7 +618,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
     await expect(badLink).toBeFocused();
     await expect(skipped.locator('.review-reason')).toBeVisible();
     await page.locator('#proposal-close').click();
-    await open(page,site,'deorphanize.html');
+    await open(page,site,'/deorphanize/vec');
     await page.locator('#candidate-search').fill(title(1));
     await trigger.click();
     await expect(pairs).toHaveCount(1);
@@ -620,7 +635,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
       const outcomes=[{source_id:34,reason:'insufficient_evidence'},{source_id:35,reason:'unavailable'}];
       await route.fulfill({response,json:++attempted===1?{}:{...body,sent_source_ids:[34],unavailable:1,proposals:[],outcomes}});
     });
-    await open(page,site,'deorphanize.html');
+    await open(page,site,'/deorphanize/vec');
     await page.locator('#ui-language-toggle').click();
     await page.locator('#candidate-search').fill(title(2));
     const card=page.locator('.candidate-card').filter({has:page.getByRole('link',{name:title(2),exact:true})});
@@ -665,7 +680,7 @@ previewTest.describe('local Wikimedia proposals preview', () => {
         ...proposal,...edit,anchor,reading_text:anchor,reading_section:'Storia locale',source_revision_id:1035,reference_revision_id:2035,
       }]}});
     });
-    await open(page,site,'deorphanize.html');
+    await open(page,site,'/deorphanize/vec');
     await page.locator('#ui-language-toggle').click();
     await expect(page.locator('#llm-provider option').first()).toHaveText('QWEN (LiftWing)');
     await page.locator('#candidate-search').fill(title(3));
@@ -719,7 +734,7 @@ test('review badges keep the article title readable and disclose review details'
   for(const [value,label,width,theme] of [['fixed','Fixed',390,'light'],['bad_link','Bad Link',1280,'dark']] as const) {
     status=value;
     await page.setViewportSize({width,height:844});
-    await open(page,site,'connections.html');
+    await open(page,site,'/page/vec/1');
     await page.locator('html').evaluate((node,mode)=>{node.dataset.theme=mode;},theme);
     await page.locator('#connection-reviewed').click();
     const card=page.locator('#connection-candidates .connection-card');
@@ -767,7 +782,7 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
       readText: async () => copied,
     }});
   });
-  await open(page, site, 'deorphanize.html');
+  await open(page, site, '/deorphanize/vec');
   expect(traffic.editorial).toEqual([]);
   await page.locator('#candidate-search').fill(title(1));
   const card=page.locator('#candidate-cards .candidate-card')
@@ -843,7 +858,7 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
   await expect(counts).toHaveText(['1/1 pages reviewed']);
   await expect(counts.locator('strong')).toHaveText(['1','1']);
   await page.locator('#ui-language-toggle').click();
-  await open(page, site, 'connections.html');
+  await open(page, site, '/page/vec/1');
   await expect(page.locator('#connection-candidates .review-badge')).toHaveCount(0);
   await page.locator('#connection-reviewed').click();
   await expect(page.locator('#connection-candidates .review-badge')).toHaveText('Fixed');
@@ -883,14 +898,14 @@ test('editorial preparation, dialog cleanup and persistent shared review', async
 });
 
 test('additional LLM providers retain their selection and expose plain chat links',async({page,site,traffic})=>{
-  await open(page,site,'deorphanize.html');
+  await open(page,site,'/deorphanize/vec');
   await expect(page.locator('#llm-provider option')).toHaveText(manualLlmOptions);
   for(const [provider,name,url] of [
     ['chatgpt','ChatGPT','https://chatgpt.com/'],
     ['claude','Claude','https://claude.ai/'],
     ['gemini','Gemini','https://gemini.google.com/'],
   ]) {
-    await open(page,site,'deorphanize.html');
+    await open(page,site,'/deorphanize/vec');
     const calls=traffic.editorial.length;
     await expect(page.locator(`#llm-provider option[value="${provider}"]`)).toHaveText(name);
     await page.locator('#llm-provider').selectOption(provider);
@@ -910,9 +925,9 @@ test('additional LLM providers retain their selection and expose plain chat link
 
 test('mobile layout, keyboard controls and Escape cleanup', async ({page, site},testInfo) => {
   await page.setViewportSize({width: 390, height: 844});
-  for (const filename of ['index.html', 'creators.html', 'deorphanize.html', 'connections.html']) {
-    await open(page, site, filename);
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), filename).toBe(true);
+  for (const route of ['/articles/vec', '/creators/vec', '/deorphanize/vec', '/page/vec/1']) {
+    await open(page, site, route);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), route).toBe(true);
   }
   await page.locator('#ui-language-toggle').focus();
   await page.keyboard.press('Enter');
@@ -948,7 +963,7 @@ test('database alone serves paginated articles, creators and cards on desktop an
       if(request.url().includes('/data/'))resources.push(request.url());
       if(request.url().endsWith('/api/pages'))queries.push(request.postDataJSON());
     });
-    await open(page,site,'index.html');
+    await open(page,site,'/articles/vec');
     await expect(page.locator('#article-rows tr')).toHaveCount(25);
     await page.locator('#article-group').selectOption('all');
     await expect(page.locator('#article-info')).toContainText('64');
@@ -1014,7 +1029,7 @@ test('Connect shows attested local mentions first and reveals other candidates o
     result.candidate_count=2;
     await route.fulfill({response,json:detail});
   });
-  await open(page,site,'connections.html');
+  await open(page,site,'/page/vec/1');
   const cards=page.locator('.connection-card'),toggle=page.locator('#connection-others');
   await expect(cards).toHaveCount(1);
   await expect(cards.first()).toContainText(title(42));

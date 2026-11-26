@@ -23,7 +23,7 @@ export function readVoteReceipt(value: unknown): VoteReceipt | null {
 export const validStars=(value: unknown): value is number=>
   typeof value==='number'&&Number.isInteger(value)&&value>=1&&value<=5;
 export async function submitCardVote(receipt: VoteReceipt,stars: number | null): Promise<void> {
-  const response=await fetch('api/orphan-votes',{method:'POST',cache:'no-store',credentials:'same-origin',
+  const response=await fetch('/api/orphan-votes',{method:'POST',cache:'no-store',credentials:'same-origin',
     headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(8000),body:JSON.stringify({stars,receipt})});
   if(response.status===401)throw new Error('Accedi con Wikimedia per votare.');
   if(!response.ok)throw new Error('Impossibile salvare il voto. Riprova.');
@@ -178,7 +178,7 @@ async function loadDatabaseList(kind: RemoteKind,render: ()=>void): Promise<void
       await Promise.allSettled(pendingVotes);
       signal.throwIfAborted();
     }
-    const response=await fetch('api/pages',{method:'POST',cache:'no-store',credentials:kind==='cards'?'same-origin':'omit',signal,
+    const response=await fetch('/api/pages',{method:'POST',cache:'no-store',credentials:kind==='cards'?'same-origin':'omit',signal,
       headers:{'Content-Type':'application/json'},body:JSON.stringify({...request,offset})});
     const payload: unknown=await response.json();
     if(signal.aborted||version!==remoteVersion||load!==context.loadVersion)return;

@@ -24,14 +24,13 @@ export function validateDataset(next: Dataset) {
   if(next.pages.some(page=>!isRecord(page)||!Number.isSafeInteger(page.page_id)||page.page_id<=0||typeof page.title!=='string'||typeof page.orphan!=='boolean'))throw new Error('Indice degli articoli non valido');
   if(next.metadata.biographies || next.biographies || next.pages.some(p=>'gender_group' in p || 'biography' in p)) throw new Error('Dataset con arricchimento esterno: rigenera i risultati dai dump ufficiali');
 }
-export async function readConnections(entry: ManifestEntry,signal?: AbortSignal): Promise<Dataset> {
-  const pageID=new URLSearchParams(window.location.search).get('page');
-  if(!pageID||!/^[1-9][0-9]*$/.test(pageID))throw new Error('Identificativo della pagina non valido');
+export async function readConnections(entry: ManifestEntry,pageID: string,signal?: AbortSignal): Promise<Dataset> {
+  if(!pageID||!/^[1-9][0-9]*$/.test(pageID)||!Number.isSafeInteger(Number(pageID)))throw new Error('Identificativo della pagina non valido');
   if(!entry.connections_dir||!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(entry.connections_dir)||
     !entry.connections_metadata_file||!/^[a-zA-Z0-9_.-]+\.json$/.test(entry.connections_metadata_file))throw new Error('Nome dataset non valido');
   const [detailResponse,sharedResponse]=await Promise.all([
-    fetch(`data/${entry.connections_dir}/${pageID}.json`,{cache:'no-store',signal}),
-    fetch('data/'+entry.connections_metadata_file,{cache:'no-store',signal})]);
+    fetch(`/data/${entry.connections_dir}/${pageID}.json`,{cache:'no-store',signal}),
+    fetch('/data/'+entry.connections_metadata_file,{cache:'no-store',signal})]);
   if(!detailResponse.ok||!sharedResponse.ok)throw new Error('Dataset non disponibile');
   const detail: unknown=await detailResponse.json(),shared=await sharedResponse.json() as ConnectionMetadata;
   if(shared?.format!=='connections_metadata_v1'||!Number.isSafeInteger(shared.census_page_count)||shared.census_page_count<0||
@@ -50,7 +49,7 @@ export async function readConnections(entry: ManifestEntry,signal?: AbortSignal)
 export async function readSummary(entry: ManifestEntry,signal?: AbortSignal): Promise<DashboardSummaryData> {
   const filename=entry.summary_file;
   if(!filename||!/^[a-zA-Z0-9_.-]+\.json$/.test(filename))throw new Error('Nome riepilogo non valido');
-  const response=await fetch('data/'+filename,{cache:'no-store',signal});
+  const response=await fetch('/data/'+filename,{cache:'no-store',signal});
   if(!response.ok)throw new Error('Riepilogo non disponibile');
   const summary=await response.json() as DashboardSummaryData;
   if(summary?.format!=='dashboard_summary_v1'||!['creation_quality_creators_v3','mixed_per_language'].includes(summary.measures_rule)||summary.metadata?.language!==entry.language||

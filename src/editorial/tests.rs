@@ -171,8 +171,9 @@ fn oauth_authorization_binds_browser_state_and_blocks_replay_and_redirects() {
     for uri in [
         "/api/auth/login?return_to=https://evil.invalid",
         "/api/auth/login?return_to=//evil.invalid",
-        "/api/auth/login?return_to=connections.html%0d%0aLocation:evil",
-        "/api/auth/login?return_to=index.html&return_to=creators.html",
+        "/api/auth/login?return_to=page/vec/1%0d%0aLocation:evil",
+        "/api/auth/login?return_to=articles/vec&return_to=creators/vec",
+        "/api/auth/login?return_to=connections.html%3Fdataset%3Dvec.json%26page%3D1",
     ] {
         assert_eq!(
             auth_call(&f, Method::GET, uri, &[]).status(),
@@ -192,7 +193,7 @@ fn oauth_authorization_binds_browser_state_and_blocks_replay_and_redirects() {
     let response = auth_call(
         &f,
         Method::GET,
-        "/api/auth/login?return_to=connections.html%3Fdataset%3Dvec.json%26page%3D1",
+        "/api/auth/login?return_to=page%2Fvec%2F1",
         &[],
     );
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -230,7 +231,7 @@ fn oauth_authorization_binds_browser_state_and_blocks_replay_and_redirects() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         response.headers()[header::LOCATION],
-        "https://example.toolforge.org/connections.html?dataset=vec.json&page=1"
+        "https://example.toolforge.org/page/vec/1"
     );
     assert!(response.headers()[header::SET_COOKIE]
         .to_str()
@@ -782,38 +783,69 @@ fn http_contract_blocks_cross_origin_forms_duplicate_queries_and_wrong_methods()
 #[test]
 fn static_files_stream_and_paths_cannot_escape_web_root() {
     let f = Fixture::new();
+    for (file, title) in [
+        ("creators.html", "Creators"),
+        ("deorphanize.html", "Deorphanize"),
+        ("connections.html", "Connections"),
+        ("about.html", "About"),
+    ] {
+        std::fs::write(f.app.web_root.join(file), title).unwrap();
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        for method in [Method::GET, Method::HEAD] {
-            let response = serve_file(
-                &f.app.web_root,
-                Request::builder()
-                    .method(method.clone())
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(response.headers()[header::CONTENT_LENGTH], "18");
-            let bytes = to_bytes(response.into_body(), 100).await.unwrap();
-            assert_eq!(
-                bytes.as_ref(),
-                if method == Method::GET {
-                    b"<h1>Dashboard</h1>".as_slice()
-                } else {
-                    b""
-                }
-            );
+        for (path, html) in [
+            ("/", "<h1>Dashboard</h1>"),
+            ("/articles/vec", "<h1>Dashboard</h1>"),
+            ("/creators/all", "Creators"),
+            ("/deorphanize", "Deorphanize"),
+            ("/deorphanize/vec", "Deorphanize"),
+            ("/page/vec/2610", "Connections"),
+            ("/about", "About"),
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let response = serve_file(
+                    &f.app.web_root,
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    response.headers()[header::CONTENT_LENGTH],
+                    html.len().to_string()
+                );
+                let bytes = to_bytes(response.into_body(), 100).await.unwrap();
+                assert_eq!(
+                    bytes.as_ref(),
+                    if method == Method::GET {
+                        html.as_bytes()
+                    } else {
+                        b""
+                    }
+                );
+            }
         }
         for path in [
             "/../secret",
             "/data/../../secret",
             "/.env",
             "/editorial.sqlite",
+            "/index.html?dataset=vec.json",
+            "/creators.html?dataset=vec.json",
+            "/deorphanize.html?dataset=vec.json",
+            "/connections.html?dataset=vec.json&page=1",
+            "/about.html",
+            "/page/all/2610",
+            "/page/vec/02610",
+            "/page/vec/9007199254740992",
+            "/page/vec/2610/extra",
+            "/creators/%2E%2E",
         ] {
             assert_eq!(
                 serve_file(

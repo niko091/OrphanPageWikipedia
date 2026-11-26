@@ -185,10 +185,7 @@ pub(super) fn return_page(value: &str) -> bool {
         && !value
             .chars()
             .any(|c| c.is_control() || c == '\\' || c == '#')
-        && matches!(
-            value.split('?').next(),
-            Some("index.html" | "creators.html" | "deorphanize.html" | "connections.html")
-        )
+        && super::http::dashboard_file(value.split('?').next().unwrap_or_default()).is_some()
 }
 
 impl ReviewApplication {
@@ -356,7 +353,7 @@ async fn auth_request(app: Arc<ReviewApplication>, request: Request) -> ReviewRe
                 return_to: fields
                     .first()
                     .map(|(_, value)| value.clone())
-                    .unwrap_or_else(|| "deorphanize.html".into()),
+                    .unwrap_or_else(|| "deorphanize".into()),
             },
         );
         return auth_redirect(config, url.as_str(), Some((&key, 600)));

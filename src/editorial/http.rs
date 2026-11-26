@@ -176,6 +176,29 @@ pub(super) async fn static_file(
     }
 }
 
+pub(super) fn dashboard_file(relative: &str) -> Option<&'static str> {
+    let mut parts = relative.split('/');
+    match (parts.next()?, parts.next(), parts.next(), parts.next()) {
+        ("articles", edition, None, None) if edition.is_none_or(language) => Some("index.html"),
+        ("creators", edition, None, None) if edition.is_none_or(language) => Some("creators.html"),
+        ("deorphanize", edition, None, None)
+            if edition.is_none_or(|edition| language(edition) && edition != "all") =>
+        {
+            Some("deorphanize.html")
+        }
+        ("page", Some(edition), Some(id), None)
+            if language(edition)
+                && edition != "all"
+                && !id.starts_with('0')
+                && id.bytes().all(|c| c.is_ascii_digit())
+                && id.parse::<u64>().is_ok_and(valid_id) =>
+        {
+            Some("connections.html")
+        }
+        _ => None,
+    }
+}
+
 pub(super) async fn serve_file(root: &Path, request: Request) -> ReviewResult<Response> {
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return Err(ReviewError::new(
@@ -184,24 +207,16 @@ pub(super) async fn serve_file(root: &Path, request: Request) -> ReviewResult<Re
         ));
     }
     let missing = || ReviewError::new(StatusCode::NOT_FOUND, "File non disponibile");
-    let relative = request.uri().path().trim_start_matches('/');
-    let relative = if relative.is_empty() {
-        "index.html"
-    } else {
-        relative
+    let relative = request.uri().path().strip_prefix('/').ok_or_else(missing)?;
+    let relative = match relative {
+        "" => "index.html",
+        "about" => "about.html",
+        path if path.starts_with("assets/")
+            && Path::new(path).components().all(|part| {
+                matches!(part, Component::Normal(value) if value.to_str().is_some_and(|s| !s.starts_with('.')))
+            }) => path,
+        path => dashboard_file(path).ok_or_else(missing)?,
     };
-    let allowed = matches!(
-        relative,
-        "index.html" | "creators.html" | "deorphanize.html" | "connections.html" | "about.html"
-    ) || relative.starts_with("assets/");
-    if !allowed
-        || Path::new(relative).components().any(|part| match part {
-            Component::Normal(value) => value.to_str().is_none_or(|s| s.starts_with('.')),
-            _ => true,
-        })
-    {
-        return Err(missing());
-    }
     let root = tokio::fs::canonicalize(root).await.map_err(|_| missing())?;
     let path = tokio::fs::canonicalize(root.join(relative))
         .await

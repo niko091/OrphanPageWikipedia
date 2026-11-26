@@ -102,7 +102,7 @@ export async function readProfileTopics(entry: ManifestEntry, wanted: Set<number
   async function read(filename: string): Promise<unknown> {
     return schedule(async()=>{
       signal.throwIfAborted();
-      const response=await fetch('data/'+filename,{cache:'no-store',signal});
+      const response=await fetch('/data/'+filename,{cache:'no-store',signal});
       if(!response.ok)throw new Error('Trasporto osservazioni non disponibile');
       return response.json();
     });
