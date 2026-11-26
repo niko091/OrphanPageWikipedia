@@ -614,6 +614,7 @@ pub(crate) fn prepared_summaries(
         || summary["reports"]["numeric"]["creator_continuity_months_before_creation"]
             ["month_histogram"]["rule"]
             != "months_0_12_overflow_v1"
+        || !summary["reports"]["registration_cohorts"]["rows"].is_array()
         || summary["measures_rule"]
             != metadata
                 .get("measures_rule")

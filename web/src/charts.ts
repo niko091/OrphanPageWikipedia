@@ -6,6 +6,30 @@ interface ChartContext {
  readonly topicDisplayNames: Map<string,string>;
  creatorMode: () => 'observed' | 'history' | 'missing';
 }
+const plotLeft=64,plotRight=24;
+function svgNode<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number>, text?: string) {
+  const node=document.createElementNS('http://www.w3.org/2000/svg',tag);
+  for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));
+  if(text!=null)node.textContent=text;
+  return node;
+}
+function chartFrame(width: number, maximum: number, count: boolean, label: string, yLabel: string) {
+  const height=width<600?380:520;
+  const bottom=height-76,plotWidth=width-plotLeft-plotRight,plotHeight=bottom-32;
+  const svg=svgNode('svg',{viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':label});
+  svg.append(svgNode('text',{x:plotLeft,y:18,fill:'var(--text)','font-size':16},yLabel));
+  for(const fraction of [0,0.25,0.5,0.75,1]) {
+    const y=bottom-fraction*plotHeight;
+    svg.append(svgNode('line',{x1:plotLeft,x2:width-plotRight,y1:y,y2:y,stroke:'var(--border)'}),
+      svgNode('text',{x:2,y:y+4,fill:'var(--muted)','font-size':16},number(fraction*maximum)+(count?'':'%')));
+  }
+  return {svg,height,bottom,plotWidth,plotHeight};
+}
+function orphanLegend() {
+  const legend=element('div',null,'legend');
+  legend.append(element('span',t('● Orfane'),'orphan'),element('span',t('● Non orfane'),'other'));
+  return legend;
+}
 function readableTicks(minimum: number, maximum: number, logarithmic: boolean, limit: number): number[] {
   if(maximum===minimum)return [minimum];
   if(logarithmic&&Math.log10((maximum+1)/(minimum+1))>2) {
@@ -94,14 +118,7 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
     box.append(element('p',t('Dati non disponibili.')));
     return report;
   }
-  const ns = 'http://www.w3.org/2000/svg';
-  function svgNode(tag: string, attrs: Record<string, string | number>, text?: string) {
-    const n = document.createElementNS(ns,tag); for(const [k,v] of Object.entries(attrs)) n.setAttribute(k,String(v));
-    if(text!=null) n.textContent=text; return n;
-  }
-  const width=Math.max(260, box.clientWidth || 900), height=width<600?380:520;
-  const left=64, right=24, top=32, bottom=height-76;
-  const plotWidth=width-left-right, plotHeight=bottom-top;
+  const width=Math.max(260,box.clientWidth||900),left=plotLeft,right=plotRight;
   const months=histogram&&field==='creator_continuity_months_before_creation'?report.month_histogram:undefined;
   if(histogram&&field==='creator_continuity_months_before_creation'&&!months) {
     box.append(element('p',t('Grafico della continuità non disponibile in questa raccolta.')));
@@ -110,12 +127,8 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   const binCount=months?months.through+2:20,bins=(months?.groups??groups).map(group=>group.counts),groupedTails=Array.isArray(report.cumulative_ticks);
   const yMax=mode==='count'?(months?.count_max??report.count_max):100;
   const chartLabel=t(percent?'Percentuale del gruppo per intervallo':histogram?'Numero di pagine per intervallo':'Percentuale cumulativa per gruppo');
-  const svg = svgNode('svg', {viewBox:`0 0 ${width} ${height}`, role:'img', 'aria-label':`${chartLabel}: ${field}`});
-  svg.append(svgNode('text',{x:left,y:18,fill:'var(--text)','font-size':16},mode==='count'?t('Numero di pagine'):t('% di voci del gruppo')));
-  for (const fraction of [0,0.25,0.5,0.75,1]) {
-    const y=bottom-fraction*plotHeight, value=fraction*yMax;
-    svg.append(svgNode('line',{x1:left,x2:width-right,y1:y,y2:y,stroke:'var(--border)'}),svgNode('text',{x:2,y:y+4,fill:'var(--muted)','font-size':16},number(value)+(mode==='count'?'':'%')));
-  }
+  const {svg,height,bottom,plotWidth,plotHeight}=chartFrame(width,yMax,mode==='count',`${chartLabel}: ${field}`,
+    t(mode==='count'?'Numero di pagine':'% di voci del gruppo'));
   if(histogram) {
     const binWidth=plotWidth/binCount, barWidth=binWidth*0.42;
     bins.forEach((frequencies,group)=>frequencies.forEach((count,bin)=>{
@@ -170,21 +183,80 @@ function distribution(id: string, field: MetricField, unit: string, axisLabel: s
   else if(histogram&&groupedTails)box.append(element('p',t('Le barre alle estremità raggruppano i valori sotto il 2° e sopra il 98° percentile; gli intervalli esatti sono nei dettagli delle barre.')));
   const orphanMedian=groups[0].median,otherMedian=groups[1].median;
   box.append(element('p',t('Mediana orfane: {a} {unit} (n={n}) · Non orfane: {b} {unit} (n={m})',{a:number(orphanMedian),b:number(otherMedian),unit,n:groups[0].known,m:groups[1].known})));
-  const legend=element('div',null,'legend');
-  legend.append(element('span',t('● Orfane'),'orphan'),element('span',t('● Non orfane'),'other'));
-  box.append(legend);
+  box.append(orphanLegend());
   const missing=groups.map(group=>group.missing);
   box.append(element('p',t('Dati mancanti esclusi dal grafico: {a} orfane, {b} non orfane.',{a:number(missing[0]),b:number(missing[1])})));
   if(!histogram)box.append(element('p',t('Ogni curva usa come denominatore le voci del proprio gruppo con dato disponibile; arriva al 100%. Le mediane sono calcolate separatamente per gruppo.')));
   return report;
 }
 const originLabels: Record<string, string> = {translation_tagged:'Traduzione segnalata',new_page_unclassified:'Nuova pagina, modalità non documentata',imported_history_observed:'Cronologia importata',unknown:'Origine non determinabile'};
+function registrationCohorts() {
+  const box=$('creator-registration-cohorts')!;
+  box.replaceChildren();
+  const report=context.precomputed.reports.registration_cohorts;
+  if(!report) {
+    box.append(element('p',t('Grafico dei lustri di registrazione non disponibile in questa raccolta.')));
+    return;
+  }
+  const {rows,known}=report;
+  if(!rows.length) {
+    box.append(element('p',t('Dati non disponibili.')));
+    return;
+  }
+  const mode=$('chart-type')!.value;
+  const count=mode==='count';
+  const cumulative=mode==='cumulative';
+  const maximum=count?Math.max(4,Math.ceil(Math.max(...rows.flatMap(row=>row.counts))/4)*4):100;
+  const axisLabel=t('Lustro di registrazione locale');
+  const yLabel=t(count?'Numero di pagine':cumulative?'% cumulativa del gruppo':'% di voci del gruppo');
+  const chartLabel=t('Lustro di registrazione locale del creatore');
+  const minimumWidth=Math.max(260,plotLeft+plotRight+rows.length*36);
+  const availableWidth=box.clientWidth||900;
+  const {svg,height,bottom,plotWidth,plotHeight}=chartFrame(Math.max(minimumWidth,availableWidth),maximum,count,chartLabel,yLabel);
+  svg.style.minWidth=`${minimumWidth}px`;
+  const plot=element('div',null,'registration-cohort-plot');
+  if(availableWidth<minimumWidth) {
+    plot.tabIndex=0;
+    plot.setAttribute('role','region');
+    plot.setAttribute('aria-label',chartLabel);
+  }
+  plot.append(svg);
+  const groupLabels=[t('Orfane'),t('Non orfane')],descriptions: string[]=[];
+  const binWidth=plotWidth/rows.length,barWidth=binWidth*0.42;
+  rows.forEach((row,index)=>{
+    const endYear=row.start_year+4,range=`${row.start_year}–${endYear}`;
+    const center=plotLeft+(index+0.5)*binWidth;
+    const tick=svgNode('text',{x:center,y:bottom+24,'text-anchor':'middle',fill:'var(--muted)',
+      'font-size':binWidth<78?12:16,'aria-label':range});
+    if(binWidth<78)tick.append(svgNode('tspan',{x:center},`${row.start_year}–`),svgNode('tspan',{x:center,dy:15},String(endYear)));
+    else tick.textContent=range;
+    svg.append(tick);
+    const values=count?row.counts:cumulative?row.cumulative:row.percentages;
+    values.forEach((value,group)=>{
+      if(known[group]===0||value===null)return;
+      const barHeight=value/maximum*plotHeight;
+      const description=`${groupLabels[group]} · ${range}: ${number(value)}${count?'':'%'}`;
+      descriptions.push(description);
+      const bar=svgNode('rect',{x:center+(group-1)*barWidth,y:bottom-barHeight,width:barWidth,height:barHeight,
+        fill:group===0?'var(--orange)':'var(--teal)','aria-label':description});
+      bar.append(svgNode('title',{},description));
+      svg.append(bar);
+    });
+  });
+  svg.setAttribute('aria-describedby','registration-cohort-description');
+  svg.append(svgNode('desc',{id:'registration-cohort-description'},descriptions.join('. ')),
+    svgNode('text',{x:plotLeft+plotWidth/2,y:height-10,'text-anchor':'middle',fill:'var(--text)','font-size':16},axisLabel));
+  box.append(plot,orphanLegend(),element('p',t(count?'Numero di voci per lustro.':cumulative?
+    'Percentuale cumulativa fino al lustro indicato, sulle voci del gruppo con date valide.':
+    'Percentuale per lustro, sulle voci del gruppo con date valide.')));
+}
 function creatorCharts() {
   const mode=context.creatorMode(),available=mode!=='missing';
   $('creators-empty')!.hidden=available;
   $('creator-section')!.hidden=!available; $('origin-section')!.hidden=!available;
   if(!available)return;
   const history=mode==='history';
+  registrationCohorts();
   const definitions: Partial<Record<MetricField, [string, string]>> = {
     creator_prior_edits_main:['Modifiche precedenti sulle voci','modifiche'],
     creator_prior_edits_other:['Modifiche precedenti negli altri namespace','modifiche'],

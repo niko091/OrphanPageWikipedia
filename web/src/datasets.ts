@@ -77,6 +77,19 @@ export async function readSummary(entry: ManifestEntry,signal?: AbortSignal): Pr
       !Array.isArray(group.percentages)||group.percentages.length!==14||
       group.percentages.some(value=>value!==null&&(!Number.isFinite(value)||value<0||value>100)))))
     throw new Error('Riepilogo della continuità non valido.');
+  const cohorts=summary.reports.registration_cohorts;
+  if(cohorts!==undefined) {
+    const counts=(values: unknown): values is [number,number]=>Array.isArray(values)&&values.length===2&&
+      values.every(value=>Number.isSafeInteger(value)&&value>=0);
+    const shares=(values: unknown,known: [number,number])=>Array.isArray(values)&&values.length===2&&
+      values.every((value,index)=>known[index]===0?value===null:Number.isFinite(value)&&value>=0&&value<=100);
+    if(!isRecord(cohorts)||!counts(cohorts.known)||!counts(cohorts.missing)||!Array.isArray(cohorts.rows)||
+      !cohorts.rows.every((row,index)=>isRecord(row)&&row.start_year===2001+5*index&&counts(row.counts)&&
+        shares(row.percentages,cohorts.known)&&shares(row.cumulative,cohorts.known))||
+      cohorts.known.some((known,group)=>cohorts.rows.reduce((total,row)=>total+row.counts[group],0)!==known||
+        known+cohorts.missing[group]!== (group===0?summary.reports.overview.orphans:summary.census_page_count-summary.reports.overview.orphans)))
+      throw new Error('Riepilogo dei lustri di registrazione non valido.');
+  }
   return summary;
 }
 

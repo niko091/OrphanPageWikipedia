@@ -7,7 +7,7 @@ use super::{
 };
 
 #[cfg(feature = "cli")]
-pub(super) const TRANSPORT_RULE: &str = "dashboard_transports_v4";
+pub(super) const TRANSPORT_RULE: &str = "dashboard_transports_v5";
 
 #[cfg(feature = "cli")]
 pub(crate) const COLLECTION_STAGING: &str = "relational_collection_staging_v1";

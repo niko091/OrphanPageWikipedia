@@ -223,6 +223,23 @@ await test('continuity separates zero, one and two months and retains overflow i
   await assert.rejects(datasets.readSummary(entry),/Riepilogo della continuità non valido/);
   respond=localResponse;
 });
+await test('legacy summaries keep the registration chart unavailable and malformed cohorts are rejected',async()=>{
+  const {createCharts}=await import(moduleURL('charts')) as typeof import('../../web/src/charts.js');
+  const summary=await datasets.readSummary(entry);
+  assert(summary.reports.registration_cohorts);
+  const older=structuredClone(summary);
+  delete older.reports.registration_cohorts;
+  respond=async()=>new Response(JSON.stringify(older));
+  const precomputed=await datasets.readSummary(entry);
+  createCharts({data:dataset,precomputed,topicDisplayNames:new Map(),creatorMode:()=> 'observed'}).creatorCharts();
+  const chart=node('creator-registration-cohorts');
+  assert.equal(chart.children.length,1);
+  assert(chart.children[0].textContent.includes('non disponibile in questa raccolta'));
+  summary.reports.registration_cohorts.rows[0].start_year=2002;
+  respond=async()=>new Response(JSON.stringify(summary));
+  await assert.rejects(datasets.readSummary(entry),/Riepilogo dei lustri di registrazione non valido/);
+  respond=localResponse;
+});
 await test('connection v2 requires matching metadata and never loads a canonical census',async()=>{
   const start=requests.length;const next=await datasets.readConnections(entry);
   assert.equal(next.pages.length,1);assert.equal(next.pages[0].page_id,1);

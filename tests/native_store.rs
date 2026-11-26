@@ -40,6 +40,8 @@ impl Fixture {
             let pages=(1..=61).chain([101,102]).map(|id|json!({"page_id":id,"title":format!("Page {id:03}"),"orphan":id<=61,
                 "category":if id==2&&language=="vec"{"Páginas de desambiguação"}else if id==2{"Paginas de desambiguac\u{0327}a\u{0303}o"}else if id==3{"Redireccions"}else{"Musica"},"length_bytes":if id==1{None}else{Some(id*10)},
                 "created_at":if id==60{Some("2026-10-01T00:00:00+02:00")}else if id==61{Some("2026-09-30T23:00:00Z")}else{None},
+                "page_created_at":(id!=1).then_some("2026-09-30T23:00:00Z"),
+                "creator_registered_at":if id==2{Some("2006-01-01T00:30:00+01:00")}else if id==101&&language=="vec"{Some("2026-01-01T00:00:00Z")}else if id==102{Some("2026-10-01T00:00:00Z")}else{None},
                 "topic_status":if id==1{"missing"}else{"predicted"},"topic_labels":if id==1{Value::Null}else if id==2{json!([])}else if id==61{json!(["Culture.Media.Music","STEM.STEM*"])}else if id%2==1{json!(["Culture.Media.Music"])}else{json!(["STEM.STEM*"])},
                 "creator_continuity_months_before_creation":if id==1{None}else{Some(if id==102{113}else{id%14})},
                 "history_creator_key":format!("local-{}",id%4),"quality_score":if id==1{None}else{Some(0.5)}})).collect::<Vec<_>>();
@@ -265,6 +267,93 @@ fn summaries_are_served_as_published_without_filling_missing_continuity() {
     }
     census.verify().unwrap();
     assert_eq!(fs::read(w.db()).unwrap(), before);
+}
+
+#[test]
+fn dashboard_refreshes_registration_cohorts_from_the_verified_database_only() {
+    let w = Fixture::new("20261001");
+    let mut expected = Vec::new();
+    for entry in w.entries.as_array().unwrap() {
+        let name = entry["summary_file"].as_str().unwrap();
+        let mut summary: Value =
+            serde_json::from_slice(&fs::read(w.root.join(name)).unwrap()).unwrap();
+        expected.push((name, summary.clone()));
+        let reports = summary["reports"].as_object_mut().unwrap();
+        assert!(reports.remove("registration_cohorts").is_some());
+        write(&w.root.join(name), &summary);
+    }
+    w.publish();
+    // Keep an old reader open and make the export manifest unavailable.
+    let old = Census::open(&w.db()).unwrap();
+    let before = fs::read(w.db()).unwrap();
+    fs::remove_file(w.root.join("manifest.json")).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_orphanwiki"))
+            .args([
+                "dashboard",
+                "--refresh-registration-cohorts",
+                "--collection-database",
+            ])
+            .arg(w.db())
+            .current_dir(&w.root)
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let backup = fs::read_dir(&w.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("collection.before-registration-cohorts-")
+        })
+        .unwrap();
+    assert_eq!(fs::read(&backup).unwrap(), before);
+    let updated = Census::open(&w.db()).unwrap();
+    updated.verify().unwrap();
+    assert_eq!(updated.identity().unwrap(), old.identity().unwrap());
+    assert_eq!(updated.manifest().unwrap(), old.manifest().unwrap());
+    for (name, expected) in expected {
+        assert!(old.resource(name).unwrap()["reports"]
+            .get("registration_cohorts")
+            .is_none());
+        assert_eq!(updated.resource(name).unwrap(), expected);
+    }
+    let all = updated.resource("all-summary.json").unwrap();
+    assert_eq!(
+        all["reports"]["registration_cohorts"]["known"],
+        json!([2, 1])
+    );
+    assert_eq!(
+        all["reports"]["registration_cohorts"]["rows"][5]["counts"],
+        json!([0, 1])
+    );
+    let after = fs::read(w.db()).unwrap();
+    let file_count = fs::read_dir(&w.root).unwrap().count();
+    assert!(run().status.success());
+    assert_eq!(fs::read(w.db()).unwrap(), after);
+    assert_eq!(fs::read_dir(&w.root).unwrap().count(), file_count);
+
+    let db = rusqlite::Connection::open(w.db()).unwrap();
+    db.execute(
+        "UPDATE pages SET orphan=1 WHERE language='vec' AND id=101",
+        [],
+    )
+    .unwrap();
+    db.close().unwrap();
+    let damaged = fs::read(w.db()).unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Checksum della raccolta"));
+    assert_eq!(fs::read(w.db()).unwrap(), damaged);
+    assert_eq!(fs::read_dir(&w.root).unwrap().count(), file_count);
 }
 
 #[test]

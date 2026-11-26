@@ -100,6 +100,16 @@ export interface NumericReport {
   bin_edges: number[]; ticks: number[]; cumulative_ticks: number[];
   month_histogram?: {rule: 'months_0_12_overflow_v1'; through: 12; count_max: number; groups: {counts: number[]; percentages: (number | null)[]}[]};
 }
+export interface RegistrationCohortReport {
+  known: [number, number];
+  missing: [number, number];
+  rows: {
+    start_year: number;
+    counts: [number, number];
+    percentages: [number | null, number | null];
+    cumulative: [number | null, number | null];
+  }[];
+}
 export interface OriginsReport { origins: CategoryReportRow[]; bots: CategoryReportRow[]; known_bots: number; }
 export interface OverviewReport {
   total: number; orphans: number; percent: number | null; dead_ends: number;
@@ -111,6 +121,7 @@ export interface DashboardSummaryData {
   reports: {
     overview: OverviewReport; categories: CategoryReportRow[]; profiles: ProfilesReport;
     numeric: Record<string, NumericReport>; origins: OriginsReport;
+    registration_cohorts?: RegistrationCohortReport;
     creator_groups: CategoryReportRow[];
   };
 }

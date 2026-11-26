@@ -1,4 +1,35 @@
 use super::*;
+use crate::dashboard::RegistrationCohortCounts;
+use std::path::PathBuf;
+
+fn publication_lock(destination: &Path) -> DumpResult<File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(destination.with_extension("publish.lock"))?;
+    lock.try_lock()
+        .map_err(|_| "Un'altra pubblicazione sta usando il database")?;
+    Ok(lock)
+}
+
+fn verify_and_close(db: Connection) -> DumpResult<()> {
+    let integrity: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        return Err("Database non integro".into());
+    }
+    db.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+fn install_collection(temporary: &Path, destination: &Path, parent: &Path) -> DumpResult<()> {
+    File::open(temporary)?.sync_all()?;
+    crate::runtime::check_cancelled()?;
+    std::fs::rename(temporary, destination)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
 
 /// Atomically replace the publication only after every member and all evidence
 /// have been imported and verified. Neither source exports nor the old DB change
@@ -20,14 +51,7 @@ pub fn publish(folder: &Path, destination: &Path, identity: &Value) -> DumpResul
         .parent()
         .ok_or("Directory del database mancante")?;
     std::fs::create_dir_all(parent)?;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(destination.with_extension("publish.lock"))?;
-    lock.try_lock()
-        .map_err(|_| "Un'altra pubblicazione sta usando il database")?;
+    let _lock = publication_lock(destination)?;
     let temporary = parent.join(format!(
         ".collection-{}.sqlite",
         crate::runtime::unique_id()
@@ -296,20 +320,121 @@ pub fn publish(folder: &Path, destination: &Path, identity: &Value) -> DumpResul
             [checksum],
         )?;
         db.execute_batch("ANALYZE; PRAGMA optimize")?;
-        let integrity: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-        if integrity != "ok" {
-            return Err("Database non integro".into());
-        }
-        db.close().map_err(|(_, error)| error)?;
-        File::open(&temporary)?.sync_all()?;
-        std::fs::rename(&temporary, destination)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        verify_and_close(db)?;
+        install_collection(&temporary, destination, parent)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+fn registration_summary_updates(census: &Census) -> DumpResult<Vec<(String, String)>> {
+    let manifest = census.manifest()?;
+    let entries = manifest.as_array().ok_or("Manifest non valido")?;
+    let mut pages = census.db.prepare(
+        "SELECT orphan,
+           CASE WHEN json_type(data,'$.creator_registered_at')='text' THEN json_extract(data,'$.creator_registered_at') END,
+           CASE WHEN json_type(data,'$.page_created_at')='text' THEN json_extract(data,'$.page_created_at') END
+         FROM pages WHERE language=?",
+    )?;
+    let mut aggregate = RegistrationCohortCounts::default();
+    let mut updates = Vec::new();
+    let mut check_summary = |entry: &Value, counts: &RegistrationCohortCounts| -> DumpResult<()> {
+        let name = filename(&entry["summary_file"])?;
+        let summary = census.resource(name)?;
+        let [orphans, others] = counts.group_totals();
+        if summary["format"] != "dashboard_summary_v1"
+            || summary["metadata"]["language"] != entry["language"]
+            || summary["metadata"]["finished_at"] != entry["date"]
+            || summary["census_page_count"] != orphans + others
+            || summary["reports"]["overview"]["total"] != orphans + others
+            || summary["reports"]["overview"]["orphans"] != orphans
+        {
+            return Err(format!("Riepilogo {name} non corrispondente al censimento").into());
+        }
+        let report = serde_json::to_value(counts.report())?;
+        if summary["reports"]["registration_cohorts"] != report {
+            updates.push((name.to_owned(), encode(&report)?));
+        }
+        Ok(())
+    };
+    for entry in entries.iter().filter(|entry| entry["kind"] != "aggregate") {
+        let language = entry["language"].as_str().ok_or("Lingua mancante")?;
+        let mut member = RegistrationCohortCounts::default();
+        let mut rows = pages.query([language])?;
+        while let Some(row) = rows.next()? {
+            crate::runtime::check_cancelled()?;
+            let registered: Option<String> = row.get(1)?;
+            let created: Option<String> = row.get(2)?;
+            member.add_dates(row.get(0)?, registered.as_deref(), created.as_deref());
+        }
+        check_summary(entry, &member)?;
+        aggregate.merge(&member);
+    }
+    for entry in entries.iter().filter(|entry| entry["kind"] == "aggregate") {
+        check_summary(entry, &aggregate)?;
+    }
+    Ok(updates)
+}
+
+/// Prepare the missing or changed chart reports from an approved local census.
+/// The old database remains accessible, including to readers with open handles.
+pub fn refresh_registration_cohorts(destination: &Path) -> DumpResult<Option<PathBuf>> {
+    let destination = std::fs::canonicalize(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or("Directory del database mancante")?;
+    let _lock = publication_lock(&destination)?;
+    let census = Census::open(&destination)?;
+    census.verify_metadata()?;
+    census.verify()?;
+    let updates = registration_summary_updates(&census)?;
+    if updates.is_empty() {
+        return Ok(None);
+    }
+
+    let generation = crate::runtime::unique_id();
+    let temporary = parent.join(format!(".collection-{generation}.sqlite"));
+    File::create_new(&temporary)?;
+    let result = (|| -> DumpResult<PathBuf> {
+        let mut db = Connection::open(&temporary)?;
+        rusqlite::backup::Backup::new(&census.db, &mut db)?.run_to_completion(
+            4096,
+            std::time::Duration::from_millis(1),
+            None,
+        )?;
+        let tx = db.transaction()?;
+        for (name, report) in updates {
+            if tx.execute(
+                "UPDATE documents SET data=json_set(data,'$.reports.registration_cohorts',json(?)) WHERE path=?",
+                params![report, name],
+            )? != 1 {
+                return Err(format!("Riepilogo {name} mancante").into());
+            }
+        }
+        let checksum = fingerprint(&tx)?;
+        if tx.execute(
+            "UPDATE publication SET data=? WHERE key='integrity_sha256'",
+            [checksum],
+        )? != 1
+        {
+            return Err("Impronta della raccolta mancante".into());
+        }
+        tx.commit()?;
+        verify_and_close(db)?;
+        crate::runtime::check_cancelled()?;
+        let backup =
+            destination.with_extension(format!("before-registration-cohorts-{generation}.sqlite"));
+        std::fs::hard_link(&destination, &backup)?;
+        File::open(parent)?.sync_all()?;
+        install_collection(&temporary, &destination, parent)?;
+        Ok(backup)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map(Some)
 }
 
 fn visit_creators(

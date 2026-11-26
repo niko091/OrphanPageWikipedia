@@ -1,4 +1,21 @@
 use super::*;
+use chrono::{DateTime, Datelike, Utc};
+
+const FIRST_REGISTRATION_COHORT: i32 = 2001;
+
+fn parse_registration<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(registration_date))
+}
+
+fn registration_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.to_utc())
+}
 
 // The same Rust calculations can be prepared once while publishing an export.
 // Retain only the fields needed by charts and the creator index; never graph edges.
@@ -26,6 +43,8 @@ pub(super) struct SummaryPage {
     pub(super) creator_prior_edits_main: Option<f64>,
     pub(super) creator_prior_edits_other: Option<f64>,
     pub(super) creator_prior_articles: Option<f64>,
+    #[serde(default, deserialize_with = "parse_registration")]
+    creator_registered_at: Option<DateTime<Utc>>,
     pub(super) creator_tenure_days: Option<f64>,
     pub(super) creator_orphans_current: Option<f64>,
     pub(super) history_creator_key: Option<String>,
@@ -41,9 +60,114 @@ pub(super) struct DashboardSummary {
     pub(super) categories: Vec<CategoryRow>,
     pub(super) profiles: Profiles,
     pub(super) numeric: BTreeMap<String, NumericReport>,
+    registration_cohorts: RegistrationCohorts,
     pub(super) origins: Origins,
     pub(super) creator_groups: Vec<CategoryRow>,
     pub(super) creators: Vec<CreatorRow>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RegistrationCohorts {
+    known: [usize; 2],
+    missing: [usize; 2],
+    rows: Vec<RegistrationCohort>,
+}
+
+#[derive(Serialize)]
+struct RegistrationCohort {
+    start_year: i32,
+    counts: [usize; 2],
+    percentages: [Option<f64>; 2],
+    cumulative: [Option<f64>; 2],
+}
+
+fn registration_cohort(registered: Option<DateTime<Utc>>, created: Option<&str>) -> Option<i32> {
+    let registered = registered?;
+    let created = DateTime::parse_from_rfc3339(created?).ok()?;
+    let year = registered.year();
+    (registered <= created && year >= FIRST_REGISTRATION_COHORT)
+        .then(|| FIRST_REGISTRATION_COHORT + (year - FIRST_REGISTRATION_COHORT) / 5 * 5)
+}
+
+#[derive(Default)]
+pub(crate) struct RegistrationCohortCounts {
+    counts: BTreeMap<i32, [usize; 2]>,
+    known: [usize; 2],
+    missing: [usize; 2],
+}
+
+impl RegistrationCohortCounts {
+    fn add(&mut self, orphan: bool, registered: Option<DateTime<Utc>>, created: Option<&str>) {
+        let group = usize::from(!orphan);
+        if let Some(year) = registration_cohort(registered, created) {
+            self.counts.entry(year).or_default()[group] += 1;
+            self.known[group] += 1;
+        } else {
+            self.missing[group] += 1;
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn add_dates(
+        &mut self,
+        orphan: bool,
+        registered: Option<&str>,
+        created: Option<&str>,
+    ) {
+        self.add(orphan, registered.and_then(registration_date), created);
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn merge(&mut self, member: &Self) {
+        for (year, counts) in &member.counts {
+            let total = self.counts.entry(*year).or_default();
+            for group in 0..2 {
+                total[group] += counts[group];
+            }
+        }
+        for group in 0..2 {
+            self.known[group] += member.known[group];
+            self.missing[group] += member.missing[group];
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn group_totals(&self) -> [usize; 2] {
+        std::array::from_fn(|group| self.known[group] + self.missing[group])
+    }
+
+    pub(crate) fn report(&self) -> RegistrationCohorts {
+        let mut running_counts = [0; 2];
+        let rows = self
+            .counts
+            .last_key_value()
+            .map_or_else(Vec::new, |(&last, _)| {
+                (FIRST_REGISTRATION_COHORT..=last)
+                    .step_by(5)
+                    .map(|start_year| {
+                        let counts = self.counts.get(&start_year).copied().unwrap_or_default();
+                        let percentages = std::array::from_fn(|group| {
+                            percentage(counts[group], self.known[group])
+                        });
+                        let cumulative = std::array::from_fn(|group| {
+                            running_counts[group] += counts[group];
+                            percentage(running_counts[group], self.known[group])
+                        });
+                        RegistrationCohort {
+                            start_year,
+                            counts,
+                            percentages,
+                            cumulative,
+                        }
+                    })
+                    .collect()
+            });
+        RegistrationCohorts {
+            known: self.known,
+            missing: self.missing,
+            rows,
+        }
+    }
 }
 
 pub struct SummaryAccumulator {
@@ -309,6 +433,14 @@ impl SummaryAccumulator {
             };
             numeric_reports.insert(field.to_owned(), report);
         }
+        let mut registration = RegistrationCohortCounts::default();
+        for page in &self.pages {
+            registration.add(
+                page.orphan,
+                page.creator_registered_at,
+                page.page_created_at.as_deref(),
+            );
+        }
         let report = DashboardSummary {
             overview: overview(
                 self.pages
@@ -350,6 +482,7 @@ impl SummaryAccumulator {
                     .collect(),
             )?,
             numeric: numeric_reports,
+            registration_cohorts: registration.report(),
             origins: origins(
                 self.pages
                     .iter()

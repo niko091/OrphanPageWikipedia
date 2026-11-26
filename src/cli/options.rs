@@ -226,7 +226,11 @@ pub(crate) fn command() -> Command {
         .subcommand_required(true)
         .arg(option("repo-root").global(true).help("Radice di configurazioni e percorsi relativi; altrimenti cerca dalla directory corrente"))
         .subcommands([
-            Command::new("dashboard").about("Prepara la dashboard dagli export approvati").arg(path_option("data-dir", "web/data")).arg(option("collection-database")),
+            Command::new("dashboard").about("Verifica la raccolta o prepara la dashboard")
+                .arg(path_option("data-dir", "web/data"))
+                .arg(option("collection-database").help("Database SQLite da pubblicare dagli export approvati o da aggiornare con --refresh-registration-cohorts"))
+                .arg(Arg::new("refresh-registration-cohorts").long("refresh-registration-cohorts").action(ArgAction::SetTrue)
+                    .help("Ricalcola i lustri di registrazione dai dati della raccolta SQLite locale")),
             content, quality, refresh, downloads, imported, history, compare, topics, analyze, serve, pipeline, benchmark,
         ])
 }

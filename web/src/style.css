@@ -1220,6 +1220,15 @@ body[data-page="creators"] .toolbar {
   height: 14px;
 }
 
+.registration-cohort-plot {
+  overflow-x: auto;
+}
+
+.registration-cohort-plot:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
 svg text {
   font-family: inherit;
   font-variant-numeric: tabular-nums;

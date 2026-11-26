@@ -263,6 +263,51 @@ test('creator chart references stay readable at desktop and mobile widths',async
   await expect(page.locator('#creator_tenure_days-chart')).toContainText('The end bars group values');
 });
 
+test('registration cohorts compare articles by local registration date',async({page,site},testInfo)=>{
+  await open(page,site,'creators.html');
+  await page.locator('#dataset').selectOption('vec');
+  const chart=page.locator('#creator-registration-cohorts');
+  const bars=chart.locator('svg rect');
+  const periods=['2001–2005','2006–2010','2011–2015','2016–2020'];
+  await expect(chart.locator('svg text[aria-label]')).toHaveText(periods);
+  await expect(chart.locator('details')).toHaveCount(0);
+  await expect(chart).not.toContainText(/Date valide per|Dati mancanti esclusi dal grafico/);
+  await expect(bars.first()).toHaveAttribute('aria-label','Orfane · 2001–2005: 48,4%');
+  await expect(bars).toHaveCount(8);
+  await page.locator('#chart-type').selectOption('count');
+  await expect(bars.first()).toHaveAttribute('aria-label','Orfane · 2001–2005: 15');
+  await expect(bars.last()).toHaveAttribute('aria-label','Non orfane · 2016–2020: 16');
+  await page.locator('#chart-type').selectOption('cumulative');
+  await expect(bars.first()).toHaveAttribute('aria-label','Orfane · 2001–2005: 48,4%');
+  await expect(bars.last()).toHaveAttribute('aria-label','Non orfane · 2016–2020: 100%');
+  await expect(bars).toHaveCount(8);
+  await expect(chart.locator('svg path')).toHaveCount(0);
+  const geometry=await bars.evaluateAll(nodes=>nodes.map(node=>['x','y','width','height'].map(attr=>Number(node.getAttribute(attr)))));
+  for(let index=0;index<geometry.length;index+=2) {
+    const [x,y,width,height]=geometry[index], [nextX,nextY,,nextHeight]=geometry[index+1];
+    expect(x+width).toBeCloseTo(nextX);
+    expect(y+height).toBeCloseTo(nextY+nextHeight);
+  }
+  await page.locator('#chart-type').selectOption('percent');
+  for(const width of [1280,390])for(const theme of ['light','dark']) {
+    await page.setViewportSize({width,height:844});
+    await page.locator('html').evaluate((node,value)=>{node.dataset.theme=value;},theme);
+    await expect(chart.locator('.legend')).toContainText('Non orfane');
+    await expect(chart.locator('svg text[aria-label]')).toHaveText(periods);
+    const bounds=await chart.boundingBox();
+    expect(bounds!.x+bounds!.width).toBeLessThanOrEqual(width);
+    const labels=await chart.locator('svg text[aria-label]').evaluateAll(nodes=>nodes.map(node=>{
+      const {left,right}=node.getBoundingClientRect();return {left,right};
+    }));
+    expect(labels.every((label,index)=>label.left>=0&&label.right<=width&&(index===0||label.left>=labels[index-1].right))).toBe(true);
+    await chart.screenshot({path:testInfo.outputPath(`registration-cohorts-${width}-${theme}.png`)});
+  }
+  await page.locator('#ui-language-toggle').click();
+  await expect(page.getByRole('heading',{name:'Creator’s local registration cohort'})).toBeVisible();
+  await expect(chart.getByRole('img',{name:'Creator’s local registration cohort'}))
+    .toHaveAccessibleDescription(/Orphans · 2001–2005: 48\.4%/);
+});
+
 test('continuity shows individual months and a complete overflow category',async({page,site},testInfo)=>{
   await open(page,site,'creators.html');
   const chart=page.locator('#creator_continuity_months_before_creation-chart');

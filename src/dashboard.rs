@@ -13,6 +13,8 @@ use interests::interest_scores;
 mod creators;
 use creators::{creator_rows, origins, overview, CreatorRow, Origins, Overview};
 mod summary;
+#[cfg(feature = "cli")]
+pub(crate) use summary::RegistrationCohortCounts;
 pub use summary::SummaryAccumulator;
 
 use serde::{Deserialize, Serialize};

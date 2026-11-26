@@ -24,6 +24,72 @@ fn chart_float_ingestion_preserves_the_frozen_bridge_without_mutating_observatio
     );
 }
 
+#[test]
+fn registration_cohorts_use_utc_calendar_boundaries_and_group_coverage() {
+    let mut summary = SummaryAccumulator::new("all".into(), true, true);
+    for (index, (language, orphan, registration, creation)) in [
+        (
+            "vec",
+            true,
+            Some("2006-01-01T00:30:00+01:00"),
+            Some("2008-01-01T00:00:00Z"),
+        ),
+        (
+            "vec",
+            true,
+            Some("2006-01-01T00:00:00Z"),
+            Some("2006-01-01T00:00:00Z"),
+        ),
+        (
+            "lmo",
+            false,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-02-01T00:00:00Z"),
+        ),
+        (
+            "lmo",
+            false,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2025-12-31T23:59:59Z"),
+        ),
+        ("vec", true, None, Some("2026-01-01T00:00:00Z")),
+        ("vec", true, Some("2021-01-01T00:00:00Z"), None),
+        ("lmo", false, Some("invalid"), Some("2026-01-01T00:00:00Z")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        summary
+            .add_observation(
+                &serde_json::json!({
+                    "page_id":index+1,"title":"Synthetic article","orphan":orphan,
+                    "creator_registered_at":registration,"page_created_at":creation
+                }),
+                Some(language),
+            )
+            .unwrap();
+    }
+    let report: serde_json::Value = serde_json::from_str(&summary.finish().unwrap()).unwrap();
+    let cohorts = &report["registration_cohorts"];
+    use serde_json::json;
+    assert_eq!(cohorts["known"], json!([2, 1]));
+    assert_eq!(cohorts["missing"], json!([2, 2]));
+    let rows = cohorts["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(
+        rows[0],
+        json!({"start_year":2001,"counts":[1,0],"percentages":[50.0,0.0],"cumulative":[50.0,0.0]})
+    );
+    assert_eq!(rows[1]["start_year"], 2006);
+    assert_eq!(rows[1]["counts"], json!([1, 0]));
+    assert_eq!(rows[2]["counts"], json!([0, 0]));
+    assert_eq!(rows[2]["cumulative"], json!([100.0, 0.0]));
+    assert_eq!(
+        rows[5],
+        json!({"start_year":2026,"counts":[0,1],"percentages":[0.0,100.0],"cumulative":[100.0,100.0]})
+    );
+}
+
 #[cfg(not(feature = "cli"))]
 #[test]
 fn chart_bridge_matches_the_original_parser_on_finite_binary64_inputs() {

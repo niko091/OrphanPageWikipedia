@@ -33,20 +33,39 @@ impl Invocation {
         .map_err(|e| e.to_string())
     }
     pub(super) fn run_dashboard(&self) -> Result<(), String> {
-        let database = self.path("data-dir")?.join("collection.sqlite");
-        if self.args.get_one::<String>("collection-database").is_none() {
-            return orphanwiki::store::Census::open(&database)
-                .and_then(|db| db.verify())
-                .map_err(|e| e.to_string());
-        }
-        orphanwiki::dumps::rebuild_dashboard(&self.path("data-dir")?).map_err(|e| e.to_string())?;
-        if let Some(path) = self.args.get_one::<String>("collection-database") {
+        let folder = self.path("data-dir")?;
+        let destination = self.args.get_one::<String>("collection-database");
+        if self.args.get_flag("refresh-registration-cohorts") {
+            let database = destination.map_or_else(
+                || folder.join("collection.sqlite"),
+                |path| self.root.join(path),
+            );
+            match orphanwiki::store::refresh_registration_cohorts(&database)
+                .map_err(|e| e.to_string())?
+            {
+                Some(backup) => println!(
+                    "Lustri di registrazione pubblicati in {}. Versione precedente: {}",
+                    database.display(),
+                    backup.display()
+                ),
+                None => println!(
+                    "Lustri di registrazione già aggiornati in {}",
+                    database.display()
+                ),
+            }
+        } else if let Some(path) = destination {
+            orphanwiki::dumps::rebuild_dashboard(&folder).map_err(|e| e.to_string())?;
             orphanwiki::store::publish(
-                &self.path("data-dir")?,
+                &folder,
                 &self.root.join(path),
                 &serde_json::json!({"rule":orphanwiki::store::RULE,"source":"approved_exports"}),
             )
             .map_err(|e| e.to_string())?;
+        } else {
+            let database = folder.join("collection.sqlite");
+            return orphanwiki::store::Census::open(&database)
+                .and_then(|db| db.verify())
+                .map_err(|e| e.to_string());
         }
         Ok(())
     }

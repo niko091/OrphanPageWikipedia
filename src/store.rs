@@ -5,7 +5,7 @@ mod publication;
 mod query;
 mod resources;
 use crate::dumps::{self, DumpResult};
-pub use publication::publish;
+pub use publication::{publish, refresh_registration_cohorts};
 pub use query::PageQuery;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
